@@ -1,0 +1,10 @@
+crawl4ai>=0.9.0
+langchain
+langchain-chroma
+langchain-openai
+python-dotenv
+rich
+urllib3
+aiofiles
+pydantic
+ruff
