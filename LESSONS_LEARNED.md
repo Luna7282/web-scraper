@@ -82,4 +82,33 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-18 — Step 0/1 of the rebuild: repo hygiene
+
+### 5. `.env` held a live plaintext secret with no `.gitignore` to catch it
+- **Problem**: `.env` contained a commented-out but intact NVIDIA API key
+  and a dead `ollama=` token nothing reads. No git repo existed yet, so
+  nothing had leaked via history — but nothing was stopping a careless
+  `git add .` from baking it in on the first commit.
+- **Root cause**: repo hygiene (`.gitignore`, `git init`) was never set up
+  before secrets were dropped into a plaintext file at the project root.
+- **Fix**: `.gitignore` (excluding `.env`, `.venv/`, `chroma_db/`, `data/`,
+  `__pycache__/`) was committed *before* any other file was ever staged.
+  Every commit since has staged files by explicit name, never `git add -A`
+  or `git add .`, as a second layer of protection during the window before
+  `.gitignore` existed. `.env` itself was then edited locally to drop the
+  dead `ollama=` line and blank the NVIDIA key; `.env.example` documents
+  the two vars `config.py` actually reads (`OPENAI_API_KEY`,
+  `NVIDIA_API_KEY`), names only.
+- **Why it matters**: the NVIDIA key still needs rotating on NVIDIA's
+  console — it sat in cleartext on disk before this, and stripping it from
+  the tracked file doesn't undo that exposure. Not done yet; flagging so
+  it isn't forgotten. Also: git init ended up happening in step 0 (to make
+  that step's "commit the freeze" possible) rather than step 1 as
+  originally planned — safe only because nothing but the freeze file was
+  ever staged before `.gitignore` landed. Future steps should not assume
+  the step numbers in the plan map 1:1 to commit ordering; check `git log`
+  for what's actually landed.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->
