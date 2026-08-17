@@ -73,10 +73,18 @@ port 11434.** That wrapper's dynamic-port routing is the exact bug
 `LESSONS_LEARNED.md` #3 documents and fixed once already; reintroducing it
 would silently break local embeddings again.
 
-Ollama **cloud** is the opposite case — it's a stable HTTPS endpoint, so
-routing it through `ChatOpenAI` (like the other hosted providers) is fine.
-Local is the stated exception to the general provider pattern, not a
-template to copy from.
+Ollama **cloud** is the opposite case for *embeddings* — it has none (no
+embedding models exist in Ollama's cloud catalog at all, verified against
+docs.ollama.com; see `LESSONS_LEARNED.md` #7) — never build an embeddings
+path against it. For *chat*, it's routed through `ChatOpenAI` at
+`https://ollama.com/v1`, but unlike every other provider entry in
+`config.py`, that base_url is **not confirmed by Ollama's own
+documentation** — only the native `/api/chat` protocol is documented for
+cloud. It's wired and usable but genuinely unverified, not just
+untested-for-lack-of-a-key; check `LESSONS_LEARNED.md` #7 before trusting
+it in a real run. Local Ollama chat has no such doubt — only cloud's
+OpenAI-compat path is in question. Local embeddings staying off the
+OpenAI-compat wrapper remains the one hard, confirmed invariant above.
 
 ## Queue architecture invariants
 

@@ -35,15 +35,24 @@ def get_llm(
 ):
     provider = LLMProvider(provider_name.lower())
     config = get_llm_config(provider)
-    
-    # 1. Chat Model -> Routes to OLLAMA CLOUD
+
+    # 1. Chat model -> OpenAI-compatible endpoint for whichever provider was
+    #    selected (OpenAI, NVIDIA NIM, Ollama local, or Ollama cloud).
     llm = ChatOpenAI(
         model=model_name,
         api_key=config.api_key if config.api_key else "dummy",
         base_url=config.base_url,
     )
-    
-    # 2. Embedding Model -> Native Local HTTP (Zero proxy bugs)
+
+    # 2. Embedding model -> always native local Ollama HTTP, regardless of
+    #    which provider was picked for chat above. This is deliberate, not
+    #    an oversight: Ollama Cloud has no embedding models to route to (see
+    #    EMBEDDING_CAPABLE_PROVIDERS in config.py and LESSONS_LEARNED.md #7),
+    #    and local Ollama embeddings must never go through an OpenAI-compat
+    #    wrapper regardless (dynamic-port bug, LESSONS_LEARNED.md #3) -- so
+    #    LocalOllamaEmbeddings is the only embeddings path until a real
+    #    NVIDIA/OpenAI embeddings integration is wired up (tracked in
+    #    ROADMAP.md, not done here).
     embeddings = LocalOllamaEmbeddings(model_name=embedding_model_name)
-    
+
     return llm, embeddings

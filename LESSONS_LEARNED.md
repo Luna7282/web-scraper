@@ -170,4 +170,67 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-18 — Step 2 close-out: Ollama cloud provider wiring
+
+### 7. Ollama Cloud has no embedding models; its OpenAI-compat chat endpoint is unconfirmed by primary docs
+- **Problem**: The rebuild plan called for adding Ollama cloud as a 4th
+  provider, "selectable for both extraction and embeddings," on the
+  assumption (mine, in the original plan) that routing it through
+  `ChatOpenAI` like the other hosted providers would just work, mirroring
+  local Ollama's `http://localhost:11434/v1` OpenAI-compat layer.
+- **Root cause / what was actually verified**: fetched docs.ollama.com
+  directly (authentication, cloud, capabilities/embeddings,
+  api/openai-compatibility pages) plus the live cloud model catalog at
+  ollama.com/search?c=cloud, rather than inferring from the wrapper's
+  expectations.
+  - **Embeddings: confirmed absent.** The cloud model catalog lists 16
+    models (glm-5.2, deepseek-v4-flash, kimi-k3, gemma4, glm-5.1,
+    minimax-m2.7, nemotron-3-super, minimax-m3, kimi-k2.7-code, kimi-k2.6,
+    deepseek-v4-pro, nemotron-3-ultra, qwen3.5, nemotron-3-nano,
+    mistral-large-3, gpt-oss) — every one is chat/vision/tools/thinking.
+    Zero are tagged embedding. The dedicated embeddings docs page only
+    ever shows `http://localhost:11434/api/embed`. There is no cloud
+    embeddings endpoint to route to, full stop.
+  - **Chat: base_url is a documented gap, not a confirmed fact.**
+    docs.ollama.com's own programmatic-access examples for cloud (Python
+    client, JS client, curl) all use `https://ollama.com` as host talking
+    the **native** Ollama protocol (`/api/chat`), with
+    `Authorization: Bearer $OLLAMA_API_KEY` — never an OpenAI-compatible
+    `/v1/chat/completions` path. The dedicated openai-compatibility docs
+    page documents only `http://localhost:11434/v1` and never mentions
+    ollama.com at all. `https://ollama.com/v1` (what got wired into
+    `config.py`) is reported by secondary/aggregator sources, not by any
+    primary Ollama documentation page — it's a plausible mirror of the
+    local pattern, not a confirmed one.
+- **Fix**: `config.py` gained `LLMProvider.OLLAMA_CLOUD` and an
+  `EMBEDDING_CAPABLE_PROVIDERS` set that excludes it, with the base_url
+  uncertainty spelled out in a comment at the exact point someone would
+  need to know it. `llm_factory.py`'s `get_llm()` embeddings line is
+  unconditional (`LocalOllamaEmbeddings` regardless of chat provider) —
+  already structurally incapable of routing embeddings to
+  `OLLAMA_CLOUD`'s base_url/key, since that code path never reads
+  `config` at all. No live call was made against `https://ollama.com/v1`
+  — no `OLLAMA_API_KEY` was available this session, and this step's rule
+  was explicitly not to spend a billed call just to verify wiring.
+  `.env.example` uses `OLLAMA_API_KEY` (Ollama's own documented variable
+  name, matching what `ollama signin` and their CLI already use) rather
+  than a project-invented name.
+- **Why it matters**: this is wired but **unverified in two separate,
+  independent ways** — not just "untested because no API key" (which
+  would be a normal, benign gap) but "the exact endpoint may not exist as
+  configured" (a real, non-benign gap). Both are stated explicitly here
+  and in `config.py` rather than left implicit, per the same discipline
+  applied to the cross-platform verification gap in #6. **Before this
+  provider is used for anything real**: get an `OLLAMA_API_KEY` and make
+  one cheap test call; if `https://ollama.com/v1/chat/completions` 404s or
+  errors, the fallback is Ollama's confirmed-working native protocol
+  (`https://ollama.com/api/chat`), which needs a different client than
+  `ChatOpenAI` — likely the same shape of fix as `LocalOllamaEmbeddings`
+  was for local embeddings (a small native HTTP class), not another
+  guessed OpenAI-compat path. Embeddings for Ollama cloud are not a "not
+  implemented yet" gap — they're "does not exist upstream"; don't build
+  toward them later without re-checking Ollama's model catalog first.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->
