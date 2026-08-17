@@ -111,4 +111,63 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-18 — Step 2 of the rebuild: dependency manifest + verification
+
+### 6. `uv sync` meant for a scratch venv modified the live `.venv` instead
+- **Problem**: Verifying the new `pyproject.toml`/`uv.lock` was supposed to
+  happen in an isolated scratch venv (`../scraper-verify-venv`), created
+  specifically so the live working environment wouldn't be touched. The
+  command used to sync into it —
+  `uv sync --python ../scraper-verify-venv/Scripts/python.exe --active` —
+  instead modified this project's own live `.venv`: it uninstalled
+  `langchain`, `langgraph`, `langgraph-checkpoint`, `langgraph-prebuilt`,
+  `langgraph-sdk`, and `ormsgpack`, and changed `tiktoken`/`websockets` to
+  different versions. The scratch venv itself was never touched — it had
+  zero packages installed the whole time.
+- **Root cause**: two flags were combined under a wrong assumption about
+  what they do. `--python <path>` selects which *interpreter* uv resolves
+  and installs against (for version-compatibility purposes) — it does
+  **not** redirect *where* `uv sync` installs packages. `--active` tells
+  `uv sync` to prefer whatever venv `$VIRTUAL_ENV` points at; with nothing
+  activated in this shell, it silently fell back to `uv sync`'s ordinary
+  default target — the project's own `.venv` in the current directory.
+  That's the exact environment the check was supposed to leave alone.
+- **Fix**: two parts. (1) *Recovery*: `uv pip sync requirements.lock.txt
+  --python .venv/Scripts/python.exe` reinstalled the six removed packages
+  and reverted `tiktoken`/`websockets`, restoring the live `.venv` to
+  exactly what `requirements.lock.txt` recorded — proven, not assumed, by
+  re-running `uv pip freeze` and diffing it against `requirements.lock.txt`
+  (empty diff). (2) *Redo, structurally*: instead of any flag or env var
+  meant to redirect `uv sync`'s target, the repo's source + `pyproject.toml`
+  + `uv.lock` were copied (no `.venv`) into a directory with no project of
+  its own (`D:\scraper-sync-check`, outside `D:\scraper`). With no project
+  `.venv` present to fall back to, this failure mode can't recur — there's
+  nothing for the fallback to fall back *to*. Verified with `uv sync
+  --dry-run` printing the resolved target path before the real sync ran,
+  then confirmed the six pipeline modules import successfully from that
+  isolated copy using its venv's interpreter by full path, with each
+  module's `__file__` printed to prove it resolved from the repo copy (not
+  an installed package) — and diffed that copy's source files against the
+  live repo's to confirm they were byte-identical to begin with.
+- **Why it matters**: the verification step mutated the very environment
+  it was meant to verify — exactly the failure mode a "prove it, don't
+  assume it" habit exists to catch, and it very nearly went unnoticed
+  since the sync command reported success. It was recoverable *only*
+  because step 0 froze the environment (`requirements.lock.txt`) before
+  any other rebuild work started — without that snapshot there would have
+  been no ground truth to restore to, and the exact working combination
+  that fixed `LESSONS_LEARNED.md` #1–#3 could have been lost silently.
+  Going forward, any `uv` command that can install or uninstall gets a
+  `--dry-run` first, with the resolved target path read and confirmed,
+  before it runs for real (now in `CLAUDE.md`).
+- **Verification scope, stated explicitly**: `uv.lock` resolves
+  dependencies cross-platform, but the import check above only ran on
+  Windows (both the live `.venv` and the isolated copy). `uvloop` and any
+  other transitive dependency gated to non-Windows platform markers remain
+  **unverified** until this manifest is synced and import-checked on
+  Linux. Not claiming full verification here — only what was actually
+  proven on this platform.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->

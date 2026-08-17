@@ -37,6 +37,20 @@ later commit has already changed it.
   `urllib3<2.0.0`. Removing either reintroduces problems already solved
   once — see `LESSONS_LEARNED.md` #1. Don't relax them without checking
   that entry first.
+- **Before any `uv` command that can install or uninstall (`uv sync`,
+  `uv pip sync`, `uv pip install`, etc.), run it with `--dry-run` first,
+  read the resolved target environment path out of the output, and
+  confirm it's the one actually intended before running for real.**
+  `--python <path>` only picks which interpreter/version uv resolves
+  against — it does **not** redirect where packages get installed.
+  `--active` prefers `$VIRTUAL_ENV` and silently falls back to the
+  project's own `.venv` when nothing is active. Neither flag is a safe way
+  to point `uv sync` at an arbitrary venv; a `uv sync` meant for a scratch
+  environment mutated this project's live `.venv` once already —
+  see `LESSONS_LEARNED.md` #6. The only structurally safe way to verify a
+  manifest against an isolated environment is a full repo copy (source +
+  `pyproject.toml` + `uv.lock`, no `.venv`) in a directory with no project
+  of its own to fall back to.
 
 ## Running the CLI
 
