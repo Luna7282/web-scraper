@@ -92,6 +92,21 @@ OpenAI-compat wrapper remains the one hard, confirmed invariant above.
 in-progress plan. Placeholder until then: do not reintroduce recursive
 task-per-page spawning; crawling must stay a bounded work-queue.)*
 
+## Scope predicate (`scope.py`)
+
+`normalize_url()`, `derive_prefix()`, and `is_in_scope()` are pure
+functions, no I/O — the frontier (once built) and `main.py --dry-run` both
+call them, and they're unit-tested offline against real fixture data from
+5 structurally different sites in `tests/fixtures/` (see
+`tests/fetch_fixtures.py` to regenerate). **No site-specific logic
+belongs in `scope.py`** — if a site needs different behavior, it has to
+come from config (host allowlist, prefix list, exclude patterns), never a
+branch on a domain name inside the predicate. `derive_prefix` has already
+had one real bug from over-fitting to a single test site (a universal
+`dirname()`-before-`commonpath()` heuristic that broke on any branch
+containing its own section-index page — see `LESSONS_LEARNED.md` #8);
+treat that as the standing warning it is before changing this file.
+
 ## Working conventions in this repo
 
 - No drive-by refactors — anything noticed outside the current task goes

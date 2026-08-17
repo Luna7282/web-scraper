@@ -1,0 +1,72 @@
+{
+  "slug": "stackblitz",
+  "root_url": "https://stackblitz.com/",
+  "fetched_at": "2026-08-17T23:00:21.173631+00:00",
+  "server_rendered": {
+    "final_url": "https://stackblitz.com/",
+    "status_code": 200,
+    "href_count": 34
+  },
+  "browser_rendered": {
+    "final_url": "https://stackblitz.com/",
+    "status_code": 200,
+    "href_count": 19,
+    "hrefs": [
+      "https://stackblitz.com/",
+      "https://stackblitz.com/careers",
+      "https://blog.stackblitz.com/posts/introducing-webcontainers",
+      "https://stackblitz.com/enterprise",
+      "https://stackblitz.com/integrations",
+      "https://stackblitz.com/design-systems",
+      "https://developer.stackblitz.com/codeflow/integrating-web-publisher",
+      "https://stackblitz.com/case-studies",
+      "https://stackblitz.com/pricing",
+      "https://stackblitz.com/privacy-policy",
+      "https://stackblitz.com/terms-of-service",
+      "https://developer.stackblitz.com",
+      "https://stackblitz.com/enterprise-contact",
+      "https://blog.stackblitz.com",
+      "https://bolt.new",
+      "https://webcontainers.io",
+      "https://discord.gg/stackblitz",
+      "https://x.com/boltdotnew",
+      "https://github.com/stackblitz"
+    ]
+  },
+  "href_set_comparison": {
+    "static_only": [
+      "https://stackblitz.com/_astro/PricingTables.BzG4guBg.css",
+      "https://stackblitz.com/_astro/_slug_.BIA1wUKj.css",
+      "https://stackblitz.com/_astro/_slug_.ZItQoVbT.css",
+      "https://stackblitz.com/_astro/favicon.svg",
+      "https://stackblitz.com/_astro/index.Bb8byi_H.css",
+      "https://stackblitz.com/_astro/index.DUIlzmdm.css",
+      "https://stackblitz.com/sitemap-index.xml"
+    ],
+    "rendered_only": [],
+    "shared": [
+      "https://blog.stackblitz.com/",
+      "https://blog.stackblitz.com/posts/introducing-webcontainers",
+      "https://bolt.new/",
+      "https://developer.stackblitz.com/",
+      "https://developer.stackblitz.com/codeflow/integrating-web-publisher",
+      "https://discord.gg/stackblitz",
+      "https://github.com/stackblitz",
+      "https://stackblitz.com/",
+      "https://stackblitz.com/careers",
+      "https://stackblitz.com/case-studies",
+      "https://stackblitz.com/design-systems",
+      "https://stackblitz.com/enterprise",
+      "https://stackblitz.com/enterprise-contact",
+      "https://stackblitz.com/integrations",
+      "https://stackblitz.com/pricing",
+      "https://stackblitz.com/privacy-policy",
+      "https://stackblitz.com/terms-of-service",
+      "https://webcontainers.io/",
+      "https://x.com/boltdotnew"
+    ],
+    "overlap_ratio": 0.731
+  },
+  "required_rendering": false,
+  "required_rendering_basis": "73% of unique links shared between versions"
+}

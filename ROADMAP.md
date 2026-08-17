@@ -159,6 +159,23 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     *Fix*: swap `print` calls for stdlib `logging` with a file handler.
     **Size: S.**
 
+15a. **Pagination is in-scope by prefix but usually worthless to crawl.**
+    `is_in_scope` (`scope.py`) only checks host + path prefix — query strings
+    are normalized (sorted) but never examined for scope decisions. A URL
+    like `.../blog/?page=2` is accepted whenever its base path is in-scope,
+    same as any other query-param variant. Confirmed as a real, unaddressed
+    case during step 3's multi-site testing, though none of the 5 test
+    sites' root pages happened to expose live pagination links to verify
+    against end-to-end. Deliberately out of scope for the scope predicate
+    itself — this is a relevance/extraction-quality concern (a paginated
+    listing page's *content* is rarely worth extracting, not that it's
+    off-topic), closer to step 6's relevance gating than step 3's host/prefix
+    scoping.
+    *Fix*: a configurable exclude-pattern list (e.g. glob/regex against path
+    or query, like `page=`, `/page/\d+/`) checked in `is_in_scope` or as a
+    separate filter — generic config, not site-specific code, per the "no
+    site-specific logic in scope.py" rule. **Size: S.**
+
 16. **No tests anywhere in the repo.** The "fully functional, tested" claim
     isn't independently verifiable — there's nothing to run. The branch-scope
     bug (#1) is exactly the kind of thing a unit test on `discover_branches`

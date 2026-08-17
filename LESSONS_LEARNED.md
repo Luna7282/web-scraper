@@ -233,4 +233,71 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-18 — Step 3: scope predicate rebuilt, tested against 5 real sites
+
+### 8. `derive_prefix`'s own fix broke on the second real site it was tested against
+- **Problem**: `derive_prefix` (`scope.py`) replaces the original bug
+  (branch scoping matched exact leaf URLs from the root page instead of a
+  path prefix). The first version took the *dirname* of every URL in a
+  branch before computing their longest common path, on the theory that
+  this would stop a single-URL branch from deriving an exact-leaf-file
+  prefix nothing else could ever match. It passed all 27 unit tests and
+  looked correct against `docs.manim.community` (dry-run step 3 kickoff).
+  Tested against `fastapi.tiangolo.com` as one of five required
+  structurally-different sites, **every single path-based branch came
+  back degenerate** — including a 51-URL `/tutorial/*` branch that should
+  obviously have scoped to `/tutorial/`.
+- **Root cause**: FastAPI's tutorial section has both an index page
+  (`/tutorial`) and its subpages (`/tutorial/body`, `/tutorial/security`,
+  ...) in the same branch — an extremely common docs-site pattern.
+  `dirname("/tutorial")` = `/` (it treats "tutorial" as a filename inside
+  the root, not as the section's own name), and `commonpath()` across a
+  set that includes `/` collapses the *entire branch* to the site root,
+  triggering the degenerate host-only fallback for a branch that
+  obviously shared a real, meaningful prefix. The dirname-based heuristic
+  was written to solve a rare case (single-URL branches) but applied
+  *universally*, breaking the common case (a section's index page sitting
+  alongside its own subpages) instead. `docs.manim.community`'s branches
+  never happened to include a bare section-index URL, so the first site
+  tested against couldn't have caught this — exactly why testing against
+  one friendly site isn't a real test of a general-purpose predicate.
+- **A second, related bug surfaced by fixing the first**: once
+  `derive_prefix` correctly returned `/tutorial/` (with a trailing slash)
+  for that branch, `is_in_scope`'s own `/tutorial` URL (the section's bare
+  index page, itself part of the branch the prefix was derived from) got
+  *rejected* by its own prefix — `"/tutorial".startswith("/tutorial/")`
+  is `False` in Python (the bare path is shorter than the slash-terminated
+  prefix). Fixed by comparing `(path + "/").startswith(prefix)` instead of
+  `path.startswith(prefix)`, which accepts the bare section URL while
+  still correctly rejecting a merely text-prefixed sibling like
+  `/tutorial2` or `/how-toz`.
+- **Fix**: `derive_prefix` now only applies the dirname heuristic when a
+  branch has exactly one *distinct* path (no sibling data to disambiguate
+  "this URL is a directory" vs. "this URL is a leaf file"). For any branch
+  with more than one distinct path, it computes `commonpath()` on the raw
+  paths directly — an index page is already a valid prefix of its own
+  subpages, so `commonpath` finds the right boundary without any
+  adjustment needed. Both bugs got dedicated regression tests
+  (`tests/test_scope.py`): a 3-URL section-index-plus-subpages case for
+  `derive_prefix`, and a bare-index-URL-matches-its-own-prefix /
+  sibling-still-rejected pair for `is_in_scope`.
+- **Why it matters**: this is exactly the failure mode multi-site testing
+  exists to catch, and exactly why the correction to test against 5
+  structurally different sites (not just the one the original broken
+  artifacts came from) mattered — a scope predicate that only sees one
+  site's URL shapes will silently overfit to it. Two other outcomes from
+  the same testing round, reported honestly rather than forced: the
+  chosen "JS-rendered nav" test site (stackblitz.com) came back
+  `required_rendering=False` (73% href overlap between server- and
+  browser-rendered versions) — it didn't actually demonstrate the
+  JS-required case, its nav chrome turned out to be present in static
+  HTML. And none of the 5 sites' root pages exposed live `?page=N`-style
+  pagination links, so the "pagination is a scoping trap" case (real,
+  and `is_in_scope` genuinely doesn't filter it — see `ROADMAP.md` #15a)
+  stayed undemonstrated against real fixture data this round, not because
+  it isn't real but because the picked site's root page didn't happen to
+  surface it.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->
