@@ -28,7 +28,7 @@ from storage.query import query_chunks, format_query_results
 from content.extraction_units import make_extraction_units_fn
 from export.dataset_report import build_dataset_report
 from export.export import load_canonical_records
-from content.chrome_strip import DEFAULT_EXCLUDED_SELECTOR, DEFAULT_EXCLUDED_TAGS, strip_text_patterns
+from content.chrome_strip import DEFAULT_EXCLUDED_SELECTOR, DEFAULT_EXCLUDED_TAGS, normalize_link_text, strip_text_patterns
 
 EMBEDDING_MODEL_NAME = "nomic-embed-text"  # LocalOllamaEmbeddings' default; keep in sync (see get_llm)
 EMBEDDING_DIM = 768  # measured in step 6 -- see LESSONS_LEARNED.md #17
@@ -197,8 +197,9 @@ def _make_fetch_fn(crawler: AsyncWebCrawler):
     (crawl4ai's own HTML-cleaning stage, the mechanism chrome_strip.py's
     own docstring says this was always meant to use) rather than
     re-running clean_html()+DefaultMarkdownGenerator() a second time on
-    already-converted markdown. strip_text_patterns() (layer 2, UI text
-    that survives structural exclusion) still runs on the resulting
+    already-converted markdown. normalize_link_text() (layer 2, markdown
+    link-syntax reduction) and strip_text_patterns() (layer 3, UI text
+    that survives structural exclusion) still run on the resulting
     markdown, same as chrome_strip.strip_chrome()'s own pipeline."""
     async def fetch_fn(url: str) -> tuple[str, list[str]]:
         run_config = CrawlerRunConfig(
@@ -214,7 +215,7 @@ def _make_fetch_fn(crawler: AsyncWebCrawler):
             raise FetchTimeout(result.error_message or "fetch failed")
         links = result.links.get("internal", []) + result.links.get("external", [])
         raw_hrefs = [l.get("href", "") for l in links if l.get("href")]
-        markdown = strip_text_patterns(result.markdown)
+        markdown = strip_text_patterns(normalize_link_text(result.markdown))
         return markdown, raw_hrefs
     return fetch_fn
 

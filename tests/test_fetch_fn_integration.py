@@ -28,6 +28,7 @@ FIXTURE_HTML = """
 <main>
 <h1>Real API Reference</h1>
 <p>This function does something real, worth extracting.</p>
+<p>See <a href="/reference/Widget.html#Widget" title="reference.Widget">Widget</a> for the related class.</p>
 <button title="Copy to clipboard">Copy to clipboard</button>
 </main>
 <footer>Copyright 2026 Example Corp. All rights reserved.</footer>
@@ -47,6 +48,8 @@ class TestRealFetchFnStripsChrome(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Copy to clipboard", markdown)
         self.assertIn("Real API Reference", markdown)
         self.assertIn("something real, worth extracting", markdown)
+        self.assertIn("Widget", markdown)
+        self.assertNotIn("reference/Widget.html", markdown)
 
 
 if __name__ == "__main__":

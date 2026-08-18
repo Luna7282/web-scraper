@@ -1,6 +1,6 @@
 """Parser-layer chrome stripping.
 
-Two layers, applied in order:
+Three layers, applied in order:
 
 1. Structural: exclude by semantic HTML tag and ARIA role, via crawl4ai's
    own HTML-cleaning stage (LXMLWebScrapingStrategy's excluded_tags /
@@ -9,7 +9,12 @@ Two layers, applied in order:
    fastapi.tiangolo.com's rendered HTML) is caught by excluding the
    `button` tag itself, no site-specific class needed.
 
-2. Text-pattern fallback: some UI affordances leak through as bare text
+2. Link-text normalization: `[text](url "title")` collapses to its
+   visible text (see normalize_link_text below) -- markdown link syntax
+   measured at 46.7% of real chunk characters (LESSONS_LEARNED.md #31),
+   the largest single content-quality finding in this project.
+
+3. Text-pattern fallback: some UI affordances leak through as bare text
    even after structural exclusion (a theme's tooltip text sitting in a
    plain <span> with no distinguishing tag or role, for instance). The
    patterns are theme-specific by nature -- every docs theme phrases its
@@ -17,12 +22,14 @@ Two layers, applied in order:
    config (DEFAULT_TEXT_PATTERNS below, overridable), never hardcoded
    inside the matching logic itself.
 
-Nothing here branches on a domain name or theme name. Same two functions
-run against every site; only the *data* (excluded_tags/selector, text
-patterns) is meant to be extended, and that extension point is the
-constants below / a caller-supplied override, not a code path.
+Nothing here branches on a domain name or theme name. Same functions run
+against every site; only the *data* (excluded_tags/selector, generic link
+text, text patterns) is meant to be extended, and that extension point is
+the constants below / a caller-supplied override, not a code path.
 """
 from __future__ import annotations
+
+import re
 
 from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
@@ -47,6 +54,19 @@ DEFAULT_EXCLUDED_SELECTOR = (
 # Theme-specific by nature -- extend per-theme via the patterns param,
 # don't hardcode a new phrase into strip_text_patterns() itself.
 DEFAULT_TEXT_PATTERNS = ["copy to clipboard", "copied to clipboard", "copied!", "make interactive"]
+
+# Link visible-text that carries no identifying information on its own --
+# heading-anchor pilcrows, generic "click here" style copy. Generic across
+# themes, not site-specific -- extend via the generic_text param, don't
+# hardcode a new phrase into normalize_link_text() itself. A link matching
+# one of these is dropped entirely (text and URL both), not just
+# unwrapped, since neither side is worth keeping.
+DEFAULT_GENERIC_LINK_TEXT = {
+    "here", "this", "link", "click here", "this page", "this link",
+    "read more", "more", "learn more", "source", "top", "¶",
+}
+
+_LINK_RE = re.compile(r'(!?)\[([^\]]*)\]\([^)\s]+(?:\s+"[^"]*")?\)')
 
 
 def clean_html(html: str, url: str, excluded_tags=None, excluded_selector=None) -> str:
@@ -84,11 +104,47 @@ def strip_text_patterns(markdown: str, patterns=None) -> str:
     return "\n".join(out_lines)
 
 
-def strip_chrome(html: str, url: str, excluded_tags=None, excluded_selector=None, text_patterns=None) -> str:
-    """Full pipeline: structural strip -> markdown -> text-pattern
-    fallback. Offline, no network call -- mirrors what CrawlerRunConfig
-    (excluded_tags/excluded_selector) does for the real pipeline, so this
-    can be developed and tested against cached HTML fixtures."""
+def normalize_link_text(markdown: str, generic_text=None) -> str:
+    """Reduces `[text](url "title")` to its visible text. Measured at
+    46.7% of real chunk characters being link syntax, only 2.9% visible
+    text -- see LESSONS_LEARNED.md #31, the largest single content-quality
+    finding in this project.
+
+    URLs are dropped, not preserved in a reference list: every link
+    surveyed in the real corpus either duplicated its own visible text
+    (a symbol name linking to its own definition) or pointed at a
+    same-page anchor -- the target added no fact the text didn't already
+    carry, and this project's Q&A/RAG pipeline never consumes a link
+    target as data (source_url is already a separate canonical-record
+    field). Images (`![...]`) are left untouched -- alt text without the
+    src isn't independently useful, so there's nothing to unwrap.
+
+    A link whose visible text is empty, has no alphanumeric content, or
+    matches DEFAULT_GENERIC_LINK_TEXT (heading-anchor pilcrows, "click
+    here" style copy) is dropped entirely -- neither the text nor the URL
+    is worth keeping, so unwrapping it would just leave dead punctuation
+    or noise behind."""
+    generic = {g.strip().lower() for g in (generic_text if generic_text is not None else DEFAULT_GENERIC_LINK_TEXT)}
+
+    def repl(match: re.Match) -> str:
+        bang, text = match.group(1), match.group(2)
+        if bang:
+            return match.group(0)
+        stripped = text.strip().strip("`")
+        if not stripped or not re.search(r"[A-Za-z0-9]", stripped) or stripped.lower() in generic:
+            return ""
+        return text
+
+    return _LINK_RE.sub(repl, markdown)
+
+
+def strip_chrome(html: str, url: str, excluded_tags=None, excluded_selector=None, text_patterns=None, generic_link_text=None) -> str:
+    """Full pipeline: structural strip -> markdown -> link-text
+    normalization -> text-pattern fallback. Offline, no network call --
+    mirrors what CrawlerRunConfig (excluded_tags/excluded_selector) does
+    for the real pipeline, so this can be developed and tested against
+    cached HTML fixtures."""
     cleaned_html = clean_html(html, url, excluded_tags, excluded_selector)
     markdown = DefaultMarkdownGenerator().generate_markdown(input_html=cleaned_html, base_url=url).raw_markdown
+    markdown = normalize_link_text(markdown, generic_link_text)
     return strip_text_patterns(markdown, text_patterns)

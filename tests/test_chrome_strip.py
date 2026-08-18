@@ -3,7 +3,7 @@ no dependency on fixture content (fixture-based before/after reporting is
 separate, see tests/report_chrome_strip.py)."""
 import unittest
 
-from content.chrome_strip import clean_html, strip_text_patterns, strip_chrome
+from content.chrome_strip import clean_html, normalize_link_text, strip_text_patterns, strip_chrome
 
 BASE = "https://example.com/page"
 
@@ -91,6 +91,45 @@ class TestStripTextPatterns(unittest.TestCase):
         self.assertIn("Real content", result)
 
 
+class TestNormalizeLinkText(unittest.TestCase):
+    def test_informative_link_text_kept_url_dropped(self):
+        md = 'Let’s define a new [`Scene`](https://docs.manim.community/en/stable/reference/manim.scene.scene.Scene.html#manim.scene.scene.Scene "manim.scene.scene.Scene") called `Shapes`.'
+        result = normalize_link_text(md)
+        self.assertIn("`Scene`", result)
+        self.assertNotIn("docs.manim.community", result)
+        self.assertNotIn("(", result)
+
+    def test_heading_anchor_pilcrow_dropped_entirely(self):
+        md = '### Placing mobjects[¶](https://docs.manim.community/en/stable/tutorials/building_blocks.html#placing-mobjects "Link to this heading")'
+        result = normalize_link_text(md)
+        self.assertEqual(result, "### Placing mobjects")
+
+    def test_reference_table_row_reduced_to_symbol_names(self):
+        md = '| [`biolinum`](https://docs.manim.community/en/stable/reference/manim.utils.tex_templates.TexFontTemplates.html#manim.utils.tex_templates.TexFontTemplates.biolinum "manim.utils.tex_templates.TexFontTemplates.biolinum")  | Biolinum  |'
+        result = normalize_link_text(md)
+        self.assertEqual(result, "| `biolinum`  | Biolinum  |")
+
+    def test_generic_click_here_text_dropped(self):
+        md = 'See the docs [click here](https://example.com/docs) for details.'
+        result = normalize_link_text(md)
+        self.assertEqual(result, "See the docs  for details.")
+
+    def test_custom_generic_text_overrides_default(self):
+        md = "[widget](https://example.com/widget) info"
+        result = normalize_link_text(md, generic_text=["widget"])
+        self.assertEqual(result, " info")
+
+    def test_image_syntax_left_untouched(self):
+        md = "![alt text](https://example.com/pic.png)"
+        result = normalize_link_text(md)
+        self.assertEqual(result, md)
+
+    def test_plain_text_without_links_unchanged(self):
+        md = "Just a normal paragraph with no links at all."
+        result = normalize_link_text(md)
+        self.assertEqual(result, md)
+
+
 class TestStripChromeEndToEnd(unittest.TestCase):
     def test_full_pipeline_removes_nav_and_button_text(self):
         html = (
@@ -104,6 +143,12 @@ class TestStripChromeEndToEnd(unittest.TestCase):
         self.assertNotIn("Home About", result)
         self.assertNotIn("Copy to clipboard", result)
         self.assertIn("x = 1", result)
+
+    def test_full_pipeline_normalizes_link_syntax(self):
+        html = '<html><body><main><p>See <a href="https://example.com/api#Widget" title="example.com api Widget">Widget</a> for details.</p></main></body></html>'
+        result = strip_chrome(html, BASE)
+        self.assertIn("Widget", result)
+        self.assertNotIn("example.com", result)
 
 
 if __name__ == "__main__":

@@ -1489,6 +1489,74 @@ factual errors; add new ones at the bottom.
   touching the chunking architecture at all. Not built this step --
   the decision is the direction, not an implementation.
 
+## 2026-08-19 — Phase 3 Step 1: link-text normalization
+
+### 34. Link syntax reduced to visible text, URLs dropped entirely -- tested against three options on the two cited examples first
+Phase 2 measured link syntax at 46.7% of chunk characters (43.8 points
+pure overhead) and reordered Phase 3 to fix this before anything else
+that touches chunk content, so nothing downstream gets measured twice.
+
+**Three options tested on the actual cited examples** (TexFontTemplates
+chunk 2, 89.5% link syntax; `building_blocks.html` chunk 5, a tutorial
+prose chunk) before choosing, per the explicit ask:
+- **A -- drop the URL, keep visible text.** TexFontTemplates chunk 2:
+  1747 -> 271 chars (15.5% of original). Tutorial chunk 5: 1182 -> 717
+  chars (60.7%). Every symbol name (`biolinum`, `Scene`, `add()`)
+  survived as plain text; nothing informative was lost in either
+  example.
+- **B -- per-chunk reference list** (citation markers inline, URLs
+  moved to a trailing block). Barely reduced size: TexFontTemplates
+  1747 -> 1393 chars (79.7% retained), tutorial 1182 -> 1047 (88.6%
+  retained). Almost every link in these chunks points at a *different*
+  URL, so a reference list has nothing to deduplicate -- it just moves
+  the same bytes to the bottom of the chunk instead of removing them.
+- **C -- keep the URL only where visible text is uninformative**, fall
+  back to the link's `title` attribute otherwise. Reproduced option A's
+  savings on both good examples, but on the heading-anchor pilcrow
+  case (`[¶](... "Link to this heading")`) it fell back to the title
+  and printed **"Link to this heading"** literally into the chunk --
+  reintroducing exactly the boilerplate normalization exists to
+  remove. The fallback also needs an ever-growing blocklist of
+  theme-specific title phrases to stay clean, which conflicts with the
+  no-site-specific-logic requirement more than option A's plain
+  generic-text list does.
+
+**Chosen: option A.** Every link actually observed in the real corpus
+either duplicated its own visible text (a symbol name linking to its
+own definition) or pointed at a same-page anchor -- the URL never
+carried a fact the text didn't already carry, and this project's Q&A
+pairs and RAG chunks are never rendered as clickable links, so a
+literal URL string has no consumer downstream (`source_url` is already
+a separate canonical-record field, independent of chunk text). The
+theoretical risk flagged before testing -- two identically-worded links
+in different places pointing at different targets, so the text alone
+becomes ambiguous -- did not appear in either real example, and no
+mechanism here would detect it if it did; noted as an open risk, not
+built around.
+
+**Implementation**: `content/chrome_strip.py::normalize_link_text()`,
+new layer 2 in the `strip_chrome()` pipeline (structural strip -> link
+normalization -> text-pattern fallback, renumbered from two layers to
+three). `DEFAULT_GENERIC_LINK_TEXT` (pilcrows, "click here", "read
+more", etc.) is a plain, non-site-specific list, overridable via a
+`generic_text` param -- same convention as `DEFAULT_TEXT_PATTERNS` in
+the same file, not a new config.py knob. A link whose text is empty,
+has no alphanumeric content, or matches the generic-text list is
+dropped entirely (both text and URL); every other link keeps its
+visible text and drops the `(url "title")` syntax. Images (`![...]`)
+are left untouched -- alt text without a `src` isn't independently
+useful, so there's nothing to unwrap.
+
+Wired into the real fetch path, not just tested in isolation --
+`main.py::_make_fetch_fn` now calls `normalize_link_text()` on
+`result.markdown` before `strip_text_patterns()`, the same lesson from
+entry #28 applied proactively this time: define it, test it, *and*
+confirm the real entry point calls it, in the same step, not three
+separate ones. `tests/test_fetch_fn_integration.py` gained an assertion
+that a real content link survives as text with its URL gone, through
+the actual `AsyncWebCrawler` path, not `strip_chrome()` called
+directly.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->
