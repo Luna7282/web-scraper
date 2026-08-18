@@ -543,4 +543,87 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-18 — Step 5 (part 2): worker loops, tested against stubs before any network call
+
+### 14. Testing a retry meant testing a re-crawl, not just a re-extraction
+- **Problem**: writing failure-mode tests for `extract_worker` (malformed
+  JSON, rate limits), the first attempt seeded `content_queue` with one
+  static item and ran `extract_worker` alone. Every test that exercised
+  an actual retry (not just the first failure) hung until timeout.
+- **Root cause**: by design (`in_progress` spans crawl *and* extract,
+  `LESSONS_LEARNED.md` #12), a requeued row goes back to `status='queued'`
+  — getting new content requires being claimed and fetched again, not
+  just re-popped from `content_queue`. `mark_extract_outcome`'s retry
+  path only touches the frontier row; it doesn't and shouldn't know how
+  to re-supply content. A test that only runs `extract_worker` has
+  nothing to perform that re-fetch, so after the first failure the row
+  sits in `queued` forever with nothing claiming it.
+- **Fix**: added a trivial `recrawl_stub` helper to the test file — claims
+  a queued row and immediately supplies its (fixed) content, standing in
+  for a real `crawl_worker` without dragging in `scope_check`/`fetch_fn`
+  concerns unrelated to what the test is actually checking. Two tests
+  (crawl_worker's own success-path test, extract_worker's retry tests)
+  had the same shape of bug for the same underlying reason and got the
+  same fix.
+- **Why it matters**: this is a direct, concrete consequence of the
+  "single `in_progress` spans both sub-phases" design decision from step
+  5 part 1 — both a quiescence-based integration test and a retry-path
+  test need something to close the crawl→extract loop, not just drive
+  one stage in isolation. Documented here so the
+  next test added for a retry path doesn't rediscover this by watching a
+  test hang for the first time.
+
+### 15. robots.txt/sitemap.xml/llms.txt reality-checked against 5 real sites — two real gaps found, one reporting bug caught before it shipped bad fixtures
+- **`Crawl-delay` is parsed by `RobotFileParser` but never read by
+  `HostPolicy`.** None of the 5 fixture sites specify one (confirmed —
+  not assumed — via `tests/fixtures/robots/*.json`), so this hasn't
+  broken anything yet, but a real target site that does specify one would
+  have it silently ignored. `crawl_worker` also has no per-host
+  concurrency semaphore or delay mechanism at all yet — the original
+  "no politeness" gap is only partially closed (robots.txt disallow is
+  now respected; rate/concurrency throttling per host is not). See
+  `ROADMAP.md` #9.
+- **`blog.cloudflare.com/sitemap.xml` is a `<sitemapindex>`, not a flat
+  `<urlset>`.** Confirmed by fetching and checking the root XML tag, not
+  assumed — this is exactly the "large sites nest their sitemaps" case,
+  and it showed up on the first real site checked that has a
+  sitemap.xml. `robots_cache.py` records the URL but doesn't fetch or
+  parse sitemap content at all yet, so nothing is broken by this today —
+  but anything that later reads sitemap content needs to check the root
+  tag and recurse one level, not assume `urlset`. See `ROADMAP.md` #9a.
+- **The reporting script itself had a bug that would have saved garbage
+  fixtures if not caught**: `requests` returns a response body on a 404
+  (most sites serve a real HTML error page, not an empty body), and the
+  first version of the fetch-and-save script only checked `if text:`
+  before treating a response as "found" — meaning all five `llms.txt`
+  404s (none of the 5 sites have one) got initially saved as if they were
+  genuine 2,300–390,000-character `llms.txt` files, and `www.manim.community`'s
+  404 sitemap page got saved as its `sitemap.xml`. Caught by checking the
+  actual status codes in the saved JSON metadata (which *was* computed
+  correctly — only the print statements and the file-save condition used
+  the wrong check) before treating the fixture set as done, deleted the
+  mislabeled files. `RobotsCache` itself was never affected — its own
+  `fetch_text_fn` contract already checked `status_code == 200` correctly
+  from the start; this was purely a bug in the one-off reporting/fixture
+  script, not the production code.
+- **Why it matters**: "including the misses" was the actual instruction,
+  and a miss saved as if it were a hit is worse than not caching it at
+  all — it would have taught `tests/test_robots_cache_fixtures.py` the
+  wrong lesson permanently. Verify what a fetch script actually saved
+  before trusting it as a fixture, the same discipline as verifying any
+  other claimed-successful operation in this project.
+
+### 16. Rate-limit backoff proven not to block a worker slot, not just designed that way
+- `extract_worker`'s `RateLimitError` path calls
+  `frontier.mark_extract_outcome(..., backoff_seconds=...)`, which sets
+  `not_before` and releases the row back to `queued` rather than the
+  worker sleeping in place (frontier.py's design from step 5 part 1).
+  `tests/test_extract_worker.py`'s rate-limit test proves this rather
+  than just asserting the code path was taken — it polls for the row to
+  be back in `queued` (not `in_progress`) well before the requested
+  backoff (5s) would have elapsed if the worker had actually slept, and
+  fails loudly if that doesn't happen fast.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->

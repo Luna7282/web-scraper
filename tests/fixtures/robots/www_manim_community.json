@@ -1,0 +1,15 @@
+{
+  "host": "www.manim.community",
+  "robots_status_code": 200,
+  "robots_found": true,
+  "disallows_root_for_star": false,
+  "crawl_delay": null,
+  "sitemap_refs_in_robots": [
+    "https://www.manim.community/sitemap/sitemap-index.xml"
+  ],
+  "sitemap_status_code": 404,
+  "sitemap_found": false,
+  "sitemap_root_tag": null,
+  "llms_status_code": 404,
+  "llms_found": false
+}

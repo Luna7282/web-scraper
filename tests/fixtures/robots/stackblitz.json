@@ -1,0 +1,13 @@
+{
+  "host": "stackblitz.com",
+  "robots_status_code": 404,
+  "robots_found": false,
+  "disallows_root_for_star": false,
+  "crawl_delay": null,
+  "sitemap_refs_in_robots": [],
+  "sitemap_status_code": 404,
+  "sitemap_found": false,
+  "sitemap_root_tag": null,
+  "llms_status_code": 404,
+  "llms_found": false
+}

@@ -1,0 +1,15 @@
+{
+  "host": "blog.cloudflare.com",
+  "robots_status_code": 200,
+  "robots_found": true,
+  "disallows_root_for_star": false,
+  "crawl_delay": null,
+  "sitemap_refs_in_robots": [
+    "https://blog.cloudflare.com/sitemap.xml"
+  ],
+  "sitemap_status_code": 200,
+  "sitemap_found": true,
+  "sitemap_root_tag": "sitemapindex",
+  "llms_status_code": 404,
+  "llms_found": false
+}

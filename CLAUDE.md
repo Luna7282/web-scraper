@@ -156,9 +156,9 @@ whatever the frontier's status column says.
 ## Scope predicate (`scope.py`)
 
 `normalize_url()`, `derive_prefix()`, and `is_in_scope()` are pure
-functions, no I/O — the frontier (once built) and `main.py --dry-run` both
-call them, and they're unit-tested offline against real fixture data from
-5 structurally different sites in `tests/fixtures/` (see
+functions, no I/O — `pipeline.py`'s `crawl_worker` and `main.py --dry-run`
+both call them, and they're unit-tested offline against real fixture data
+from 5 structurally different sites in `tests/fixtures/` (see
 `tests/fetch_fixtures.py` to regenerate). **No site-specific logic
 belongs in `scope.py`** — if a site needs different behavior, it has to
 come from config (host allowlist, prefix list, exclude patterns), never a
@@ -167,6 +167,60 @@ had one real bug from over-fitting to a single test site (a universal
 `dirname()`-before-`commonpath()` heuristic that broke on any branch
 containing its own section-index page — see `LESSONS_LEARNED.md` #8);
 treat that as the standing warning it is before changing this file.
+
+## Worker loops (`pipeline.py`, `writer.py`, `extraction.py`, `robots_cache.py`, `progress_display.py`)
+
+`crawl_worker` / `extract_worker` / `writer_worker` in `pipeline.py` are
+the real implementations of `frontier.py`'s design — built and tested
+against stubs (`tests/stub_fetcher.py`, inline stub `score_fn`/`extract_fn`
+in the test files) before any of them ever touched the network. Not wired
+into `main.py` yet; `orchestrator.py` (the old single-queue crawler) is
+still what actually runs.
+
+- **Every I/O dependency is injected** (`fetch_fn`, `score_fn`,
+  `extract_fn`, `Writer`) — this is what makes offline testing possible at
+  all, not an incidental design choice. Keep new worker logic testable the
+  same way; don't reach for the real crawl4ai/LLM client from inside a
+  worker function directly.
+- **A retry re-fetches, not just re-extracts** (see the state machine —
+  `in_progress` spans both sub-phases). A test that exercises a retry path
+  needs something claiming `queued` rows and re-supplying content, not
+  just re-running the failing stage in isolation — see
+  `tests/stub_fetcher.py`-adjacent `recrawl_stub` helpers in
+  `tests/test_extract_worker.py` / `tests/test_crawl_worker.py`, and
+  `LESSONS_LEARNED.md` #14 for what happens when a test forgets this (it
+  hangs, it doesn't fail fast).
+- **Malformed LLM JSON**: `extraction.py::parse_qa_json` tries direct
+  parse, then a stripped code fence, then the substring between the first
+  `[` and last `]` (salvages prose-wrapped JSON, the common case) before
+  raising `MalformedExtractionError`. An empty-but-valid parse (`[]`) is
+  not an error — don't conflate "the LLM found nothing" with "the
+  response was unparseable," they need different handling upstream.
+- **Rate limits release the row, they don't sleep the worker.**
+  `RateLimitError(retry_after=...)` → `frontier.mark_extract_outcome(...,
+  backoff_seconds=...)` sets `not_before` and hands the row back to
+  `queued`; the worker moves on immediately. A worker `sleep`ing in place
+  for a 429 blocks that concurrency slot for the full backoff — with a
+  small pool, a few 429s idle the whole stage.
+- **`Writer` (in `writer.py`) has exactly one caller: `writer_worker`.**
+  `crawl_worker`/`extract_worker`'s signatures structurally cannot receive
+  a `Writer` or Chroma client (enforced by
+  `tests/test_writer_ownership.py`, which fails if either one ever grows a
+  parameter with "writer" or "chroma" in its name) — this is what lets
+  `Writer` skip internal locking entirely and instead assert loudly
+  (`RuntimeError`) if it's ever called concurrently, rather than silently
+  serializing calls the way the old `asyncio.Lock`-per-write pattern did.
+- **robots.txt is respected, including for an explicitly-selected
+  branch** — `crawl_worker` checks `RobotsCache` before every fetch;
+  disallowed URLs go straight to `failed` (`mark_permanently_failed`, no
+  retry) with a loud print, never silently dropped or silently crawled
+  anyway. Per-host rate limiting/politeness delay is **not** built yet —
+  `Crawl-delay` is parsed by stdlib `RobotFileParser` but never read (see
+  `ROADMAP.md` #9); none of the 5 fixture sites specify one, so this is
+  unverified against a real case, not proven safe.
+- **Progress display** (`progress_display.py`) is read-only against the
+  frontier — `counts_by_status()`/`in_progress_urls()` only ever `SELECT`.
+  Safe to poll on any interval; it cannot perturb the state machine.
 
 ## Working conventions in this repo
 

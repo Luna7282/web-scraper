@@ -108,12 +108,39 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
    a `meta.json` beside `chroma_db/`) at creation time, and refuse/warn if a
    later run's model doesn't match. **Size: S.**
 
-9. **No rate limiting, politeness delay, or robots.txt handling** in
-   `discovery.py` or `orchestrator.py`. N concurrent workers (default 5,
-   user-configurable, no upper bound) hit the target site as fast as
-   crawl4ai can fetch, with no backoff.
-   *Fix*: add a per-domain delay between requests and a robots.txt check
-   before enqueueing a URL. **Size: S–M.**
+9. **[Partially resolved, step 5] robots.txt is now respected; per-host
+   rate limiting/politeness delay is still missing.** `robots_cache.py` +
+   `crawl_worker`'s pre-fetch check (`pipeline.py`) now refuse a
+   disallowed URL outright (`mark_permanently_failed`, no retry, logged
+   loudly) — this applies uniformly, including to a branch the user
+   explicitly selected; not configurable to override yet, which is a
+   deliberate safety default worth revisiting only if a real need for an
+   override shows up. What's still missing: crawl_worker has no per-host
+   concurrency semaphore or inter-request delay at all — N crawl workers
+   still hit a single host as fast as they can claim work, with nothing
+   throttling concurrent requests to the *same* host specifically (the
+   original gap this item described). Confirmed against real data from
+   the 5 fixture sites (`tests/fixtures/robots/`): none of the 5 specify
+   `Crawl-delay`, so this hasn't bitten anything yet, but `RobotFileParser`
+   parses it fine (`parser.crawl_delay(ua)`) and `HostPolicy` never reads
+   it — if a real target site does specify one, it's silently ignored
+   right now. *Fix*: add a per-host `asyncio.Semaphore` (concurrency cap)
+   and honor `Crawl-delay` as a minimum inter-request spacing per host in
+   `crawl_worker`, sourced from `HostPolicy.robots_parser.crawl_delay()`.
+   **Size: S–M.**
+
+9a. **Sitemap discovery doesn't follow a `sitemapindex`.** Confirmed
+    against real data: `blog.cloudflare.com/sitemap.xml` is a
+    `<sitemapindex>` (points at further sitemaps, not URLs directly) —
+    a common pattern on large sites, not a one-off. `robots_cache.py`
+    records the sitemap URL but never fetches or parses its content, so
+    this doesn't currently affect anything, but if sitemap-based seeding
+    is added later it needs to recurse one level (parse `<sitemapindex>`,
+    fetch each child `<sitemap>`, only then expect a `<urlset>`) rather
+    than assuming every `/sitemap.xml` is directly a flat URL list.
+    *Fix*: when sitemap content is actually consumed, check the root tag
+    first (`urlset` vs `sitemapindex`) and recurse one level for the
+    latter. **Size: S.**
 
 10. **Unbounded / off-target crawl scope when "all" is selected.**
     `allowed_branch_prefixes = ["all"]` fully disables the scope check in

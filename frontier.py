@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 
@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS frontier (
     relevance_score REAL,
     retry_count     INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
+    not_before      TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -157,12 +158,15 @@ class Frontier:
             self.quiescent.set()
 
     async def _locked_claim(self) -> FrontierRow | None:
+        now = _now()
         cur = await self._conn.execute(
             """
             UPDATE frontier
             SET status = 'in_progress', updated_at = ?
             WHERE url = (
-                SELECT url FROM frontier WHERE status = 'queued'
+                SELECT url FROM frontier
+                WHERE status = 'queued'
+                AND (not_before IS NULL OR not_before <= ?)
                 ORDER BY created_at LIMIT 1
             )
             AND (
@@ -171,7 +175,7 @@ class Frontier:
             )
             RETURNING *
             """,
-            (_now(), self._max_pages, self._max_pages),
+            (now, now, self._max_pages, self._max_pages),
         )
         row = await cur.fetchone()
         await self._conn.commit()
@@ -250,9 +254,17 @@ class Frontier:
         await self._conn.commit()
         await self._locked_leave_in_progress(url)
 
-    async def _locked_retry_or_fail(self, url: str, error: str) -> bool:
+    async def _locked_retry_or_fail(
+        self, url: str, error: str, backoff_seconds: float = 0.0
+    ) -> bool:
         """Returns True if the row is now terminally failed, False if it
-        was requeued for another attempt."""
+        was requeued for another attempt. backoff_seconds sets not_before
+        instead of sleeping in-place -- releasing the row rather than
+        holding a worker slot idle for the delay. A rate-limit caller
+        passes a real delay (from Retry-After or an exponential backoff);
+        an ordinary fetch/extraction failure passes 0 (immediate retry
+        eligibility, still subject to the worker naturally being busy with
+        other queued work first)."""
         cur = await self._conn.execute("SELECT retry_count FROM frontier WHERE url = ?", (url,))
         row = await cur.fetchone()
         retry_count = row["retry_count"] + 1
@@ -263,10 +275,13 @@ class Frontier:
             )
             await self._locked_mark_terminal(url, "failed", error)
             return True
+        not_before = None
+        if backoff_seconds > 0:
+            not_before = (datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)).isoformat()
         await self._conn.execute(
-            "UPDATE frontier SET status = 'queued', retry_count = ?, last_error = ?, updated_at = ? "
-            "WHERE url = ?",
-            (retry_count, error, _now(), url),
+            "UPDATE frontier SET status = 'queued', retry_count = ?, last_error = ?, "
+            "not_before = ?, updated_at = ? WHERE url = ?",
+            (retry_count, error, not_before, _now(), url),
         )
         await self._conn.commit()
         await self._locked_leave_in_progress(url)
@@ -324,19 +339,31 @@ class Frontier:
             await self._locked_record_score(url, score)
             await self._locked_resolve_children(url, promote)
 
-    async def mark_fetch_failed(self, url: str, error: str) -> bool:
+    async def mark_fetch_failed(self, url: str, error: str, backoff_seconds: float = 0.0) -> bool:
         async with self._lock:
-            return await self._locked_retry_or_fail(url, error)
+            return await self._locked_retry_or_fail(url, error, backoff_seconds)
 
-    async def mark_extract_outcome(self, url: str, status: str, error: str | None = None) -> bool:
+    async def mark_extract_outcome(
+        self, url: str, status: str, error: str | None = None, backoff_seconds: float = 0.0
+    ) -> bool:
         """status: 'skipped_extract' (direct terminal, not a failure) or
-        'failed' (retried like a fetch failure)."""
+        'failed' (retried like a fetch failure -- e.g. a 429 from the LLM
+        provider, passing backoff_seconds so the row waits via not_before
+        instead of a worker sleeping in place)."""
         assert status in ("skipped_extract", "failed")
         async with self._lock:
             if status == "skipped_extract":
                 await self._locked_mark_terminal(url, "skipped_extract")
                 return True
-            return await self._locked_retry_or_fail(url, error or "extraction failed")
+            return await self._locked_retry_or_fail(url, error or "extraction failed", backoff_seconds)
+
+    async def mark_permanently_failed(self, url: str, error: str) -> None:
+        """Direct terminal failure, no retry accounting -- for failures a
+        retry can't possibly fix (robots.txt disallow, a URL that's
+        out-of-scope by the time it's claimed, etc), as opposed to
+        mark_fetch_failed's retry-then-eventually-fail path."""
+        async with self._lock:
+            await self._locked_mark_terminal(url, "failed", error)
 
     async def mark_written(self, url: str) -> None:
         """Writer-owned: only called after the JSONL/Chroma write actually
@@ -344,9 +371,9 @@ class Frontier:
         async with self._lock:
             await self._locked_mark_terminal(url, "done")
 
-    async def mark_write_failed(self, url: str, error: str) -> bool:
+    async def mark_write_failed(self, url: str, error: str, backoff_seconds: float = 0.0) -> bool:
         async with self._lock:
-            return await self._locked_retry_or_fail(url, error)
+            return await self._locked_retry_or_fail(url, error, backoff_seconds)
 
     async def put_content(self, content_queue: asyncio.Queue, item) -> None:
         async with self._lock:
@@ -410,3 +437,20 @@ class Frontier:
                 "SELECT status, COUNT(*) FROM frontier GROUP BY status"
             )
             return dict(await cur.fetchall())
+
+    async def get_all_urls(self) -> set[str]:
+        """Read-only, for tests/debugging -- every url ever inserted."""
+        async with self._lock:
+            cur = await self._conn.execute("SELECT url FROM frontier")
+            return {row["url"] for row in await cur.fetchall()}
+
+    async def in_progress_urls(self, limit: int = 20) -> list[str]:
+        """Read-only, for the progress display -- never mutates state, so
+        it can't perturb the state machine no matter how often it's polled."""
+        async with self._lock:
+            cur = await self._conn.execute(
+                "SELECT url FROM frontier WHERE status = 'in_progress' "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            )
+            return [row["url"] for row in await cur.fetchall()]

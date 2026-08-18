@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap>
+    <loc>https://blog.cloudflare.com/sitemap-posts.xml</loc>
+    <lastmod>2026-08-17T20:23:43.296Z</lastmod>
+  </sitemap>
+  <sitemap>
+    <loc>https://blog.cloudflare.com/sitemap-archives.xml</loc>
+    <lastmod>2026-08-17T20:23:43.296Z</lastmod>
+  </sitemap>
+  <sitemap>
+    <loc>https://blog.cloudflare.com/sitemap-authors.xml</loc>
+    <lastmod>2026-08-17T20:23:43.296Z</lastmod>
+  </sitemap>
+  <sitemap>
+    <loc>https://blog.cloudflare.com/sitemap-tags.xml</loc>
+    <lastmod>2026-08-17T20:23:43.296Z</lastmod>
+  </sitemap>
+</sitemapindex>
