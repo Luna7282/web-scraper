@@ -1624,6 +1624,34 @@ pre-fix selector/pattern lists (all five phrases leak into chunks) before
 trusting it as a real regression guard, not just a test that happens to
 pass.
 
+## 2026-08-19 — Phase 3 Step 3: applied the 2B variable-count prompt to production
+
+### 36. Prompt swap applied as measured, with the one known regression case recorded rather than left to be rediscovered
+`content/extraction.py::QA_EXTRACTION_SYSTEM_PROMPT` now uses the exact
+prompt text A/B tested in entry #33's 2B measurement, unchanged from what
+was tested: "up to 5" instead of a fixed "3 to 5" pair count, an explicit
+instruction to generate one pair per genuinely distinct fact rather than
+padding to a target number, and an explicit self-check rule ("check it
+against the ones you've already written -- if it's really the same
+question reworded, skip it instead") before adding a pair. Measured
+effect on the 12-chunk real test: 56 -> 43 pairs (-23%), 6 of 7
+reductions being pure restatement removal or improved coverage at the
+same count.
+
+**Known regression, so it isn't rediscovered later**: `building_blocks#2`
+showed a small real loss under the new prompt -- a pair about whether
+plain `Mobject` is commonly used carried minor practical framing beyond
+pure restatement, and the new prompt's stricter anti-reword rule dropped
+it. This is a one-chunk anecdote from a 12-chunk test, not something to
+chase with more prompt tuning right now; recorded here so if it shows up
+again at scale in the Step 6 re-run, it's a confirmation of a known
+tradeoff, not a new finding.
+
+No test asserts the prompt's exact wording (none did before this
+change either) -- extraction behavior against a live LLM isn't something
+the offline test suite exercises; the real check is the Step 6 re-run's
+pairs-per-chunk distribution against the Part D baseline.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->

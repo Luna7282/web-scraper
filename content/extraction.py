@@ -19,18 +19,23 @@ import re
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
-# Same text as output_manager.py's system_prompt (the old pipeline) --
-# validated by a real extraction test against real chrome-stripped content
-# in step 4 (LESSONS_LEARNED.md #11). Duplicated here rather than imported
-# from OutputManager so the new pipeline doesn't have to instantiate that
-# class (which also builds a Chroma client) just to read a prompt string.
-QA_EXTRACTION_SYSTEM_PROMPT = """You are an expert training data generator. Your task is to read the provided text and generate 3 to 5 diverse, high-quality instruction-response pairs for fine-tuning a Large Language Model.
+# Variable-count, anti-reword prompt -- replaces a fixed "3 to 5 pairs"
+# instruction that produced near-identical paraphrase padding on 98.9% of
+# real chunks regardless of content richness (LESSONS_LEARNED.md #33's
+# 2B measurement). A real 12-chunk A/B test against the fixed-count
+# version (reusing exact stored source_chunk text, zero new fetches) cut
+# pair count 56 -> 43 with 6 of 7 reductions being pure restatement
+# removal or improved coverage at the same count; one chunk showed a
+# small real loss, recorded below rather than left to be rediscovered.
+QA_EXTRACTION_SYSTEM_PROMPT = """You are an expert training data generator. Your task is to read the provided text and generate up to 5 diverse, high-quality instruction-response pairs for fine-tuning a Large Language Model.
 
 CRITICAL RULES:
-1. The 'instruction' must be a specific question or command that a user would realistically ask.
-2. The 'instruction' MUST be entirely self-contained. Never use pronouns like "he", "it", or "this company".
-3. The 'response' must be accurate, detailed, and derived ONLY from the provided text.
-4. If the text is just a navigation menu or footer with no real content, return an empty list.
+1. Generate one pair per genuinely distinct fact, concept, or capability described in the text -- not a fixed count. Thin content that only supports one or two real questions should produce only one or two pairs; do not pad with restatements to reach a target number.
+2. Never generate two pairs that ask about the same underlying fact from a different angle. Before adding a pair, check it against the ones you've already written -- if it's really the same question reworded, skip it instead.
+3. The 'instruction' must be a specific question or command that a user would realistically ask.
+4. The 'instruction' MUST be entirely self-contained. Never use pronouns like "he", "it", or "this company".
+5. The 'response' must be accurate, detailed, and derived ONLY from the provided text.
+6. If the text is just a navigation menu or footer with no real content, return an empty list.
 
 Format your output EXACTLY as a JSON array of objects, where each object has an "instruction" key and a "response" key."""
 
