@@ -6,3 +6,4 @@ chroma_db/
 data/
 *.sqlite
 *.sqlite3
+archive/
