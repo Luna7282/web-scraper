@@ -397,6 +397,29 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     today -- this item is about adding the regression guard, not about
     a currently-known second instance of the bug. **Size: M.**
 
+28. **`max_pages` can overshoot within a single uninterrupted run, not
+    just across a resume.** `Frontier.claim()`'s cap check
+    (`done+skipped_extract < max_pages`) only gates *new* claims -- it
+    can't retroactively cancel rows already claimed and mid-flight.
+    Confirmed on both step 8 Part D runs: with 3 crawl workers racing
+    ahead of 2 slow (per_chunk, multi-call) extract workers, many rows
+    sat `in_progress` simultaneously while `done` was still under the
+    cap; all of them finished and incremented `done` regardless, so
+    `max_pages=20` produced 35 `done` pages both times, not a hard
+    ceiling. Distinct from the already-documented "a resumed run keeps
+    claiming past the cap" case (item 7's note, still real) -- this
+    overshoot happens within one continuous run, no crash or resume
+    needed, and scales with worker-count × per-page latency.
+    *Fix, not yet chosen*: options include a soft "stop admitting new
+    in-flight work" signal that also reduces effective worker
+    concurrency as `done` approaches the cap, or just documenting
+    `max_pages` as "budget, not ceiling" more prominently in the CLI
+    prompt itself (it currently only says this in `CLAUDE.md`). Whoever
+    sizes `max_pages` for cost control needs to know the real ceiling
+    can be `max_pages + (concurrent in-flight rows at cap time)`, not
+    `max_pages` itself. **Size: S if just documented more prominently in
+    the CLI; M if an actual throttle is built.**
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

@@ -1194,4 +1194,80 @@ factual errors; add new ones at the bottom.
 
 ---
 
+### 29. Part D complete: resumability proven on real data, and a controlled before/after on the chrome-stripping fix
+- **Resumability, on the actual production path for the first time**:
+  killed the crawl (hard TaskStop, not a graceful shutdown) at 10 done /
+  15 in_progress against a real `docs.manim.community` crawl, restarted
+  with identical CLI inputs. All 10 `done` URLs stayed `done` (never
+  re-fetched); all 15 stuck `in_progress` rows were recovered (11
+  re-claimed, 4 back in `queued`, none lost or silently dropped). One
+  page's write had genuinely raced the crash window (JSONL append
+  committed, frontier status update didn't) -- occurred naturally, not
+  fabricated -- and on retry produced neither a duplicate JSONL row (96
+  rows before and after) nor a duplicate Chroma vector (0 vectors with a
+  repeated source entry, 1445/1445 unique ids). This is the step-5
+  crash-window design and the step-7 content-hash IDs exercised together
+  against real interruption for the first time, not just the synthetic
+  scenarios in `tests/test_crash_resume_dedup.py`.
+- **`max_pages` overshoots under real concurrency, not just across a
+  resume -- a distinct case from the one `CLAUDE.md` already
+  documents.** `claim()`'s cap check
+  (`done+skipped_extract < max_pages`) is correct in isolation, but it
+  only gates *new* claims -- it can't cancel rows already claimed and
+  mid-flight. With 3 crawl workers racing far ahead of 2 slow (per_chunk,
+  multi-call) extract workers, many rows can be simultaneously
+  `in_progress` while `done` is still well under the cap; all of them
+  finish and increment `done` regardless, so the real ceiling with
+  `max_pages=20` and this concurrency profile was 35, both times this
+  ran. Not the same gap as the already-documented "resumed run keeps
+  claiming past the cap" case -- this one happens within a single
+  uninterrupted run. Not fixed here; `ROADMAP.md` should get an entry
+  before this surprises someone sizing a `max_pages` value for cost
+  control expecting a hard ceiling.
+- **The controlled before/after the site choice was for**: full numbers
+  and the two bugs this run caught (#27 robots.txt, #28 chrome-strip
+  wiring) are in the published artifact
+  (part_d_report.html) rather than duplicated here. Headline: nav-menu
+  questions 47 → 0, exact-duplicate questions 12.5% → 0.09% of pairs,
+  pairs/page 86.5 → 32.7, near-duplicate-affected rows 80.1% → 54.8%,
+  char survival 9.2-33.6% on 3 sampled pages (consistent with step 4's
+  original 21-68% range on other sites). Vectors/page barely moved
+  (41.3 → 46.7, both far under the archive's 306.8) for a real, checked
+  reason, not a wash: before the fix, content-hash dedup was mostly
+  collapsing *repeated chrome* (85.6% collision reduction, byte-identical
+  sidebar text across all 35 pages); after, there's far less raw content
+  overall but what remains is genuine per-page content that doesn't
+  collide across pages nearly as much (3.3% collision reduction). Both
+  effects are real and roughly cancel in the per-page count, while the
+  *composition* of what's stored changed completely.
+- **The `other` redundancy cause (non-adjacent, same-page) is confirmed
+  structural, not a chrome artifact** -- it stayed dominant at almost the
+  same share before and after stripping (68.6% → 71.6% of near-duplicate
+  answer pairs). Chrome-stripping reduced every cause's absolute count
+  roughly proportionally without changing which one dominates. This
+  matches the step 8 Part A hypothesis (structurally repetitive
+  API-reference content -- parameter lists, method signatures -- spread
+  across far-apart chunks of a long page) and rules out "it was chrome
+  all along" as an alternative explanation, now that a real before/after
+  exists to check it against.
+- **`dataset_report.py` needed a real performance fix, not just a
+  documented ceiling.** The ponytail comment on `find_near_duplicates`
+  originally said "fine for a capped crawl's few hundred rows" -- true in
+  aggregate, false per-page: `NumberLine.html` alone produced 152 pairs
+  before the fix, and O(n^2) `SequenceMatcher.ratio()` at that size
+  timed out past 2 minutes for the whole report. Fixed with a
+  `quick_ratio()` pre-filter (a documented difflib pattern -- cheap upper
+  bound, skip the full O(n*m) `ratio()` unless it already clears
+  threshold) rather than raising the timeout and hoping smaller crawls
+  stay smaller.
+- **Why it matters**: this step produced two structural bug fixes (#27,
+  #28), a real crash-resume proof, a previously-undocumented `max_pages`
+  overshoot mode, a confirmed-not-refuted hypothesis about redundancy's
+  root cause, and a real performance fix to the tool built to measure
+  all of it -- from one controlled run against a site chosen specifically
+  because there was archived data to check against. That is what "run it
+  for real" was for.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->
