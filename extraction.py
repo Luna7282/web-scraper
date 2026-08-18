@@ -19,6 +19,21 @@ import re
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
+# Same text as output_manager.py's system_prompt (the old pipeline) --
+# validated by a real extraction test against real chrome-stripped content
+# in step 4 (LESSONS_LEARNED.md #11). Duplicated here rather than imported
+# from OutputManager so the new pipeline doesn't have to instantiate that
+# class (which also builds a Chroma client) just to read a prompt string.
+QA_EXTRACTION_SYSTEM_PROMPT = """You are an expert training data generator. Your task is to read the provided text and generate 3 to 5 diverse, high-quality instruction-response pairs for fine-tuning a Large Language Model.
+
+CRITICAL RULES:
+1. The 'instruction' must be a specific question or command that a user would realistically ask.
+2. The 'instruction' MUST be entirely self-contained. Never use pronouns like "he", "it", or "this company".
+3. The 'response' must be accurate, detailed, and derived ONLY from the provided text.
+4. If the text is just a navigation menu or footer with no real content, return an empty list.
+
+Format your output EXACTLY as a JSON array of objects, where each object has an "instruction" key and a "response" key."""
+
 
 class MalformedExtractionError(Exception):
     pass

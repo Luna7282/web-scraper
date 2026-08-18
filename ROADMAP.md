@@ -6,16 +6,18 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
 
 ## (a) Broken / blocking
 
-1. **Branch-scoped crawling is almost certainly broken past the seed page.**
-   `main.py:57-58` sets `allowed_branch_prefixes` to the literal list of leaf
-   URLs found *on the root page* for the chosen category, not a path prefix.
-   `orchestrator.py:41-48`'s scope check does `href.startswith(branch)`
-   against those exact URLs, so almost no newly-discovered link during the
-   crawl will match. In practice, choosing anything other than "all" likely
-   crawls only the handful of URLs visible on page one.
-   *Fix*: derive the prefix from the category itself (e.g.
-   `f"{urlparse(root_url).scheme}://{domain}/{first_segment}/"`) instead of
-   the discovered URL list. **Size: S.**
+1. **[RESOLVED, step 6] Branch-scoped crawling was almost certainly broken
+   past the seed page.** This described the *old* `orchestrator.py` path
+   (`main.py:57-58`'s `allowed_branch_prefixes` set to literal leaf URLs,
+   `orchestrator.py:41-48`'s naive `startswith` check). Step 3 fixed the
+   scope predicate itself (`scope.py`'s `derive_prefix`/`is_in_scope`,
+   tested against 5 real sites) but only wired it into `--dry-run` at the
+   time — the *live* crawl path (`orchestrator.py`) still had the original
+   bug. Step 6's `main.py` rewrite finally applies the corrected predicate
+   to the real crawl (`_make_scope_check` in `main.py`, feeding
+   `crawl_worker`), so this is now fixed in the path that actually runs,
+   not just in the diagnostic tool. `orchestrator.py` itself still has the
+   original bug — left as-is, unreferenced, pending step 9 deletion.
 
 2. **Dependency pins are not reproducible from any tracked file.**
    `pyproject.toml` has no `[project]`/dependency section (only `[tool.ruff]`),
@@ -170,15 +172,21 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     currently at their concurrency limit) once multi-host crawling is
     actually exercised. **Size: M.**
 
-11. **LLM JSON output isn't schema-enforced.** `_generate_qa`
-    (`output_manager.py:69-97`) relies on prompt instructions + manual
-    ` ```json ` fence stripping + `json.loads`. Any deviation (extra prose,
-    truncated output, unbalanced fences) throws inside a bare
-    `except Exception`, gets printed, and the page silently contributes zero
-    Q&A pairs with no retry.
-    *Fix*: use provider-native JSON mode
-    (`response_format={"type": "json_object"}`) where the provider supports
-    it, keep the try/except as a fallback for providers that don't. **Size: S.**
+11. **[Partially resolved, step 5] LLM JSON output isn't schema-enforced.**
+    Described the *old* `_generate_qa` (`output_manager.py:69-97`): prompt
+    instructions + manual fence-stripping + `json.loads`, any deviation
+    throws inside a bare `except Exception`, silently zero pairs, no
+    retry. The *new* pipeline's `extraction.py::parse_qa_json` improves on
+    this — tries direct parse, fence-stripped, and prose-substring-salvage
+    before raising `MalformedExtractionError`, which `extract_worker`
+    retries (up to `MAX_RETRIES`) rather than silently swallowing. Still
+    not provider-native JSON mode (`response_format={"type":
+    "json_object"}`), which would prevent malformed output rather than
+    salvage/retry around it — worth adding on top, not a substitute for
+    what's there now. `output_manager.py` itself is unchanged (dead code
+    path, not deleted). *Fix, remaining*: add
+    `response_format={"type": "json_object"}` where the provider supports
+    it, on top of the existing salvage/retry. **Size: S.**
 
 12. **Shutdown swallows a spurious `task_done()` call.**
     `orchestrator.py:52-57` — on cancellation while a worker is blocked

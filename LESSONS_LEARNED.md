@@ -626,4 +626,101 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-18 — Step 6: relevance-gate scoring unit measured, not assumed
+
+### 17. Wider score spread didn't mean better relevance signal -- headings beat both whole-page and max-chunk on the one thing that mattered
+- **Problem being investigated**: a short intent string and a full page of
+  markdown live at very different scales of specificity; cosine similarity
+  between them was suspected to compress into a narrow, useless band.
+  Measured before building anything, per the explicit ask, rather than
+  assumed.
+- **Method**: one intent ("How do I use the animation API to create and
+  control geometric shapes?") embedded once, scored against all 6 stripped
+  fixture pages (5 sites' root pages + the manim `Circle` API reference
+  page added in step 4 -- the one page that's unambiguously, exactly what
+  this intent describes) under three candidate strategies: whole-page
+  embedding, headings-only embedding (falls back to whole-page if a page
+  has no markdown headings), and max-similarity-over-chunks. 62 real
+  embedding calls, `nomic-embed-text` via local Ollama, 768-dim, mean
+  2.80s/call.
+- **Result, not what was expected**: spreads were 0.12 (headings) to 0.28
+  (whole-page) -- none of the three compressed into "a few hundredths," so
+  the originally-suspected failure mode (scores too close together to set
+  a threshold) didn't show up. A different, more important problem did:
+  **`whole_page` and `max_chunk` both ranked a marketing page
+  (`www.manim.community`, tagline-heavy, short) above the actual API
+  reference page** for an intent specifically about the API. `headings`
+  was the only strategy that ranked the genuinely correct page first --
+  and it has the *smallest* spread of the three, and costs one embed call
+  per page (same as whole-page, versus max-chunk's 5-13 calls/page for a
+  worse answer).
+- **Why it matters**: discrimination (how far apart the scores are) and
+  correctness (whether the ranking matches genuine relevance) are not the
+  same property, and it would have been easy to pick `whole_page` for
+  having the widest, most "confident-looking" spread and ship a gate that
+  systematically favors marketing copy over real documentation. The
+  hypothesis was specifically "max-over-chunks is usually the right unit"
+  -- measurement contradicted the default assumption, which is exactly why
+  the instruction was to measure rather than assume it. **Caveat, stated
+  explicitly**: this is one intent string against one known-correct page,
+  not a multi-query validation -- treat `score_headings` as the reasoned
+  choice from real data, not a proven-robust one. If it misranks on a
+  different intent/site shape later, this entry is where to start.
+- **Bug caught by this measurement, fixed before it mattered**:
+  `score_headings`' no-headings fallback to `score_whole_page` passed
+  *untruncated* content, and `score_whole_page` itself had a hardcoded
+  `content[:8000]` truncation that 500'd against a real embedding server
+  on real markdown (same root cause as `LESSONS_LEARNED.md` #10 --
+  markdown tokenizes far less efficiently than plain prose, so a
+  character-count truncation safe for one doesn't transfer to the other).
+  `blog.cloudflare.com`'s stripped page has no markdown headings at all,
+  hit the fallback, hit the bug, on the very first live run. Fixed with
+  one shared `MAX_EMBED_CHARS = 4000` constant (same number already
+  established as safe in `LESSONS_LEARNED.md` #10, and matching
+  `output_manager.py`'s existing extraction-call truncation) applied
+  everywhere `relevance.py` calls `embed_fn`, with regression tests for
+  both the fallback path and an oversized `chunk_size` override.
+
+---
+
+## 2026-08-18 — Step 6 close-out: main.py wired to the new pipeline
+
+### 18. Wiring main.py to the new pipeline incidentally fixed ROADMAP #1 in the path that actually runs
+- Step 3 fixed the branch-scoping predicate itself (`scope.py`) but only
+  ever wired it into `--dry-run` — the live crawl path (`orchestrator.py`,
+  via the old `main.py`) still had the original bug the whole time
+  (`allowed_branch_prefixes` set to literal leaf URLs, not a real prefix).
+  Step 6's rewrite replaces `main.py`'s crawl invocation with the new
+  pipeline (`_make_scope_check` built from `derive_prefix`/`is_in_scope`,
+  feeding `crawl_worker` directly), so the corrected predicate now governs
+  the code path that actually runs a crawl, not just the diagnostic tool.
+  `orchestrator.py` still has the original bug — left alone, unreferenced,
+  not deleted (step 9's job once the new path has proven itself on a real
+  crawl). `ROADMAP.md` #1 marked resolved accordingly.
+- **`main.py` no longer imports `orchestrator` or `output_manager` at
+  all** — both stay fully importable (confirmed: `import orchestrator`
+  still works standalone) but are referenced nowhere in the new flow,
+  matching "build alongside, don't mutate in place, don't delete yet."
+- **Provider menu gained a 4th option** (Ollama cloud) that the old
+  `main.py` never had, even though `config.py`'s `LLMProvider` enum added
+  it back in step 2 — the CLI menu had simply never been updated to match.
+  Caught while rewriting this file for an unrelated reason (wiring the
+  new pipeline), not as its own investigation — worth remembering that
+  config-level provider additions don't automatically surface in the UI
+  that's supposed to expose them.
+- **Output scope deliberately narrowed for now**: the new `main.py` only
+  offers unified JSONL output. `split_jsonl` and Chroma/RAG output
+  (`build_rag`) existed as toggles in the old flow but aren't wired into
+  `Writer`/the new pipeline yet — chunk IDs and Chroma upsert are step 7's
+  job (`ROADMAP.md` #6). Stating this as a deliberate scope cut, not a
+  silent regression: the old toggles still exist and still work via
+  `orchestrator.py`/`output_manager.py` if needed in the meantime.
+- **`--score-report` reads an existing frontier DB independently of any
+  crawl** — pure DB read (`Frontier.all_scores()`) + pure formatting
+  (`score_report.py`), tested end-to-end against a real temp-file
+  `Frontier` instance (not a live crawl's output) to prove the two pieces
+  actually connect, not just that each one works in isolation.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->

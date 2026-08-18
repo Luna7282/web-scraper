@@ -444,6 +444,17 @@ class Frontier:
             cur = await self._conn.execute("SELECT url FROM frontier")
             return {row["url"] for row in await cur.fetchall()}
 
+    async def all_scores(self) -> list[tuple[str, float, str]]:
+        """Read-only, for --score-report -- every page that got a
+        relevance score recorded, regardless of what happened to it
+        afterward. (url, relevance_score, status)."""
+        async with self._lock:
+            cur = await self._conn.execute(
+                "SELECT url, relevance_score, status FROM frontier "
+                "WHERE relevance_score IS NOT NULL ORDER BY relevance_score DESC"
+            )
+            return [(row["url"], row["relevance_score"], row["status"]) for row in await cur.fetchall()]
+
     async def in_progress_urls(self, limit: int = 20) -> list[str]:
         """Read-only, for the progress display -- never mutates state, so
         it can't perturb the state machine no matter how often it's polled."""

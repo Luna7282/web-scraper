@@ -7,3 +7,4 @@ data/
 *.sqlite
 *.sqlite3
 archive/
+.claude/

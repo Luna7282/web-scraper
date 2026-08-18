@@ -1,19 +1,40 @@
 import argparse
 import asyncio
+import os
 import sys
+
+import requests
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
+from langchain_core.messages import SystemMessage, HumanMessage
 from rich.console import Console
 from rich.prompt import Prompt, Confirm
 from rich.panel import Panel
 from rich.table import Table
 
-from config import OutputPreferences
 from llm_factory import get_llm
-from output_manager import OutputManager
 from discovery import discover_branches, fetch_page_links
-from orchestrator import start_workers
 from scope import normalize_url, derive_prefix, is_in_scope
+from frontier import Frontier
+from pipeline import crawl_worker, extract_worker, writer_worker, FetchTimeout, FetchHTTPError, RateLimitError
+from extraction import QA_EXTRACTION_SYSTEM_PROMPT
+from relevance import make_score_fn
+from robots_cache import RobotsCache
+from writer import Writer
+from progress_display import run_progress_display
+from score_report import format_score_report
+
+# orchestrator.py / output_manager.py: the old pipeline. Deliberately left
+# importable but unreferenced here -- this file is the rewrite (see the
+# rebuild plan and CLAUDE.md); deleting the old modules is step 9's job,
+# once the new path has actually completed a real crawl.
 
 console = Console()
+
+DATA_DIR = "data"
+FRONTIER_DB_PATH = os.path.join(DATA_DIR, "frontier.db")
+JSONL_PATH = os.path.join(DATA_DIR, "unified.jsonl")
+HTTP_USER_AGENT = "Mozilla/5.0 (compatible; scraper/1.0)"
+
 
 async def dry_run(root_url: str):
     """Evaluate every href a real discovery call actually returns against
@@ -79,100 +100,238 @@ async def dry_run(root_url: str):
                 console.print(f"    - {u}  ({reason})")
         console.print()
 
+
+async def score_report_command(db_path: str):
+    """Reads an existing frontier DB's recorded relevance scores and
+    prints the distribution report -- run after a log-only (thresholds=0)
+    pass to pick real thresholds from data."""
+    if not os.path.exists(db_path):
+        console.print(f"[red]No frontier DB found at {db_path}[/red]")
+        sys.exit(1)
+    frontier = Frontier(db_path)
+    await frontier.open()
+    scores = await frontier.all_scores()
+    await frontier.close()
+    console.print(format_score_report(scores))
+
+
+async def _http_get_text(url: str) -> str | None:
+    def _get():
+        try:
+            resp = requests.get(url, timeout=15, headers={"User-Agent": HTTP_USER_AGENT})
+            return resp.text if resp.status_code == 200 else None
+        except Exception:
+            return None
+    return await asyncio.to_thread(_get)
+
+
+def _make_fetch_fn(crawler: AsyncWebCrawler):
+    """Shares one AsyncWebCrawler instance across every crawl_worker call
+    -- matching orchestrator.py's existing pattern, not spinning up a new
+    browser context per fetch. Live crawl bypasses crawl4ai's cache
+    (unlike dry_run/discovery, which deliberately reuse it)."""
+    async def fetch_fn(url: str) -> tuple[str, list[str]]:
+        config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
+        result = await crawler.arun(url=url, config=config)
+        if not result.success:
+            status = result.redirected_status_code or result.status_code
+            if status and status != 200:
+                raise FetchHTTPError(status)
+            raise FetchTimeout(result.error_message or "fetch failed")
+        links = result.links.get("internal", []) + result.links.get("external", [])
+        raw_hrefs = [l.get("href", "") for l in links if l.get("href")]
+        return result.markdown, raw_hrefs
+    return fetch_fn
+
+
+def _make_embed_fn(embeddings):
+    async def embed_fn(text: str) -> list[float]:
+        return await asyncio.to_thread(embeddings.embed_query, text)
+    return embed_fn
+
+
+def _is_rate_limit_exception(e: Exception) -> bool:
+    status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+    return status == 429
+
+
+def _make_extract_fn(llm):
+    async def extract_fn(content: str) -> str:
+        messages = [
+            SystemMessage(content=QA_EXTRACTION_SYSTEM_PROMPT),
+            HumanMessage(content=f"Text to process:\n\n{content[:4000]}"),
+        ]
+        try:
+            response = await asyncio.to_thread(llm.invoke, messages)
+        except Exception as e:
+            if _is_rate_limit_exception(e):
+                raise RateLimitError() from e
+            raise
+        return response.content
+    return extract_fn
+
+
+def _make_scope_check(host_prefix_pairs: list[tuple[str, str | None]]):
+    def scope_check(url: str) -> bool:
+        return any(
+            is_in_scope(url, host=host, prefix=prefix).allowed
+            for host, prefix in host_prefix_pairs
+        )
+    return scope_check
+
+
 async def main():
-    console.print(Panel.fit("[bold blue]Recursive Web Scraper with LLM & RAG[/bold blue]"))
-    
+    console.print(Panel.fit("[bold blue]Prompt-Steered Documentation Scraper[/bold blue]"))
+
     root_url = Prompt.ask("Enter the Root URL to start discovery")
-    
     if not root_url.startswith("http"):
         root_url = "https://" + root_url
-        
+
+    intent = Prompt.ask(
+        "Describe what you want from this site "
+        "(leave blank to scrape everything, no relevance filtering)",
+        default="",
+    ).strip() or None
+    if intent is None:
+        console.print("[yellow]No intent given -- relevance gate is off, every fetched page extracts.[/yellow]")
+
     branches = await discover_branches(root_url)
-    
     if not branches:
         console.print("[red]No branches discovered or discovery failed.[/red]")
         sys.exit(1)
-        
+
     table = Table(title="Discovered Branches")
     table.add_column("ID", style="cyan")
     table.add_column("Category", style="magenta")
     table.add_column("Count", justify="right", style="green")
-    
     branch_list = list(branches.items())
     for i, (cat, urls) in enumerate(branch_list, 1):
         table.add_row(str(i), cat, str(len(urls)))
-        
     console.print(table)
-    
+
     branch_input = Prompt.ask("Enter comma-separated IDs of branches to crawl, or 'all'")
-    
-    selected_urls = []
-    allowed_branch_prefixes = []
-    
+    selected_branches: list[tuple[str, list[str]]] = []
     if branch_input.strip().lower() == "all":
-        for urls in branches.values():
-            selected_urls.extend(urls)
-        allowed_branch_prefixes = ["all"]
+        selected_branches = branch_list
     else:
         try:
-            ids = [int(x.strip()) for x in branch_input.split(',')]
-            for i in ids:
-                if 1 <= i <= len(branch_list):
-                    cat, urls = branch_list[i-1]
-                    selected_urls.extend(urls)
-                    if urls:
-                        allowed_branch_prefixes.extend(urls)
+            ids = [int(x.strip()) for x in branch_input.split(",")]
         except ValueError:
             console.print("[red]Invalid input. Exiting.[/red]")
             sys.exit(1)
-            
-    if not selected_urls:
-        console.print("[yellow]No URLs selected. Exiting.[/yellow]")
+        for i in ids:
+            if 1 <= i <= len(branch_list):
+                selected_branches.append(branch_list[i - 1])
+
+    if not selected_branches:
+        console.print("[yellow]No branches selected. Exiting.[/yellow]")
         sys.exit(0)
-        
-    console.print("\n[bold]Select LLM Provider[/bold]")
+
+    seeds: list[tuple[str, str | None]] = []
+    host_prefix_pairs: list[tuple[str, str | None]] = []
+    for category, urls in selected_branches:
+        prefix_result = derive_prefix(urls)
+        host_prefix_pairs.append((prefix_result.host, prefix_result.prefix))
+        for url in urls:
+            seeds.append((url, category))
+    scope_check = _make_scope_check(host_prefix_pairs)
+
+    console.print("\n[bold]Select LLM Provider (chat/extraction)[/bold]")
     console.print("1. NVIDIA NIM")
-    console.print("2. Ollama")
-    console.print("3. OpenAI")
-    
-    llm_choice = Prompt.ask("Choice", choices=["1", "2", "3"], default="3")
-    
-    provider_map = {"1": "nvidia", "2": "ollama", "3": "openai"}
+    console.print("2. Ollama (local)")
+    console.print("3. Ollama (cloud)")
+    console.print("4. OpenAI")
+    llm_choice = Prompt.ask("Choice", choices=["1", "2", "3", "4"], default="4")
+    provider_map = {"1": "nvidia", "2": "ollama", "3": "ollama_cloud", "4": "openai"}
     provider_name = provider_map[llm_choice]
-    
-    default_model = "gpt-4o-mini"
-    if provider_name == "nvidia":
-        default_model = "meta/llama3-70b-instruct"
-    elif provider_name == "ollama":
-        default_model = "llama3"
-        
-    model_name = Prompt.ask(f"Enter model name for {provider_name}", default=default_model)
-    
+    default_models = {
+        "nvidia": "meta/llama3-70b-instruct",
+        "ollama": "llama3",
+        "ollama_cloud": "deepseek-v4-flash",
+        "openai": "gpt-4o-mini",
+    }
+    model_name = Prompt.ask(f"Enter model name for {provider_name}", default=default_models[provider_name])
     llm, embeddings = get_llm(provider_name, model_name)
-    
-    console.print("\n[bold]Select Output Formats[/bold]")
-    build_rag = Confirm.ask("Build Vector RAG (Chroma)?", default=False)
-    unified_jsonl = Confirm.ask("Generate Unified JSONL?", default=True)
-    split_jsonl = Confirm.ask("Generate Split JSONL (by section)?", default=False)
-    
-    prefs = OutputPreferences(
-        unified_jsonl=unified_jsonl,
-        split_jsonl=split_jsonl,
-        build_rag=build_rag
+    console.print(
+        "[dim]Embeddings always use local Ollama (nomic-embed-text) regardless of the "
+        "chat provider chosen -- see CLAUDE.md's provider-routing invariant.[/dim]"
     )
-    
-    output_manager = OutputManager(prefs, llm, embeddings)
-    
-    max_workers = Prompt.ask("Enter max concurrent workers", default="5")
-    try:
-        max_workers_int = int(max_workers)
-    except:
-        max_workers_int = 5
-        
-    console.print(f"\n[bold green]Starting scraping with {max_workers_int} workers...[/bold green]")
-    await start_workers(selected_urls, allowed_branch_prefixes, output_manager, max_concurrent=max_workers_int)
-    
-    console.print("[bold blue]Done![/bold blue]")
+
+    console.print("\n[bold]Output[/bold]")
+    console.print(
+        "[dim]JSONL only for now -- Chroma/RAG output isn't wired into the new "
+        "pipeline yet (step 7). Old --build-rag flow is still in orchestrator.py "
+        "if needed.[/dim]"
+    )
+
+    max_pages_input = Prompt.ask("Max pages to fetch (blank = unlimited)", default="")
+    max_pages = int(max_pages_input) if max_pages_input.strip() else None
+    max_depth_input = Prompt.ask("Max crawl depth (blank = unlimited)", default="")
+    max_depth = int(max_depth_input) if max_depth_input.strip() else None
+
+    console.print(
+        "\n[bold yellow]Both relevance thresholds default to 0 -- log-only by "
+        "construction: nothing gets skipped, every page's score is recorded. "
+        "Run `python main.py --score-report data/frontier.db` after this "
+        "completes to pick real thresholds from the actual distribution, "
+        "rather than guessing before you've seen real data.[/bold yellow]"
+    )
+    extract_threshold = float(Prompt.ask("Extraction relevance threshold", default="0"))
+    follow_threshold = float(Prompt.ask("Follow relevance threshold", default="0"))
+
+    crawl_workers_n = int(Prompt.ask("Concurrent crawl workers", default="5"))
+    extract_workers_n = int(Prompt.ask("Concurrent extract workers", default="2"))
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    frontier = Frontier(FRONTIER_DB_PATH, max_pages=max_pages, max_depth=max_depth)
+    await frontier.open()
+    recovery = await frontier.recover_crashed()
+    if recovery["requeued"] or recovery["failed"]:
+        console.print(
+            f"[yellow]Resumed from a prior run in {FRONTIER_DB_PATH}: "
+            f"{recovery['requeued']} rows requeued, {recovery['failed']} marked failed.[/yellow]"
+        )
+    await frontier.seed(seeds)
+
+    embed_fn = _make_embed_fn(embeddings)
+    intent_embedding = await embed_fn(intent) if intent else None
+    score_fn = make_score_fn(intent_embedding, embed_fn)
+    extract_fn = _make_extract_fn(llm)
+    writer = Writer(JSONL_PATH)
+    robots_cache = RobotsCache(_http_get_text)
+
+    console.print(f"\n[bold green]Starting: {crawl_workers_n} crawl workers, "
+                  f"{extract_workers_n} extract workers, 1 writer[/bold green]")
+
+    async with AsyncWebCrawler() as crawler:
+        fetch_fn = _make_fetch_fn(crawler)
+        content_queue = asyncio.Queue(maxsize=max(4, crawl_workers_n * 2))
+        results_queue = asyncio.Queue(maxsize=max(4, extract_workers_n * 2))
+
+        tasks = [
+            asyncio.create_task(crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache))
+            for _ in range(crawl_workers_n)
+        ] + [
+            asyncio.create_task(
+                extract_worker(frontier, content_queue, results_queue, score_fn, extract_fn,
+                                extract_threshold, follow_threshold)
+            )
+            for _ in range(extract_workers_n)
+        ] + [
+            asyncio.create_task(writer_worker(frontier, results_queue, writer)),
+            asyncio.create_task(run_progress_display(frontier)),
+        ]
+
+        await frontier.quiescent.wait()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    counts = await frontier.counts_by_status()
+    await frontier.close()
+    console.print(f"\n[bold blue]Done.[/bold blue] {counts}")
+    console.print(f"[dim]Run `python main.py --score-report {FRONTIER_DB_PATH}` to see the relevance score distribution.[/dim]")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -182,11 +341,19 @@ if __name__ == "__main__":
         help="Fetch URL, derive scope per discovered branch, print accept/"
              "reject for every discovered href. No crawl, no LLM calls.",
     )
+    parser.add_argument(
+        "--score-report",
+        metavar="FRONTIER_DB",
+        help="Print the relevance score distribution recorded in an existing "
+             "frontier DB (from a prior run) -- no crawl, no LLM calls.",
+    )
     args = parser.parse_args()
 
     try:
         if args.dry_run:
             asyncio.run(dry_run(args.dry_run))
+        elif args.score_report:
+            asyncio.run(score_report_command(args.score_report))
         else:
             asyncio.run(main())
     except KeyboardInterrupt:

@@ -55,13 +55,32 @@ later commit has already changed it.
 ## Running the CLI
 
 ```
-uv run python main.py
+uv run python main.py                              # interactive crawl
+uv run python main.py --dry-run <url>               # scope-check only, no crawl/LLM
+uv run python main.py --score-report data/frontier.db  # relevance distribution from a prior run
 ```
 
-Interactive prompts: root URL, branch/scope selection, LLM provider +
-model, output formats (JSONL / Chroma), concurrency. (Exact prompts are
-changing as the rebuild proceeds — see `ARCHITECTURE.md` for current
-behavior.)
+Interactive prompts: root URL, **intent** (optional — blank means no
+relevance filtering, every page extracts), branch/scope selection, LLM
+provider + model (chat/extraction only — embeddings always local Ollama,
+see the invariant below), max pages/depth, relevance thresholds
+(**default 0 for both — log-only**, shown with an explicit on-screen
+warning, not a buried default), crawl/extract worker concurrency.
+
+Output is JSONL-only right now (`data/unified.jsonl`) — `split_jsonl` and
+Chroma/RAG output existed as toggles in the old `orchestrator.py` flow but
+aren't wired into the new pipeline yet (step 7). Frontier state persists
+to `data/frontier.db`; a rerun resumes it (`Frontier.recover_crashed()` at
+startup) rather than starting over.
+
+**Relevance scoring uses `score_headings`, not the intuitive default
+(max-over-chunks)** — chosen from a real measurement, not assumed. See
+`LESSONS_LEARNED.md` #17 before changing this: `whole_page` and
+`max_chunk` both ranked a marketing page above the actual best-matching
+API reference page for a real test intent; `headings` was the only one of
+three candidates that got the ranking right, and it's also the cheapest
+(1 embed call/page vs. `max_chunk`'s 5-13). Caveat carried forward: one
+intent/one known-correct-page validation, not a robust multi-query proof.
 
 ## Provider routing — one hard invariant
 
