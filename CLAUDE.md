@@ -76,6 +76,19 @@ flow is still not wired in. Frontier state persists to `data/frontier.db`;
 a rerun resumes it (`Frontier.recover_crashed()` at startup) rather than
 starting over.
 
+**Chrome-stripping runs on every real fetch**: `main.py::_make_fetch_fn`
+passes `chrome_strip.py`'s `DEFAULT_EXCLUDED_TAGS`/`DEFAULT_EXCLUDED_SELECTOR`
+into the real `CrawlerRunConfig` (crawl4ai's own HTML-cleaning stage) and
+applies `strip_text_patterns()` to the resulting markdown before it ever
+reaches extraction or Chroma chunking. **This was not true until step 8
+Part D** — `chrome_strip.py` existed and was validated since step 4, but
+nothing in the production path ever called it; every earlier
+"chrome-stripping validated" claim was against a standalone script
+calling `strip_chrome()` directly, never against `main.py` itself. See
+`LESSONS_LEARNED.md` #28 before assuming a component that's tested in
+isolation is therefore wired in — verify the call site, not just the
+function.
+
 **Retrieval**: `uv run python main.py --query "<question>"` embeds the
 question, searches child chunks in the existing Chroma collection, and
 prints parent text + sources + the matched child chunk + distance

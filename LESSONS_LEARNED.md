@@ -1111,4 +1111,87 @@ factual errors; add new ones at the bottom.
 
 ---
 
+### 28. chrome_strip.py was never called from main.py's real fetch path -- built, tested, and validated entirely in isolation since step 4
+- **Problem**: the 47 nav-menu questions found on Part D's real
+  docs.manim.community crawl (entry #27's sibling finding) traced back
+  to something much bigger than a `chrome_strip.py` selector gap:
+  `main.py::_make_fetch_fn` built `CrawlerRunConfig` with only
+  `cache_mode=CacheMode.BYPASS` -- no `excluded_tags`, no
+  `excluded_selector` -- and handed `result.markdown` straight to
+  extraction and Chroma chunking, completely unstripped. Confirmed by
+  grep, not inference: `strip_chrome()`/`clean_html()`/
+  `strip_text_patterns()` are called nowhere outside `chrome_strip.py`
+  itself and its own test file, across the entire codebase.
+- **Every prior "chrome-stripping validated" claim was true only for a
+  hand-rolled call to `strip_chrome()`, never for `main.py` itself**:
+  step 4's fixture measurements, step 4's two-page extraction test, step
+  6's chrome-stripped extraction test, step 7's live demo, and step 8's
+  cross-site extraction check (`LESSONS_LEARNED.md` #25) all called
+  `chrome_strip.strip_chrome(html, url)` directly from a standalone
+  script against cached fixture HTML. None of them ever ran `main.py`
+  itself end to end. Part D -- the first real crawl through the actual
+  CLI -- is the first time this gap could have been visible, and it was,
+  immediately.
+- **Root cause of the root cause**: verification always happened one
+  layer below the actual entry point. Component-level testing
+  (`tests/test_chrome_strip.py`) and ad hoc integration checks (steps
+  4/6/7/8's demo scripts) both exercised `strip_chrome()` correctly and
+  thoroughly -- the function itself was never wrong. What was never
+  tested is that `main.py` *calls* it. This is the second time in the
+  same session a real end-to-end run caught something careful
+  component-level testing missed (see #27, the robots.txt precedence
+  bug) -- both times, the missing layer was integration, not coverage.
+- **Fix**: `chrome_strip.py`'s own docstring says `strip_chrome()`
+  "mirrors what `CrawlerRunConfig` does for the real pipeline" -- meaning
+  the *intended* production path was always to pass
+  `excluded_tags=DEFAULT_EXCLUDED_TAGS`,
+  `excluded_selector=DEFAULT_EXCLUDED_SELECTOR` into the real
+  `CrawlerRunConfig` directly (crawl4ai's own HTML-cleaning stage,
+  applied once, during the real fetch) rather than re-running
+  `clean_html()` + `DefaultMarkdownGenerator()` a second time on
+  already-converted markdown. `_make_fetch_fn` now does exactly that,
+  plus applies `strip_text_patterns()` (layer 2) to the resulting
+  markdown before it reaches extraction or chunking -- the same two-layer
+  pipeline `strip_chrome()` runs internally, just through crawl4ai's
+  native mechanism instead of a redundant second HTML pass.
+- **New test asserts through the real entry point, not through
+  `strip_chrome()` again**: `tests/test_fetch_fn_integration.py` calls
+  `main._make_fetch_fn()` directly against a fixture HTML string
+  containing nav/aside/footer/button chrome, using crawl4ai's `raw:` URL
+  scheme (no network call, but the real `AsyncWebCrawler.arun()` +
+  `CrawlerRunConfig` + `LXMLWebScrapingStrategy` pipeline genuinely
+  runs) and asserts the chrome text is absent from the output.
+  Confirmed this test actually catches the original bug: re-ran the
+  same fixture through the unfixed config (no `excluded_tags`) and the
+  nav text came through, as expected.
+- **A systematic audit followed, checking every other module for the
+  same class of gap** (defined, tested, never actually called from
+  `main.py`'s reachable path): relevance scoring, `normalize_url`,
+  `is_in_scope`, `derive_prefix`, robots checks, the writer's dedup
+  marker, content-hash chunk IDs, sectioning, and canonical record
+  building were all confirmed genuinely wired, by tracing real call
+  sites, not by recalling that they should be. Two categories found
+  that are *unreachable from `main.py` but not bugs*: everything in
+  `export.py`/`export_formats.py` beyond `load_canonical_records`/
+  `dedup_by_question` (by design -- a separate CLI entry point per the
+  step 8 Part B/C plan) and `relevance.py::score_max_chunk` (a measured
+  and deliberately-rejected scoring strategy, `LESSONS_LEARNED.md` #17).
+  Three minor, behaviorally-inert dead surfaces found alongside:
+  `RobotsCache.is_allowed(host, url)` (crawl_worker calls
+  `HostPolicy.is_allowed()` directly instead -- the check still runs,
+  just via a different object), `Frontier.get_all_urls()` (test-only),
+  and `LocalOllamaEmbeddings.embed_documents()` (the batch method --
+  only single-text `embed_query` is ever used). None of these three
+  have a behavioral consequence; `chrome_strip.py` was the only real gap.
+- **Why it matters**: "verify, don't assume" needs a specific target --
+  verifying a function works is not the same claim as verifying it's
+  called. A test suite can have excellent coverage of every individual
+  piece and still have zero coverage of whether those pieces are wired
+  together the way the surrounding prose says they are. The fix for that
+  blind spot isn't more unit tests of already-tested functions; it's at
+  least one test per pipeline stage that goes in through the same door a
+  real user would.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->

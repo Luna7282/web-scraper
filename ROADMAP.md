@@ -367,6 +367,36 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     plausible fits for `prompt_completion` but weren't confirmed this
     session). **Size: XS per schema, once confirmed.**
 
+26. **[RESOLVED, step 8 Part D] `chrome_strip.py` was never called from
+    `main.py`'s real fetch path.** Confirmed by grep across the whole
+    codebase, not inference -- `strip_chrome`/`clean_html`/
+    `strip_text_patterns` were called nowhere outside the module itself
+    and its own test file, despite being built and fixture-validated
+    since step 4. `_make_fetch_fn` now passes chrome_strip's excluded-
+    tags/selector into the real `CrawlerRunConfig` and applies
+    `strip_text_patterns` to the result; a real integration test
+    (`tests/test_fetch_fn_integration.py`, via crawl4ai's `raw:` URL
+    scheme) exercises this through `main.py` itself, not `strip_chrome()`
+    in isolation. See `LESSONS_LEARNED.md` #28.
+
+27. **No per-stage integration test existed for any real pipeline stage
+    before step 8 Part D.** The chrome-stripping gap (#26) and the
+    robots.txt Allow/Disallow precedence bug (`LESSONS_LEARNED.md` #27)
+    were both caught only by a real end-to-end crawl, not by the
+    existing test suite -- every prior test exercised a function
+    correctly but never confirmed `main.py` actually calls it. One
+    integration test now exists for the fetch stage
+    (`test_fetch_fn_integration.py`); the same gap-shape could exist for
+    other stages not yet covered this way.
+    *Fix*: audit each pipeline stage main.py wires up (crawl, extract,
+    write, RAG upsert, robots check) for a test that goes in through
+    `main.py`'s own constructors (`_make_fetch_fn`, `_make_extract_fn`,
+    etc.), not just the stage's underlying function in isolation. The
+    step 8 Part D audit (`LESSONS_LEARNED.md` #28) confirmed every
+    *other* stage's underlying function is at least correctly wired
+    today -- this item is about adding the regression guard, not about
+    a currently-known second instance of the bug. **Size: M.**
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

@@ -28,6 +28,7 @@ from query import query_chunks, format_query_results
 from extraction_units import make_extraction_units_fn
 from dataset_report import build_dataset_report
 from export import load_canonical_records
+from chrome_strip import DEFAULT_EXCLUDED_SELECTOR, DEFAULT_EXCLUDED_TAGS, strip_text_patterns
 
 EMBEDDING_MODEL_NAME = "nomic-embed-text"  # LocalOllamaEmbeddings' default; keep in sync (see get_llm)
 EMBEDDING_DIM = 768  # measured in step 6 -- see LESSONS_LEARNED.md #17
@@ -185,10 +186,26 @@ def _make_fetch_fn(crawler: AsyncWebCrawler):
     """Shares one AsyncWebCrawler instance across every crawl_worker call
     -- matching orchestrator.py's existing pattern, not spinning up a new
     browser context per fetch. Live crawl bypasses crawl4ai's cache
-    (unlike dry_run/discovery, which deliberately reuse it)."""
+    (unlike dry_run/discovery, which deliberately reuse it).
+
+    Chrome-stripping (chrome_strip.py, steps 4/9/11) was built and
+    validated against cached HTML fixtures but never actually wired in
+    here until step 8 Part D's real crawl exposed the gap (nav-menu
+    questions in real extraction output -- see LESSONS_LEARNED.md).
+    excluded_tags/excluded_selector go through CrawlerRunConfig directly
+    (crawl4ai's own HTML-cleaning stage, the mechanism chrome_strip.py's
+    own docstring says this was always meant to use) rather than
+    re-running clean_html()+DefaultMarkdownGenerator() a second time on
+    already-converted markdown. strip_text_patterns() (layer 2, UI text
+    that survives structural exclusion) still runs on the resulting
+    markdown, same as chrome_strip.strip_chrome()'s own pipeline."""
     async def fetch_fn(url: str) -> tuple[str, list[str]]:
-        config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
-        result = await crawler.arun(url=url, config=config)
+        run_config = CrawlerRunConfig(
+            cache_mode=CacheMode.BYPASS,
+            excluded_tags=DEFAULT_EXCLUDED_TAGS,
+            excluded_selector=DEFAULT_EXCLUDED_SELECTOR,
+        )
+        result = await crawler.arun(url=url, config=run_config)
         if not result.success:
             status = result.redirected_status_code or result.status_code
             if status and status != 200:
@@ -196,7 +213,8 @@ def _make_fetch_fn(crawler: AsyncWebCrawler):
             raise FetchTimeout(result.error_message or "fetch failed")
         links = result.links.get("internal", []) + result.links.get("external", [])
         raw_hrefs = [l.get("href", "") for l in links if l.get("href")]
-        return result.markdown, raw_hrefs
+        markdown = strip_text_patterns(result.markdown)
+        return markdown, raw_hrefs
     return fetch_fn
 
 

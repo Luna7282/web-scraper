@@ -42,20 +42,31 @@ def find_near_duplicates(
     a blanket all-pairs comparison.
 
     ponytail: O(n^2) pairwise SequenceMatcher per page, fine for a capped
-    crawl's few hundred rows; a much larger corpus would need an indexed
-    approach (minhash / embedding clustering) instead of this.
+    crawl's few hundred rows total -- but a single long reference page
+    under per_chunk can itself produce 100-150+ pairs (confirmed on
+    docs.manim.community's real Part D run), so real per-page n^2 needed
+    a cheaper pre-filter, not just "small enough to ignore." quick_ratio()
+    is a fast upper bound on ratio() (never lower) -- skipping straight to
+    the full O(n*m) ratio() only when quick_ratio() already clears the
+    threshold cuts most pairs (which aren't close) at a fraction of the
+    cost, without changing which pairs end up counted as near-duplicates.
+    A much larger corpus would still need an indexed approach (minhash /
+    embedding clustering) instead of this.
     """
     by_url: dict[str, list[int]] = {}
     for i, r in enumerate(records):
         by_url.setdefault(r.get("source_url", ""), []).append(i)
 
-    normed = [_normalize(r.get(field, "")) for r in records]
+    matchers = [SequenceMatcher(None, "", _normalize(r.get(field, ""))) for r in records]
     dups = []
     for indices in by_url.values():
         for a in range(len(indices)):
             for b in range(a + 1, len(indices)):
                 i, j = indices[a], indices[b]
-                ratio = SequenceMatcher(None, normed[i], normed[j]).ratio()
+                matchers[i].set_seq1(matchers[j].b)
+                if matchers[i].quick_ratio() < threshold:
+                    continue
+                ratio = matchers[i].ratio()
                 if ratio >= threshold:
                     dups.append((i, j, ratio))
     return dups
