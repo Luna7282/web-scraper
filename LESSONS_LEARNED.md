@@ -79,6 +79,38 @@ factual errors; add new ones at the bottom.
   fresh test run against a code-heavy page (e.g., an API reference page with
   real parameter tables) before concluding either way. **Do not assume this
   is fixed.**
+- **Amendment (step 4, 2026-08-18) — "nav junk" was conflating three
+  distinct causes, and the diagnosis was only ~40% right.** Dumping and
+  categorizing all 87 duplicate Chroma chunks from the original manim
+  crawl (not guessed — every entry read) found:
+  - **23 pairs / 76 rows**: inline UI chrome — "Copy to clipboard" /
+    "Make interactive" button text that crawl4ai's markdown conversion
+    bakes into every code block. Not nav/sidebar at all; lives *inside*
+    content blocks, so semantic-tag stripping (`nav`/`aside`/`footer`)
+    can't touch it.
+  - **14 pairs / 28 rows**: true sidebar/TOC chrome (changelog version
+    listings, link lists) — this is what the original diagnosis actually
+    described, and it's real, but it's less than a sixth of the total.
+  - **49 pairs / 125 rows — the majority — is not chrome at all.** Real
+    documentation content duplicating for two different reasons: the same
+    example code shown twice *within* one page (gallery preview + full
+    source), and genuinely identical instructional text repeated *across*
+    pages by the site's own authors (the same "install the package"
+    paragraph copy-pasted onto the Linux/macOS/Windows/uv install pages).
+    No parser-layer fix should touch this — it's correct content sitting
+    on legitimate, distinct pages.
+  - **Why this matters going forward**: the JSONL nav-menu-question
+    problem this entry describes may have more than one root cause too,
+    not just "the prompt isn't working." A page that's genuinely dominated
+    by inline UI chrome and repeated boilerplate has less real unique
+    content for the LLM to extract from *regardless* of how well the
+    prompt filters navigation — so before concluding the prompt fix failed
+    outright, rule out how much of the page's actual text was chrome/
+    boilerplate to begin with. Don't re-diagnose "nav junk" as one thing
+    again; it's at minimum three: inline code-block UI, sidebar chrome,
+    and genuinely repeated source content, each needing a different fix
+    (a code-block UI filter, semantic-tag stripping, and content-level
+    dedup, respectively — see ROADMAP.md and this file's step-4 entry).
 
 ---
 
