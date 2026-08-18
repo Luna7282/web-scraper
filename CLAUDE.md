@@ -196,8 +196,16 @@ absolute `export.export_formats`-style imports need the repo root on
 `sys.path`, which only `-m` guarantees). Pipeline, always in this order:
 validate (`export/export_formats.py::validate_records` — rejects empty/
 equal/too-short answers) → dedup (`dedup_by_question`, exact-normalized-
-text only — does **not** catch the near-duplicates `ROADMAP.md` #23
-describes) → split (`split_records`, grouped by section/source_url,
+text only) → **optional** semantic dedup (`semantic_dedup`, pair-level
+near-duplicate answers on the same page — the `ROADMAP.md` #23 gap
+`dedup_by_question` leaves; off by default, enabled via `--semantic-dedup`,
+threshold via `--semantic-dedup-threshold` default
+`ANSWER_NEAR_DUP_THRESHOLD`=0.4; `--semantic-dedup-report` writes
+`semantic_dedup_report.json` listing what the current threshold would
+drop without dropping it, independent of whether `--semantic-dedup` is
+on — the intended way to pick a threshold from real data rather than
+guessing one, see `LESSONS_LEARNED.md` #37) → split (`split_records`,
+grouped by section/source_url,
 never random — docs repeat content across pages, a random split leaks
 near-duplicates into eval; seeded for reproducibility) → project
 (`SCHEMA_PROJECTIONS`/`BATCH_PROJECTIONS` — conversational, alpaca,

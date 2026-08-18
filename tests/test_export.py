@@ -182,6 +182,60 @@ class TestRunExport(unittest.TestCase):
         self.assertEqual(card["row_counts"]["removed_by_dedup"], 1)
         self.assertEqual(card["row_counts"]["final"], 1)
 
+    def _write_near_duplicate_pair(self) -> str:
+        records = [
+            {
+                "question": "Is Scene the base class?", "answer": "Scene is the base class.",
+                "source_chunk": "chunk a", "source_url": "https://x.com/a/page", "section": "a",
+                "page_title": "Page", "generation_model": "deepseek-v4-flash", "extraction_strategy": "per_chunk",
+                "timestamp": "2026-08-18T00:00:00+00:00", "crawl_date": "2026-08-18", "license_signal": None,
+            },
+            {
+                "question": "What role does Scene play?",
+                "answer": "Scene is the base class that every animation inherits from.",
+                "source_chunk": "chunk a", "source_url": "https://x.com/a/page", "section": "a",
+                "page_title": "Page", "generation_model": "deepseek-v4-flash", "extraction_strategy": "per_chunk",
+                "timestamp": "2026-08-18T00:00:00+00:00", "crawl_date": "2026-08-18", "license_signal": None,
+            },
+        ]
+        path = str(Path(self._tmpdir.name) / "near_dup.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+        return path
+
+    def test_semantic_dedup_report_writes_candidates_without_dropping(self):
+        path = self._write_near_duplicate_pair()
+        out = str(Path(self._tmpdir.name) / "report_out")
+        card = run_export(
+            path, out, schema="alpaca", framework="mlx",
+            semantic_dedup_report=True, semantic_dedup_threshold=0.5,
+        )
+        self.assertEqual(card["row_counts"]["final"], 2)  # report-only: nothing actually dropped
+        report = json.loads(Path(out, "semantic_dedup_report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["applied"], False)
+        self.assertEqual(report["candidate_count"], 1)
+
+    def test_semantic_dedup_applied_removes_the_near_duplicate(self):
+        path = self._write_near_duplicate_pair()
+        out = str(Path(self._tmpdir.name) / "applied_out")
+        card = run_export(
+            path, out, schema="alpaca", framework="mlx",
+            semantic_dedup=True, semantic_dedup_threshold=0.5,
+        )
+        self.assertEqual(card["row_counts"]["removed_by_semantic_dedup"], 1)
+        self.assertEqual(card["row_counts"]["final"], 1)
+        train = _read_jsonl(Path(out, "train.jsonl"))
+        self.assertEqual(len(train), 1)
+
+    def test_semantic_dedup_off_by_default(self):
+        path = self._write_near_duplicate_pair()
+        out = str(Path(self._tmpdir.name) / "default_out")
+        card = run_export(path, out, schema="alpaca", framework="mlx")
+        self.assertEqual(card["row_counts"]["removed_by_semantic_dedup"], 0)
+        self.assertEqual(card["row_counts"]["final"], 2)
+        self.assertFalse(Path(out, "semantic_dedup_report.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

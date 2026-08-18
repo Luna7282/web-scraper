@@ -11,11 +11,70 @@ in-memory structures, nothing more.
 from __future__ import annotations
 
 import random
+from difflib import SequenceMatcher
+from re import sub as _sub
 from typing import Callable
 
 from storage.chunk_store import normalize_chunk_text
 
 DEFAULT_MIN_ANSWER_LENGTH = 20
+
+# Picked from step 8 Part A's live-check analysis (LESSONS_LEARNED.md
+# #26), not a calibrated/labeled threshold -- answers are long enough
+# that a real duplicate shares a lower fraction of its total characters
+# than a real duplicate question does. Also semantic_dedup()'s default
+# drop threshold (Phase 3 Step 4) -- the same measure serves both a
+# report (dataset_report.py) and an actual removal decision, so a
+# dry_run mode exists precisely so this default isn't trusted blind for
+# the latter. QUESTION_NEAR_DUP_THRESHOLD (0.6) stays in
+# dataset_report.py -- it's report-only, nothing removes rows by it.
+ANSWER_NEAR_DUP_THRESHOLD = 0.4
+
+
+def _normalize_near_dup_text(text: str) -> str:
+    return _sub(r"[^a-z0-9 ]", "", (text or "").lower())
+
+
+def find_near_duplicates(
+    records: list[dict], field: str, threshold: float,
+) -> list[tuple[int, int, float]]:
+    """(i, j, ratio) for every pair of records whose normalized `field`
+    text is at least `threshold` similar -- restricted to records sharing
+    the same source_url. Comparing across unrelated pages produces
+    matches on generic question templates ("Who are the authors of...")
+    that inflate the count with false positives; that's exactly what step
+    8 Part A's live-check had to work around by hand when it first tried
+    a blanket all-pairs comparison.
+
+    ponytail: O(n^2) pairwise SequenceMatcher per page, fine for a capped
+    crawl's few hundred rows total -- but a single long reference page
+    under per_chunk can itself produce 100-150+ pairs (confirmed on
+    docs.manim.community's real Part D run), so real per-page n^2 needed
+    a cheaper pre-filter, not just "small enough to ignore." quick_ratio()
+    is a fast upper bound on ratio() (never lower) -- skipping straight to
+    the full O(n*m) ratio() only when quick_ratio() already clears the
+    threshold cuts most pairs (which aren't close) at a fraction of the
+    cost, without changing which pairs end up counted as near-duplicates.
+    A much larger corpus would still need an indexed approach (minhash /
+    embedding clustering) instead of this.
+    """
+    by_url: dict[str, list[int]] = {}
+    for i, r in enumerate(records):
+        by_url.setdefault(r.get("source_url", ""), []).append(i)
+
+    matchers = [SequenceMatcher(None, "", _normalize_near_dup_text(r.get(field, ""))) for r in records]
+    dups = []
+    for indices in by_url.values():
+        for a in range(len(indices)):
+            for b in range(a + 1, len(indices)):
+                i, j = indices[a], indices[b]
+                matchers[i].set_seq1(matchers[j].b)
+                if matchers[i].quick_ratio() < threshold:
+                    continue
+                ratio = matchers[i].ratio()
+                if ratio >= threshold:
+                    dups.append((i, j, ratio))
+    return dups
 
 
 def validate_records(
@@ -57,6 +116,69 @@ def dedup_by_question(records: list[dict]) -> tuple[list[dict], int]:
         seen.add(key)
         deduped.append(r)
     return deduped, len(records) - len(deduped)
+
+
+def semantic_dedup(
+    records: list[dict],
+    *,
+    field: str = "answer",
+    threshold: float = ANSWER_NEAR_DUP_THRESHOLD,
+    dry_run: bool = False,
+) -> tuple[list[dict], list[dict]]:
+    """Pair-level near-duplicate removal, run after dedup_by_question
+    (exact question match, above) since it catches what that stage
+    demonstrably misses: rewordings of the same underlying fact, not just
+    identical questions. Covers both LESSONS_LEARNED.md #33's causes --
+    same-chunk paraphrase padding and adjacent-chunk overlap -- in one
+    mechanism, since both show up as answer-text near-duplicates on the
+    same page regardless of which chunk(s) produced them; this is why
+    split chunking was rejected in favor of this instead.
+
+    Reuses find_near_duplicates() -- the exact detector already
+    calibrated against real data for the dataset_report.py redundancy
+    measurement, restricted to same-source_url pairs and pre-filtered by
+    quick_ratio() for the O(n^2) cost.
+
+    Collision rule: the longer answer survives, not whichever was
+    written first -- the 2B manual read (LESSONS_LEARNED.md #33) found a
+    near-dup group where a later pair consolidated several rewordings
+    into the single most complete answer, so "first" is not a reliable
+    proxy for "best" here. Ties keep the lower record index for
+    determinism. A record that loses one comparison but wins another
+    (a redundant cluster of 3+) is still dropped -- only the single
+    longest answer in a mutually-similar group survives.
+
+    dry_run=True runs identical detection and collision logic but
+    returns every record unchanged in the first slot and the drop
+    decisions in the second, so a threshold can be picked from a real
+    report instead of guessed -- see export.py's --semantic-dedup-report."""
+    dups = find_near_duplicates(records, field, threshold)
+    if not dups:
+        return records, []
+
+    drop_reasons: dict[int, dict] = {}
+    for i, j, ratio in dups:
+        len_i = len((records[i].get(field) or ""))
+        len_j = len((records[j].get(field) or ""))
+        winner, loser = (i, j) if len_i >= len_j else (j, i)
+        existing = drop_reasons.get(loser)
+        if existing is None or ratio > existing["ratio"]:
+            drop_reasons[loser] = {"winner": winner, "ratio": ratio}
+
+    dropped = [
+        {
+            **records[loser],
+            "_dedup_reason": "semantic_near_duplicate",
+            "_dedup_ratio": round(info["ratio"], 3),
+            "_dedup_survivor_question": records[info["winner"]].get("question"),
+        }
+        for loser, info in drop_reasons.items()
+    ]
+    if dry_run:
+        return records, dropped
+
+    deduped = [r for idx, r in enumerate(records) if idx not in drop_reasons]
+    return deduped, dropped
 
 
 def split_records(

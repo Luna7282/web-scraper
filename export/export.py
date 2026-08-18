@@ -21,10 +21,12 @@ import sys
 from datetime import datetime, timezone
 
 from export.export_formats import (
+    ANSWER_NEAR_DUP_THRESHOLD,
     BATCH_PROJECTIONS,
     SCHEMA_PROJECTIONS,
     UNSUPPORTED_WITHOUT_EXTRA_PASS,
     dedup_by_question,
+    semantic_dedup as semantic_dedup_pairs,
     split_records,
     to_raw_text,
     validate_records,
@@ -52,7 +54,7 @@ def _write_jsonl(path: str, rows: list[dict]) -> None:
 
 def build_dataset_card(
     records: list[dict], *, intent: str | None, generation_model: str, min_answer_length: int,
-    valid_count: int, rejected_count: int, dedup_removed: int,
+    valid_count: int, rejected_count: int, dedup_removed: int, semantic_dedup_removed: int = 0,
 ) -> dict:
     """Provenance, not laundering: a tool that turns any site into training
     data should say where the data came from and under what conditions it
@@ -70,7 +72,8 @@ def build_dataset_card(
             "valid_after_validation": valid_count,
             "rejected_by_validation": rejected_count,
             "removed_by_dedup": dedup_removed,
-            "final": valid_count - dedup_removed,
+            "removed_by_semantic_dedup": semantic_dedup_removed,
+            "final": valid_count - dedup_removed - semantic_dedup_removed,
         },
         "validation_min_answer_length": min_answer_length,
         "license_signals_observed": license_signals or None,
@@ -200,6 +203,9 @@ def run_export(
     seed: int = 42,
     intent: str | None = None,
     section_depth: int = 2,
+    semantic_dedup: bool = False,
+    semantic_dedup_threshold: float = ANSWER_NEAR_DUP_THRESHOLD,
+    semantic_dedup_report: bool = False,
 ) -> dict:
     if schema in UNSUPPORTED_WITHOUT_EXTRA_PASS:
         raise ValueError(
@@ -213,13 +219,40 @@ def run_export(
     valid, rejected = validate_records(records, min_answer_length=min_answer_length)
     deduped, dedup_removed = dedup_by_question(valid)
 
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Runs after exact-question dedup, above -- catches rewordings that
+    # stage demonstrably misses (LESSONS_LEARNED.md #33). Not applied by
+    # default: semantic_dedup_report writes what WOULD be dropped at the
+    # given threshold without touching `deduped`, precisely so the
+    # threshold can be picked from a real report instead of guessed
+    # before --semantic-dedup is ever turned on for a real export.
+    semantic_removed = 0
+    if semantic_dedup or semantic_dedup_report:
+        kept, dropped_pairs = semantic_dedup_pairs(
+            deduped, threshold=semantic_dedup_threshold, dry_run=not semantic_dedup,
+        )
+        if semantic_dedup_report:
+            with open(os.path.join(out_dir, "semantic_dedup_report.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "threshold": semantic_dedup_threshold,
+                        "applied": semantic_dedup,
+                        "candidate_count": len(dropped_pairs),
+                        "candidates": dropped_pairs,
+                    },
+                    f, indent=2, ensure_ascii=False,
+                )
+        if semantic_dedup:
+            deduped = kept
+            semantic_removed = len(dropped_pairs)
+
     generation_model = deduped[0]["generation_model"] if deduped else "unknown"
     card = build_dataset_card(
         records, intent=intent, generation_model=generation_model, min_answer_length=min_answer_length,
         valid_count=len(valid), rejected_count=len(rejected), dedup_removed=dedup_removed,
+        semantic_dedup_removed=semantic_removed,
     )
-
-    os.makedirs(out_dir, exist_ok=True)
 
     if schema in BATCH_PROJECTIONS:
         splits = split_records(deduped, by=split_by, seed=seed)
@@ -266,6 +299,18 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--intent", default=None, help="Intent string used for the crawl, recorded on the dataset card.")
     parser.add_argument("--section-depth", type=int, default=2)
+    parser.add_argument(
+        "--semantic-dedup", action="store_true",
+        help="Drop pair-level near-duplicate answers (same page, ratio>=threshold) after exact-question dedup.",
+    )
+    parser.add_argument(
+        "--semantic-dedup-threshold", type=float, default=ANSWER_NEAR_DUP_THRESHOLD,
+        help=f"SequenceMatcher ratio threshold for --semantic-dedup / --semantic-dedup-report (default {ANSWER_NEAR_DUP_THRESHOLD}).",
+    )
+    parser.add_argument(
+        "--semantic-dedup-report", action="store_true",
+        help="Write semantic_dedup_report.json listing what --semantic-dedup would drop at the given threshold, without dropping anything (usable with or without --semantic-dedup).",
+    )
     args = parser.parse_args()
 
     try:
@@ -273,6 +318,8 @@ if __name__ == "__main__":
             args.canonical_path, args.out, schema=args.schema, framework=args.framework,
             min_answer_length=args.min_answer_length, split_by=args.split_by, seed=args.seed,
             intent=args.intent, section_depth=args.section_depth,
+            semantic_dedup=args.semantic_dedup, semantic_dedup_threshold=args.semantic_dedup_threshold,
+            semantic_dedup_report=args.semantic_dedup_report,
         )
     except ValueError as e:
         print(f"Export refused: {e}", file=sys.stderr)

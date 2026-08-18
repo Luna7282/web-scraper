@@ -5,6 +5,7 @@ import unittest
 from export.export_formats import (
     dedup_by_question,
     mine_triplets,
+    semantic_dedup,
     split_records,
     to_alpaca,
     to_conversational,
@@ -69,6 +70,79 @@ class TestDedupByQuestion(unittest.TestCase):
         deduped, removed = dedup_by_question(records)
         self.assertEqual(len(deduped), 2)
         self.assertEqual(removed, 0)
+
+
+class TestSemanticDedup(unittest.TestCase):
+    def test_near_duplicate_answers_reduced_to_the_longer_one(self):
+        records = [
+            _record(source_url="https://x.com/a", question="Is Scene the base class?",
+                     answer="Scene is the base class."),
+            _record(source_url="https://x.com/a", question="What role does Scene play?",
+                     answer="Scene is the base class that every animation inherits from."),
+        ]
+        deduped, dropped = semantic_dedup(records, threshold=0.5)
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["answer"], records[1]["answer"])
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(dropped[0]["answer"], records[0]["answer"])
+        self.assertEqual(dropped[0]["_dedup_reason"], "semantic_near_duplicate")
+
+    def test_distinct_answers_kept(self):
+        records = [
+            _record(source_url="https://x.com/a", answer="Circle draws a circular mobject."),
+            _record(source_url="https://x.com/a", answer="The crawl worker checks robots dot txt before every fetch."),
+        ]
+        deduped, dropped = semantic_dedup(records, threshold=0.5)
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual(dropped, [])
+
+    def test_different_pages_not_compared(self):
+        records = [
+            _record(source_url="https://x.com/a", answer="Scene is the base class."),
+            _record(source_url="https://x.com/b", answer="Scene is the base class."),
+        ]
+        deduped, dropped = semantic_dedup(records, threshold=0.9)
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual(dropped, [])
+
+    def test_tie_length_keeps_earlier_record(self):
+        records = [
+            _record(source_url="https://x.com/a", question="Q1", answer="Scene is the animation base class."),
+            _record(source_url="https://x.com/a", question="Q2", answer="Scene is the animation root class."),
+        ]
+        deduped, dropped = semantic_dedup(records, threshold=0.5)
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["question"], "Q1")
+
+    def test_dry_run_reports_without_dropping(self):
+        records = [
+            _record(source_url="https://x.com/a", answer="Scene is the base class."),
+            _record(source_url="https://x.com/a", answer="Scene is the base class that everything inherits."),
+        ]
+        deduped, dropped = semantic_dedup(records, threshold=0.5, dry_run=True)
+        self.assertEqual(len(deduped), 2)  # nothing actually removed
+        self.assertEqual(len(dropped), 1)
+
+    def test_threshold_configurable_below_threshold_kept(self):
+        records = [
+            _record(source_url="https://x.com/a", answer="Scene is the base class."),
+            _record(source_url="https://x.com/a", answer="Square draws a four-sided mobject entirely unrelated."),
+        ]
+        deduped, dropped = semantic_dedup(records, threshold=0.9)
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual(dropped, [])
+
+    def test_redundant_cluster_keeps_only_the_single_longest_answer(self):
+        records = [
+            _record(source_url="https://x.com/a", question="Q1", answer="Scene is the base class."),
+            _record(source_url="https://x.com/a", question="Q2", answer="Scene is the base class too."),
+            _record(source_url="https://x.com/a", question="Q3",
+                     answer="Scene is the base class that every animation in the library ultimately inherits from."),
+        ]
+        deduped, dropped = semantic_dedup(records, threshold=0.4)
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["question"], "Q3")
+        self.assertEqual(len(dropped), 2)
 
 
 class TestSplitRecords(unittest.TestCase):

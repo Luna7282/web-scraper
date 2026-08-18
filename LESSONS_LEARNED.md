@@ -1652,6 +1652,65 @@ change either) -- extraction behavior against a live LLM isn't something
 the offline test suite exercises; the real check is the Step 6 re-run's
 pairs-per-chunk distribution against the Part D baseline.
 
+## 2026-08-19 — Phase 3 Step 4: pair-level semantic dedup (ROADMAP #23)
+
+### 37. Reused the already-calibrated near-dup detector instead of building a second one, kept it off by default
+Decisions made and the reasoning, per the explicit ask to state them:
+
+- **Where it runs**: export time only, as a new optional stage in
+  `export/export_formats.py` between `dedup_by_question` (exact question
+  match) and `split_records`. Not extraction time -- catching entry
+  #33's 2C (adjacent-chunk overlap) requires comparing pairs from
+  *different* chunks of the same page, and those come from separate,
+  independent LLM calls in different `extract_worker` invocations with
+  no shared state between them (and no legitimate way to give them one:
+  `test_writer_ownership.py` structurally forbids `extract_worker` from
+  taking a `Writer`/shared-state parameter, by design). A single
+  export-time pass over the whole canonical file naturally sees every
+  pair from every chunk of every page at once, which is exactly what
+  "covers both causes in one mechanism" (the reason split chunking was
+  rejected) requires.
+- **Similarity measure**: `SequenceMatcher.ratio()` on normalized answer
+  text, restricted to same-`source_url` pairs, `quick_ratio()`-prefiltered
+  for the O(n^2) cost -- not a new embedding-based measure. This is
+  `export/dataset_report.py::find_near_duplicates()`, unchanged, moved
+  to `export_formats.py` (dataset_report.py now imports it back) so
+  `export_formats.py`'s new `semantic_dedup()` could call it without a
+  circular import. Reusing it rather than writing a second detector: it
+  was already calibrated against real Part A data (LESSONS_LEARNED.md
+  #26) and is exactly the measure that produced entry #33's real 2B/2C
+  numbers -- a different measure here would mean the thing being applied
+  doesn't match the thing that was measured.
+- **Threshold**: `ANSWER_NEAR_DUP_THRESHOLD` (0.4, the existing constant)
+  as the default, but configurable via `semantic_dedup()`'s `threshold`
+  param and `export.py`'s `--semantic-dedup-threshold` CLI flag -- and,
+  per the explicit ask not to trust a guessed threshold for an actual
+  drop decision, `--semantic-dedup-report` runs identical detection and
+  collision logic and writes `semantic_dedup_report.json` (every
+  candidate pair, its ratio, and which record would survive) without
+  removing anything, independent of whether `--semantic-dedup` itself is
+  on. `--semantic-dedup` (the actual drop) defaults to **off** -- the
+  report mode exists specifically so the threshold gets tuned against
+  the Step 6 re-run's real data before this ever changes a real export's
+  row count, not applied blind on the strength of the 0.4 report-only
+  calibration alone.
+- **Collision rule**: the longer answer survives, not whichever was
+  written first. `dedup_by_question` already keeps first-seen, but that
+  rule doesn't fit here -- entry #33's manual 2B read found a near-dup
+  group where a later-generated pair had consolidated several shorter
+  rewordings into the single most complete answer, so "first" is not a
+  reliable proxy for "best" for this kind of duplicate. Ties keep the
+  lower record index for determinism. A record that loses one comparison
+  but would have won another (a mutually-similar cluster of 3+) is still
+  dropped -- only the single longest answer in a redundant cluster
+  survives, not one survivor per pairwise comparison.
+
+Not run against the real corpus yet -- this step built and tested the
+mechanism (`tests/test_export_formats.py::TestSemanticDedup`, `test_export.py`'s
+report/applied/off-by-default wiring tests) against synthetic records
+only. The Step 6 re-run is where `--semantic-dedup-report` gets pointed
+at real data and the 0.4 default gets confirmed or adjusted.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->

@@ -9,67 +9,20 @@ from __future__ import annotations
 
 import statistics
 from collections import Counter
-from difflib import SequenceMatcher
-from re import sub as _sub
 
-from export.export_formats import dedup_by_question
+from export.export_formats import ANSWER_NEAR_DUP_THRESHOLD, dedup_by_question, find_near_duplicates
 
-# Picked from step 8 Part A's live-check analysis (LESSONS_LEARNED.md
-# #26), not a calibrated/labeled threshold -- questions are short enough
-# that 0.6 caught real duplicates without much noise; answers are longer,
-# so a real duplicate shares a lower fraction of its total characters.
+# Report-only -- nothing removes rows by this one (contrast
+# ANSWER_NEAR_DUP_THRESHOLD, imported above, which is also
+# export_formats.py::semantic_dedup()'s actual drop threshold as of
+# Phase 3 Step 4). Picked from step 8 Part A's live-check analysis
+# (LESSONS_LEARNED.md #26): questions are short enough that 0.6 caught
+# real duplicates without much noise.
 QUESTION_NEAR_DUP_THRESHOLD = 0.6
-ANSWER_NEAR_DUP_THRESHOLD = 0.4
-
-
-def _normalize(text: str) -> str:
-    return _sub(r"[^a-z0-9 ]", "", (text or "").lower())
 
 
 def pairs_per_page(records: list[dict]) -> dict[str, int]:
     return dict(Counter(r.get("source_url", "") for r in records))
-
-
-def find_near_duplicates(
-    records: list[dict], field: str, threshold: float,
-) -> list[tuple[int, int, float]]:
-    """(i, j, ratio) for every pair of records whose normalized `field`
-    text is at least `threshold` similar -- restricted to records sharing
-    the same source_url. Comparing across unrelated pages produces
-    matches on generic question templates ("Who are the authors of...")
-    that inflate the count with false positives; that's exactly what step
-    8 Part A's live-check had to work around by hand when it first tried
-    a blanket all-pairs comparison.
-
-    ponytail: O(n^2) pairwise SequenceMatcher per page, fine for a capped
-    crawl's few hundred rows total -- but a single long reference page
-    under per_chunk can itself produce 100-150+ pairs (confirmed on
-    docs.manim.community's real Part D run), so real per-page n^2 needed
-    a cheaper pre-filter, not just "small enough to ignore." quick_ratio()
-    is a fast upper bound on ratio() (never lower) -- skipping straight to
-    the full O(n*m) ratio() only when quick_ratio() already clears the
-    threshold cuts most pairs (which aren't close) at a fraction of the
-    cost, without changing which pairs end up counted as near-duplicates.
-    A much larger corpus would still need an indexed approach (minhash /
-    embedding clustering) instead of this.
-    """
-    by_url: dict[str, list[int]] = {}
-    for i, r in enumerate(records):
-        by_url.setdefault(r.get("source_url", ""), []).append(i)
-
-    matchers = [SequenceMatcher(None, "", _normalize(r.get(field, ""))) for r in records]
-    dups = []
-    for indices in by_url.values():
-        for a in range(len(indices)):
-            for b in range(a + 1, len(indices)):
-                i, j = indices[a], indices[b]
-                matchers[i].set_seq1(matchers[j].b)
-                if matchers[i].quick_ratio() < threshold:
-                    continue
-                ratio = matchers[i].ratio()
-                if ratio >= threshold:
-                    dups.append((i, j, ratio))
-    return dups
 
 
 def classify_redundancy_cause(records: list[dict], i: int, j: int) -> str:

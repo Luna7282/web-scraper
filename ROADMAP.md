@@ -320,30 +320,33 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     rate against this step's `per_chunk` baseline. **Size: S (mechanism
     exists; needs a measurement, not new code).**
 
-23. **[Lower priority than #31 -- see there] No dedup for near-duplicate
-    pairs from chunk-overlap boundaries or same-chunk paraphrase
-    padding.** Measured, not assumed (`LESSONS_LEARNED.md` #26): ~27%
-    of FastAPI's `per_chunk` pairs and ~47% of Cloudflare's are
-    near-duplicates by answer-text similarity, from two distinct causes
-    -- adjacent chunks re-covering the ~10% overlap region, and the "3
-    to 5 diverse pairs" prompt instruction padding with rephrasings when
-    a chunk only supports one real fact. `export_formats.py::dedup_by_question`'s
+23. **[RESOLVED, mechanism built -- Phase 3 Step 4] Dedup for
+    near-duplicate pairs from chunk-overlap boundaries or same-chunk
+    paraphrase padding.** Measured, not assumed (`LESSONS_LEARNED.md`
+    #26): ~27% of FastAPI's `per_chunk` pairs and ~47% of Cloudflare's
+    are near-duplicates by answer-text similarity, from two distinct
+    causes -- adjacent chunks re-covering the ~10% overlap region, and
+    the fixed-count prompt instruction padding with rephrasings when a
+    chunk only supports one real fact. `export_formats.py::dedup_by_question`'s
     exact-normalized-text dedup catches neither, since every pair is a
-    fresh generation with different wording. Re-measured on real
-    Part D data in step 8 Phase 2B/2C (`LESSONS_LEARNED.md` #33): 380
-    same-chunk near-duplicate pairs (52.7% of chunks affected) vs. only
-    24 pairs (2.1%) directly attributable to overlap -- same-chunk
-    padding is the far bigger of the two causes on real data,
-    confirming semantic dedup (catches both) over a chunking-overlap
-    change (catches only the smaller one).
-    *Fix, not yet chosen*: options include semantic similarity dedup at
-    export time (embed each question, cluster/threshold, keep one per
-    cluster -- costs embed calls per row), a smaller `top_k`-per-page
-    instruction to the LLM to reduce same-chunk padding directly, or
-    reducing `PARENT_CHUNK_OVERLAP` to shrink the boundary-duplicate
-    contribution specifically (only one of the two causes, per the
-    measurement). Needs a decision informed by cost, not made here.
-    **Size: M.**
+    fresh generation with different wording. Re-measured on real Part D
+    data in step 8 Phase 2B/2C (`LESSONS_LEARNED.md` #33): 380 same-chunk
+    near-duplicate pairs (52.7% of chunks affected) vs. only 24 pairs
+    (2.1%) directly attributable to overlap -- same-chunk padding is the
+    far bigger of the two causes on real data, confirming semantic dedup
+    (catches both) over a chunking-overlap change (catches only the
+    smaller one).
+    *Fix, built and tested against synthetic data, not yet applied to a
+    real export*: `export_formats.py::semantic_dedup()` (Phase 3 Step 4,
+    `LESSONS_LEARNED.md` #37) -- reuses the already-calibrated
+    `find_near_duplicates()` text-similarity detector rather than a new
+    embedding-based measure, runs at export time (the only point that
+    naturally sees pairs from every chunk of a page at once), keeps the
+    longer answer on a collision, and defaults to off with a
+    `--semantic-dedup-report` dry-run mode so the 0.4 threshold gets
+    confirmed against real data (the Step 6 re-run) before it's trusted
+    to actually drop rows. **Size: done -- what's left is a real-data
+    threshold check, not new code.**
 
 24. **Whether a listing/index page should pass `extract_threshold` at
     all is unanswered.** `blog.cloudflare.com`'s root (item 20 above) is
