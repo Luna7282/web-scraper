@@ -7,7 +7,7 @@ from canonical import build_canonical_record, detect_license_signal, extract_pag
 class TestBuildCanonicalRecord(unittest.TestCase):
     def test_has_all_expected_fields(self):
         record = build_canonical_record(
-            question="Q", answer="A", source_chunk="chunk", source_url="https://x.com/a",
+            question="Q", answer="A", source_chunk="chunk", chunk_index=0, source_url="https://x.com/a",
             section="tutorial", page_title="Title", generation_model="deepseek-v4-flash",
             extraction_strategy="per_chunk", timestamp="2026-08-18T00:00:00+00:00",
             crawl_date="2026-08-18", license_signal=None,
@@ -15,6 +15,7 @@ class TestBuildCanonicalRecord(unittest.TestCase):
         self.assertEqual(record["question"], "Q")
         self.assertEqual(record["answer"], "A")
         self.assertEqual(record["source_chunk"], "chunk")
+        self.assertEqual(record["chunk_index"], 0)
         self.assertIsNone(record["license_signal"])
 
 

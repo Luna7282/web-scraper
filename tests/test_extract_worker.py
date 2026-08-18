@@ -101,6 +101,7 @@ class TestExtractWorkerFailureModes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pair["question"], "Q")
         self.assertEqual(pair["answer"], "A")
         self.assertEqual(pair["source_chunk"], CONTENT)
+        self.assertEqual(pair["chunk_index"], 0)
         self.assertEqual(pair["source_url"], SEED)
         counts = await self.frontier.counts_by_status()
         self.assertNotIn("failed", counts)
@@ -242,6 +243,7 @@ class TestExtractWorkerFailureModes(unittest.IsolatedAsyncioTestCase):
         result: ExtractionResult = self.results_queue.get_nowait()
         self.assertEqual(len(result.qa_pairs), 3)
         self.assertEqual([p["source_chunk"] for p in result.qa_pairs], ["chunk-1", "chunk-2", "chunk-3"])
+        self.assertEqual([p["chunk_index"] for p in result.qa_pairs], [0, 1, 2])
 
     async def test_one_malformed_unit_among_several_does_not_fail_the_page(self):
         async def score_fn(url, content):

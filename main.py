@@ -26,6 +26,8 @@ from score_report import format_score_report
 from chunk_store import ChunkStore, get_or_create_collection, split_into_parent_child_chunks
 from query import query_chunks, format_query_results
 from extraction_units import make_extraction_units_fn
+from dataset_report import build_dataset_report
+from export import load_canonical_records
 
 EMBEDDING_MODEL_NAME = "nomic-embed-text"  # LocalOllamaEmbeddings' default; keep in sync (see get_llm)
 EMBEDDING_DIM = 768  # measured in step 6 -- see LESSONS_LEARNED.md #17
@@ -120,6 +122,29 @@ async def score_report_command(db_path: str):
     scores = await frontier.all_scores()
     await frontier.close()
     console.print(format_score_report(scores))
+
+
+async def dataset_report_command(canonical_path: str, frontier_db_path: str | None):
+    """Reads canonical.jsonl (and, if given, the frontier DB it came from)
+    and reports pair-level redundancy stats -- the instrument for
+    ROADMAP #23. Offline, no LLM calls -- pure reads over what a
+    completed run already wrote to disk."""
+    if not os.path.exists(canonical_path):
+        console.print(f"[red]No canonical file found at {canonical_path}[/red]")
+        sys.exit(1)
+    records = load_canonical_records(canonical_path)
+
+    scores = None
+    if frontier_db_path:
+        if not os.path.exists(frontier_db_path):
+            console.print(f"[yellow]No frontier DB found at {frontier_db_path} -- skipping the scores section.[/yellow]")
+        else:
+            frontier = Frontier(frontier_db_path)
+            await frontier.open()
+            scores = await frontier.all_scores()
+            await frontier.close()
+
+    console.print(build_dataset_report(records, scores=scores))
 
 
 async def query_command(question: str):
@@ -415,6 +440,21 @@ if __name__ == "__main__":
              "and sources. Requires a prior run with RAG enabled. One live "
              "embedding call.",
     )
+    parser.add_argument(
+        "--dataset-report",
+        metavar="CANONICAL_JSONL",
+        help="Report pair counts, exact/near-duplicate questions and answers, "
+             "and redundancy by cause (adjacent-chunk overlap vs. same-chunk "
+             "paraphrase padding) for a completed run's canonical file. "
+             "Offline, no LLM calls. Pair with --dataset-report-frontier-db "
+             "to also show relevance scores against what was extracted.",
+    )
+    parser.add_argument(
+        "--dataset-report-frontier-db",
+        metavar="FRONTIER_DB",
+        default=None,
+        help="Optional frontier DB to cross-reference with --dataset-report.",
+    )
     args = parser.parse_args()
 
     try:
@@ -424,6 +464,8 @@ if __name__ == "__main__":
             asyncio.run(score_report_command(args.score_report))
         elif args.query:
             asyncio.run(query_command(args.query))
+        elif args.dataset_report:
+            asyncio.run(dataset_report_command(args.dataset_report, args.dataset_report_frontier_db))
         else:
             asyncio.run(main())
     except KeyboardInterrupt:

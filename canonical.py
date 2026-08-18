@@ -4,13 +4,20 @@ projections and framework packaging (export.py) are pure functions over
 this file -- changing training format must never require re-crawling, so
 every field a future projection might need has to be captured now, even
 one (source_chunk) nothing currently reads.
+
+chunk_index (position of this pair's source_chunk within the page's
+extraction-unit sequence, 0-based) exists specifically so redundancy
+analysis (dataset_report.py, ROADMAP #23) can classify a near-duplicate
+pair as adjacent-chunk-overlap (consecutive index) vs. same-chunk
+paraphrase-padding (identical source_chunk) without having to infer chunk
+order from file position, which a real crash-resumed run could reorder.
 """
 from __future__ import annotations
 
 import re
 
 CANONICAL_FIELDS = (
-    "question", "answer", "source_chunk", "source_url", "section",
+    "question", "answer", "source_chunk", "chunk_index", "source_url", "section",
     "page_title", "generation_model", "extraction_strategy",
     "timestamp", "crawl_date", "license_signal",
 )
@@ -21,6 +28,7 @@ def build_canonical_record(
     question: str,
     answer: str,
     source_chunk: str,
+    chunk_index: int,
     source_url: str,
     section: str,
     page_title: str | None,
@@ -34,6 +42,7 @@ def build_canonical_record(
         "question": question,
         "answer": answer,
         "source_chunk": source_chunk,
+        "chunk_index": chunk_index,
         "source_url": source_url,
         "section": section,
         "page_title": page_title,

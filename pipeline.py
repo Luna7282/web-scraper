@@ -165,7 +165,7 @@ async def extract_worker(
         qa_pairs: list[dict] = []
         parsed_any_unit = False
         try:
-            for unit in units:
+            for chunk_index, unit in enumerate(units):
                 raw_response = await extract_fn(unit)
                 try:
                     pairs = parse_qa_json(raw_response)
@@ -178,7 +178,7 @@ async def extract_worker(
                 for pair in pairs:
                     qa_pairs.append(build_canonical_record(
                         question=pair["instruction"], answer=pair["response"],
-                        source_chunk=unit, source_url=url, section=section,
+                        source_chunk=unit, chunk_index=chunk_index, source_url=url, section=section,
                         page_title=page_title, generation_model=generation_model,
                         extraction_strategy=extraction_strategy,
                         timestamp=timestamp, crawl_date=crawl_date,
