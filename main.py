@@ -418,7 +418,8 @@ async def main():
                                 extraction_units_fn=extraction_units_fn,
                                 generation_model=model_name,
                                 extraction_strategy=config.EXTRACTION_STRATEGY.value,
-                                section_depth=config.SECTION_DEPTH)
+                                section_depth=config.SECTION_DEPTH,
+                                seed_prefixes=host_prefix_pairs)
             )
             for _ in range(extract_workers_n)
         ] + [

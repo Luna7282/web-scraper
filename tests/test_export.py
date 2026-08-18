@@ -111,6 +111,44 @@ class TestRunExport(unittest.TestCase):
         unified = _read_jsonl(Path(out, "unified.jsonl"))
         self.assertEqual(len(unified), 24)
 
+    def test_plain_jsonl_disambiguates_a_real_slug_collision_not_just_the_unit(self):
+        """step 8 Phase 2A: the real Part D corpus (35 sections at depth
+        2/3) hit the length-cap+hash-suffix path (5 slugs) but never
+        triggered an actual collision -- disambiguate_slugs()'s own unit
+        tests cover the logic in isolation, but that's exactly the kind
+        of isolation gap LESSONS_LEARNED.md #28 (chrome_strip) warns
+        about. This constructs three section labels that genuinely
+        collide after slugification ("a!b", "a?b", "a.b" all -> "a-b")
+        and proves the disambiguation survives a real run through
+        run_export -> package_plain_jsonl, not just the pure function."""
+        def _row(url, question, section):
+            return {
+                "question": question,
+                "answer": f"Answer for {question}, long enough to pass validation checks.",
+                "source_chunk": "chunk", "source_url": url, "section": section,
+                "page_title": "T", "generation_model": "m", "extraction_strategy": "per_chunk",
+                "timestamp": "t", "crawl_date": "d", "license_signal": None,
+            }
+
+        records = [
+            _row("https://x.com/a!b", "Q1", "a!b"),
+            _row("https://x.com/a?b", "Q2", "a?b"),
+            _row("https://x.com/a.b", "Q3", "a.b"),
+        ]
+        path = str(Path(self._tmpdir.name) / "collision_canonical.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+        out = str(Path(self._tmpdir.name) / "collision_out")
+        run_export(path, out, schema="alpaca", framework="plain-jsonl", split_by="source_url")
+
+        section_files = sorted(p.name for p in Path(out, "sections").iterdir())
+        self.assertEqual(section_files, ["a-b-1.jsonl", "a-b-2.jsonl", "a-b.jsonl"])
+        manifest = json.loads(Path(out, "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(manifest), 3)  # not silently merged into one
+        self.assertEqual(sum(v["row_count"] for v in manifest.values()), 3)
+
     def test_raw_text_batch_projection_writes_split_files_not_qa_pairs(self):
         out = str(Path(self._tmpdir.name) / "raw_out")
         run_export(self.canonical_path, out, schema="raw_text", framework="plain-jsonl")

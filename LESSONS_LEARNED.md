@@ -1270,4 +1270,104 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-19 — Step 8 Phase 2A: sectioning was depth-from-root, not depth-from-seed -- every page in the real corpus had the same section
+
+### 30. derive_section counted depth from the domain root, not the crawl's own seed prefix -- confirmed by reading the real corpus, not by inspecting the code
+- **Problem**: every one of the real Part D corpus's 1144 records had
+  the identical `"section": "en/stable"` -- found by reading a sample of
+  `data/run/canonical.jsonl` directly, not by re-deriving expectations
+  from the code. `derive_section(url, depth=2)` counts `depth`
+  non-empty path segments from the URL's root, with no awareness that
+  the crawl was seeded at `/en/stable/` -- for `docs.manim.community`,
+  the locale (`en`) and version (`stable`) segments the seed itself
+  sits behind consume the entire depth budget before any real category
+  (`reference`, `tutorials`, `changelog`, ...) is ever reached. Every
+  page produced the same section regardless of its real content, and
+  Part C's export-time filename logic (slugify, cap+hash,
+  disambiguate, `manifest.json`) had never seen more than one distinct
+  label -- a per-section export would have produced exactly one file.
+- **Fix**: `content/sectioning.py::derive_section()` gained an optional
+  `seed_prefixes: list[tuple[str, str | None]]` parameter -- the exact
+  same `(host, prefix)` list `main.py` already builds for `scope_check`
+  (`crawl/scope.py::derive_prefix` per selected branch), reused rather
+  than reimplemented. When a URL's host+path matches one or more
+  prefixes, the *longest* match wins (same convention `crawl/scope.py`
+  itself uses) and the path is made relative to it before segmenting;
+  a crawl with multiple seeds on different prefixes is handled the same
+  way, not just the single-seed case. `seed_prefixes=None` (the
+  default) falls back to the original root-relative behavior, so
+  existing callers (tests, or a URL that matches no known seed) don't
+  break. Wired through `crawl/pipeline.py::extract_worker`'s new
+  `seed_prefixes` parameter, populated from `main.py`'s existing
+  `host_prefix_pairs`.
+- **The existing corpus was repaired in place, not re-crawled**: a
+  one-off offline script re-derived `section` for all 1144 records from
+  their already-known `source_url` + the run's actual seed prefix
+  (`docs.manim.community`, `/en/stable/`) and rewrote
+  `data/run/canonical.jsonl`. Re-crawling 35 pages again just to fix a
+  metadata field would have spent real LLM calls for no reason --
+  `derive_section` is a pure function of information the corpus already
+  has.
+- **Depth measured at 1, 2, and 3 (seed-relative) against the real,
+  repaired corpus, not guessed**: depth=1 produces exactly the 6 clean
+  categories expected (`reference` 812, `tutorials` 100, `guides` 91,
+  `changelog` 67, `conduct.html` 65 -- a genuine single-segment page, not
+  a bug, `installation` 9). depth=2 and depth=3 are *identical* to each
+  other (35 sections each) and degenerate to near-per-page granularity,
+  because manim's real URL structure never nests past 2 segments past
+  the seed -- `reference/<leaf>.html` is as deep as it goes. `config.
+  SECTION_DEPTH`'s default (2) was deliberately left unchanged in this
+  fix -- whether 1 is a better default for typical doc sites is a
+  separate decision from making the counting correct, same discipline
+  as every other "make visible, don't retune in the same commit"
+  decision this project has followed. Worth revisiting with more than
+  one site's real structure before changing the default.
+- **A second, independent bug found while measuring**: `export/export.py`'s
+  `--section-depth` CLI argument is accepted and threaded through to
+  `package_plain_jsonl(..., section_depth)` but **never actually used**
+  inside that function -- sections are grouped purely by the `section`
+  field already baked into each canonical record at crawl time. Passing
+  `--section-depth 1` vs. `--section-depth 3` to a real export call
+  produces byte-identical output. Depth is crawl-time-only; there is
+  currently no way to change section granularity at export time without
+  re-deriving `section` on the canonical file first (exactly what the
+  repair script above did, ad hoc). Not fixed here -- see `ROADMAP.md`.
+- **Real corpus exercised the length-cap+hash path but never a real
+  collision -- constructed a synthetic case rather than declaring
+  Part C verified anyway**: at depth 2/3, 5 of 35 real section labels
+  were long enough to hit `cap_slug`'s 60-char truncation-with-hash-
+  suffix (e.g. `reference-manim-utils-docbuild-manim-directive-setu-
+  df7fa229`), confirmed by inspecting the real filenames produced, not
+  assumed from the cap constant. But 0 collisions occurred at any depth
+  (`disambiguate_slugs` never needed to append a numeric suffix) --
+  real Sphinx URL slugs happened not to collide after slugification.
+  Per the explicit instruction not to declare this verified on
+  incomplete evidence, constructed a synthetic 3-row canonical file
+  with three section labels that genuinely collide after slugification
+  (`a!b`, `a?b`, `a.b` all -> `a-b`) and ran it through the real
+  `run_export` -> `package_plain_jsonl` path (not just
+  `disambiguate_slugs()` in isolation) -- produced `a-b.jsonl`,
+  `a-b-1.jsonl`, `a-b-2.jsonl`, three separate files each with their
+  own row, not a silent 3-into-1 merge. Kept as a permanent regression
+  test (`tests/test_export.py::test_plain_jsonl_disambiguates_a_real_
+  slug_collision_not_just_the_unit`) rather than a throwaway diagnostic,
+  since a real collision is exactly as hard to find on demand as the
+  cross-page chunk duplicate was in step 7.
+- **Other Part C claims checked against the real (repaired) corpus**:
+  longest absolute path produced was 110 characters
+  (`D:\scraper\data\export\...\reference-manim-utils-docbuild-manim-
+  directive-setu-df7fa229.jsonl`) against Windows' 260-char limit -- 150
+  characters of headroom, not tight. `unified.jsonl`'s row count and the
+  sum of every per-section file's row count matched exactly (1143 = 1144
+  raw rows minus 1 exact-duplicate question) at every depth tested --
+  no rows silently dropped or double-counted by the per-section split.
+- **Why it matters**: this is the same shape of finding as #27/#28 --
+  something built and unit-tested correctly in isolation
+  (`disambiguate_slugs`, `cap_slug`, `derive_section` itself) had never
+  been exercised against data that actually stressed it, and the gap
+  was invisible until real data was read directly rather than assumed
+  correct because the code looked right and the tests passed.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->

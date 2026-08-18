@@ -26,6 +26,74 @@ class TestDeriveSection(unittest.TestCase):
         self.assertEqual(derive_section("https://x.com"), FALLBACK_SECTION)
 
 
+class TestDeriveSectionSeedRelative(unittest.TestCase):
+    """step 8 Phase 2A: depth-from-root produced "en/stable" as literally
+    every page's section on a real crawl seeded at /en/stable/ -- the
+    locale+version segments ate the whole depth budget before any real
+    category was reached. Confirmed against the real 1144-row corpus
+    before fixing (LESSONS_LEARNED.md)."""
+
+    def test_depth_counted_from_seed_prefix_not_domain_root(self):
+        seeds = [("docs.example.com", "/en/stable/")]
+        self.assertEqual(
+            derive_section("https://docs.example.com/en/stable/reference/x.html", depth=1, seed_prefixes=seeds),
+            "reference",
+        )
+
+    def test_bare_seed_prefix_url_itself(self):
+        seeds = [("docs.example.com", "/en/stable/")]
+        self.assertEqual(
+            derive_section("https://docs.example.com/en/stable/conduct.html", depth=1, seed_prefixes=seeds),
+            "conduct.html",
+        )
+
+    def test_no_seed_prefixes_falls_back_to_root_relative(self):
+        # Existing callers (tests, or a URL from before this parameter
+        # existed) get the original behavior, not an error.
+        self.assertEqual(
+            derive_section("https://x.com/en/stable/reference/x.html", depth=1, seed_prefixes=None),
+            "en",
+        )
+
+    def test_multiple_seeds_different_prefixes_longest_match_wins(self):
+        # A crawl with two selected branches on the same host, one
+        # nested inside the other -- the more specific prefix should win
+        # rather than either one winning arbitrarily by list order.
+        seeds = [
+            ("docs.example.com", "/en/"),
+            ("docs.example.com", "/en/stable/reference/"),
+        ]
+        self.assertEqual(
+            derive_section("https://docs.example.com/en/stable/reference/x.html", depth=1, seed_prefixes=seeds),
+            "x.html",
+        )
+        self.assertEqual(
+            derive_section("https://docs.example.com/en/tutorials/y.html", depth=1, seed_prefixes=seeds),
+            "tutorials",
+        )
+
+    def test_multiple_seeds_different_hosts(self):
+        seeds = [
+            ("a.example.com", "/docs/"),
+            ("b.example.com", "/help/"),
+        ]
+        self.assertEqual(
+            derive_section("https://a.example.com/docs/reference/x.html", depth=1, seed_prefixes=seeds),
+            "reference",
+        )
+        self.assertEqual(
+            derive_section("https://b.example.com/help/faq/y.html", depth=1, seed_prefixes=seeds),
+            "faq",
+        )
+
+    def test_url_matching_no_seed_falls_back_to_root_relative(self):
+        seeds = [("docs.example.com", "/en/stable/")]
+        self.assertEqual(
+            derive_section("https://other.example.com/a/b/c.html", depth=1, seed_prefixes=seeds),
+            "a",
+        )
+
+
 class TestSlugify(unittest.TestCase):
     def test_lowercase_and_hyphenate(self):
         self.assertEqual(slugify("Tutorial/Security"), "tutorial-security")

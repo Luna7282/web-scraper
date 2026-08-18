@@ -26,13 +26,50 @@ _RESERVED_WINDOWS_NAMES = {
 }
 
 
-def derive_section(url: str, depth: int = DEFAULT_SECTION_DEPTH) -> str:
-    """First `depth` non-empty path segments, joined with '/'. A site's
-    root/index page (empty path) maps to FALLBACK_SECTION rather than an
-    empty string -- an empty label would otherwise slugify to an empty
-    filename, which is exactly the degenerate case this exists to avoid."""
-    path = urlparse(url).path
-    segments = [s for s in path.split("/") if s]
+def derive_section(
+    url: str,
+    depth: int = DEFAULT_SECTION_DEPTH,
+    seed_prefixes: list[tuple[str, str | None]] | None = None,
+) -> str:
+    """First `depth` non-empty path segments, counted from the crawl's own
+    seed prefix (not the domain root), joined with '/'. Depth-from-root
+    was confirmed broken on real data (step 8 Phase 2A): a site crawled
+    from /en/stable/ produced "en/stable" as literally every page's
+    section, since the locale+version segments the seed itself sits
+    behind ate the whole depth budget before any real category (reference,
+    tutorials, ...) was ever reached.
+
+    seed_prefixes is the same (host, prefix) list main.py already builds
+    for scope_check (crawl/scope.py::derive_prefix per selected branch) --
+    reused, not reimplemented. A crawl with multiple seeds/branches on
+    different prefixes is resolved by longest-matching-prefix, the same
+    convention crawl/scope.py's own prefix matching uses: a URL can
+    legitimately fall under more than one selected branch's prefix if
+    they nest, and the most specific one should win.
+
+    seed_prefixes=None (the default) falls back to the original
+    root-relative behavior -- existing callers that never had seed
+    context (tests, or a URL that doesn't match any known seed) still get
+    a sensible answer instead of an error.
+
+    A site's root/index page (empty relative path) maps to
+    FALLBACK_SECTION rather than an empty string -- an empty label would
+    otherwise slugify to an empty filename, which is exactly the
+    degenerate case this exists to avoid.
+    """
+    parsed = urlparse(url)
+    relative_path = parsed.path
+
+    if seed_prefixes:
+        matches = [
+            prefix for host, prefix in seed_prefixes
+            if host == parsed.netloc and prefix and (parsed.path + "/").startswith(prefix)
+        ]
+        if matches:
+            best_prefix = max(matches, key=len)
+            relative_path = parsed.path[len(best_prefix):]
+
+    segments = [s for s in relative_path.split("/") if s]
     if not segments:
         return FALLBACK_SECTION
     return "/".join(segments[:depth])

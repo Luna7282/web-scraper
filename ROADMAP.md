@@ -420,6 +420,41 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     `max_pages` itself. **Size: S if just documented more prominently in
     the CLI; M if an actual throttle is built.**
 
+29. **[Partially resolved, step 8 Phase 2A] `derive_section` counted
+    depth from the domain root, not the crawl's own seed prefix --
+    every page in a real crawl got the same section.** Fixed:
+    `content/sectioning.py::derive_section()` now accepts an optional
+    `seed_prefixes` list and counts depth relative to the longest
+    matching seed prefix, reusing `crawl/scope.py::derive_prefix`'s own
+    output rather than reimplementing prefix matching. See
+    `LESSONS_LEARNED.md` #30 for the measured before/after and the
+    depth-1/2/3 comparison. **Still open**: whether `config.
+    SECTION_DEPTH`'s default (2) should change -- depth=1 produced the
+    expected clean categories on the one real site measured, depth=2/3
+    degenerated to near-per-page granularity, but this is one site's
+    URL structure, not a robust multi-site conclusion. *Fix*: measure
+    against 2-3 more real sites with genuinely deeper category
+    structure before changing the default. **Size: XS to change the
+    constant, once measured.**
+
+30. **`export/export.py`'s `--section-depth` CLI argument is a no-op.**
+    Threaded through to `package_plain_jsonl(..., section_depth)` but
+    never read inside that function -- sections are grouped purely by
+    the `section` field already baked into the canonical record at
+    crawl time. `--section-depth 1` and `--section-depth 3` against the
+    same canonical file produce byte-identical output, confirmed by
+    running both. Found while measuring `LESSONS_LEARNED.md` #30, not
+    previously known.
+    *Fix, not yet chosen*: either remove the flag entirely (depth is
+    crawl-time-only, so an export-time flag claiming to control it is
+    actively misleading) or make export.py actually re-derive `section`
+    from `source_url` at the requested depth before grouping -- which
+    would need the crawl's seed prefixes recorded somewhere export.py
+    can read them (not currently captured anywhere outside the
+    now-baked `section` field itself). The dataset card seems like the
+    natural place to record seed prefixes if this fix is chosen. **Size:
+    XS to remove the flag; S-M to make it real.**
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

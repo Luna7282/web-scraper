@@ -115,6 +115,7 @@ async def extract_worker(
     generation_model: str = "unknown",
     extraction_strategy: str = "first_n_chars",
     section_depth: int = DEFAULT_SECTION_DEPTH,
+    seed_prefixes: list[tuple[str, str | None]] | None = None,
     poll_interval: float = POLL_INTERVAL,
 ) -> None:
     while True:
@@ -156,7 +157,7 @@ async def extract_worker(
 
         page_title = extract_page_title(content)
         license_signal = detect_license_signal(content)
-        section = derive_section(url, depth=section_depth)
+        section = derive_section(url, depth=section_depth, seed_prefixes=seed_prefixes)
         now = datetime.now(timezone.utc)
         timestamp, crawl_date = now.isoformat(), now.date().isoformat()
 
