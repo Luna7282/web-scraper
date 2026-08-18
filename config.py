@@ -20,8 +20,13 @@ PARENT_CHUNK_OVERLAP = 200
 CHILD_CHUNK_SIZE = 400
 CHILD_CHUNK_OVERLAP = 200
 
-# Chroma (chunk_store.py).
-CHROMA_PERSIST_DIR = "./chroma_db"
+# Chroma (storage/chunk_store.py). Lives under data/run/ alongside
+# frontier.db/canonical.jsonl -- all three are run state from the same
+# crawl, never a deliverable (see CLAUDE.md's output layout, step 8
+# Phase 1D). Not data/run/chroma_db directly: chromadb.PersistentClient
+# writes many files at this path, so it gets its own subdirectory rather
+# than mixing with frontier.db/canonical.jsonl's loose files.
+CHROMA_PERSIST_DIR = "./data/run/chroma_db"
 CHROMA_COLLECTION_NAME = "scraper_docs"
 
 class ExtractionStrategy(str, Enum):

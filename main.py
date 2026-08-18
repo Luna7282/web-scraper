@@ -41,8 +41,9 @@ EMBEDDING_DIM = 768  # measured in step 6 -- see LESSONS_LEARNED.md #17
 console = Console()
 
 DATA_DIR = "data"
-FRONTIER_DB_PATH = os.path.join(DATA_DIR, "frontier.db")
-CANONICAL_PATH = os.path.join(DATA_DIR, "canonical.jsonl")  # one row per Q&A pair, never a training file directly -- see export.py
+RUN_DIR = os.path.join(DATA_DIR, "run")  # run state -- frontier.db, canonical.jsonl, the Chroma index; never a deliverable, see CLAUDE.md's output layout
+FRONTIER_DB_PATH = os.path.join(RUN_DIR, "frontier.db")
+CANONICAL_PATH = os.path.join(RUN_DIR, "canonical.jsonl")  # one row per Q&A pair, never a training file directly -- see export.py
 HTTP_USER_AGENT = "Mozilla/5.0 (compatible; scraper/1.0)"
 
 
@@ -346,7 +347,7 @@ async def main():
     console.print(
         "\n[bold yellow]Both relevance thresholds default to 0 -- log-only by "
         "construction: nothing gets skipped, every page's score is recorded. "
-        "Run `python main.py --score-report data/frontier.db` after this "
+        f"Run `python main.py --score-report {FRONTIER_DB_PATH}` after this "
         "completes to pick real thresholds from the actual distribution, "
         "rather than guessing before you've seen real data.[/bold yellow]"
     )
@@ -356,7 +357,7 @@ async def main():
     crawl_workers_n = int(Prompt.ask("Concurrent crawl workers", default="5"))
     extract_workers_n = int(Prompt.ask("Concurrent extract workers", default="2"))
 
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(RUN_DIR, exist_ok=True)
     frontier = Frontier(FRONTIER_DB_PATH, max_pages=max_pages, max_depth=max_depth)
     await frontier.open()
     recovery = await frontier.recover_crashed()

@@ -97,8 +97,17 @@ not by accident.
 ```
 uv run python main.py                              # interactive crawl
 uv run python main.py --dry-run <url>               # scope-check only, no crawl/LLM
-uv run python main.py --score-report data/frontier.db  # relevance distribution from a prior run
+uv run python main.py --score-report data/run/frontier.db  # relevance distribution from a prior run
 ```
+
+**Output layout** (step 8 Phase 1D): `data/run/` holds one crawl's state
+— `frontier.db` (+ its `-shm`/`-wal` WAL files), `canonical.jsonl`, and
+the Chroma index (`chroma_db/`, `config.CHROMA_PERSIST_DIR`) — never a
+deliverable, always overwritten/resumed in place by the next run against
+the same directory. `data/export/<format>/` (a `--out` argument you
+choose per export call, this is just the convention) holds the actual
+training-format files `export/export.py` produces — a separate, disposable
+directory per export, since re-running export never touches `data/run/`.
 
 Interactive prompts: root URL, **intent** (optional — blank means no
 relevance filtering, every page extracts), branch/scope selection, LLM
@@ -112,10 +121,10 @@ up a real Chroma collection (`storage/chunk_store.py`, persisted to
 `config.CHROMA_PERSIST_DIR`) alongside it — chunk/embed/upsert happens in
 `extract_worker`/`Writer` via injected `chunk_fn`/`chroma_upsert_fn`
 closures built in `main.py`. There's no crawl-time per-section JSONL
-split — `data/canonical.jsonl` is always one unified file; per-section
+split — `data/run/canonical.jsonl` is always one unified file; per-section
 splitting happens at export time instead (`export/export.py`'s
 `plain-jsonl` packaging, see below). Frontier state persists to
-`data/frontier.db`; a rerun resumes it (`Frontier.recover_crashed()` at
+`data/run/frontier.db`; a rerun resumes it (`Frontier.recover_crashed()` at
 startup) rather than starting over.
 
 **Chrome-stripping runs on every real fetch**: `main.py::_make_fetch_fn`
@@ -186,12 +195,12 @@ writes, and it is never a training file directly**: one row per Q&A pair
 non-negotiable, every downstream projection needs it), source_url,
 section, page_title, generation_model, extraction_strategy, timestamp,
 crawl_date, license_signal (best-effort text-pattern match, not a legal
-determination). `data/canonical.jsonl` replaces the old `unified.jsonl`
+determination). `data/run/canonical.jsonl` replaces the old `unified.jsonl`
 name — the schema changed, and no live crawl had produced real data
 under the old name yet, so no migration was needed.
 
 **Export is a separate CLI, over the canonical file, never re-crawling**:
-`uv run python -m export.export data/canonical.jsonl --schema alpaca
+`uv run python -m export.export data/run/canonical.jsonl --schema alpaca
 --framework huggingface --out data/export/...` — run as a module from the
 repo root, not as a direct script (`python export/export.py` breaks: its
 absolute `export.export_formats`-style imports need the repo root on

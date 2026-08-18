@@ -7,7 +7,7 @@ must never require re-crawling. Run as a module from the repo root (not
 as a direct script -- the absolute `export.export_formats`-style imports
 below need the repo root on sys.path, which only `-m` guarantees):
 
-    uv run python -m export.export data/canonical.jsonl --schema alpaca --framework huggingface --out data/export/hf_alpaca
+    uv run python -m export.export data/run/canonical.jsonl --schema alpaca --framework huggingface --out data/export/hf_alpaca
 
 Cross-cutting steps always run in this order, regardless of
 schema/framework: validate -> dedup -> split -> project -> package.
