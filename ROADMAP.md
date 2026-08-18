@@ -279,38 +279,85 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     *Fix*: either document this as the intentional target schema, or add a
     converter step. **Size: XS–S.**
 
-20. **Q&A extraction on a real page with zero markdown headings is
-    untested.** Step 7's cross-site extraction check (`LESSONS_LEARNED.md`
-    #25) deliberately covered 3 new site shapes plus a thin marketing page,
-    but all 4 happened to have real headings after chrome-stripping — the
-    no-headings case is a different, still-open question for the *Q&A
-    extraction* path specifically (`score_headings`' no-headings fallback,
-    `LESSONS_LEARNED.md` #17, is a separate function, `score_whole_page`,
-    not `_make_extract_fn`/`parse_qa_json`).
-    *Fix*: find or fetch one real page with no markdown headings after
-    stripping (a single-paragraph landing page, a FAQ page rendered as
-    plain prose, etc.), run it through the real extraction path, and
-    record the result — don't retune the prompt speculatively before
-    seeing an actual failure. **Size: XS (mostly finding a fixture).**
+20. **[RESOLVED, step 8 Part A] Q&A extraction on a real page with zero
+    markdown headings is untested.** Ran the real extraction path against
+    `blog.cloudflare.com`'s root listing page (confirmed 0 markdown
+    headings after stripping) -- 45 pairs, 7 factual claims spot-checked
+    directly against source text, all accurate. See
+    `LESSONS_LEARNED.md` #26.
 
-21. **4000-char truncation can land the extraction window on low-value
-    content when a page front-loads boilerplate before its real content.**
-    Confirmed on `fastapi.tiangolo.com`'s homepage (`LESSONS_LEARNED.md`
-    #25): the sponsor-badge section sits within the first 4000 stripped
-    characters, ahead of the page's actual technical content, so one of
-    5 extracted pairs is an accurate but low-value "who are the sponsors"
-    Q&A. Not a chrome-stripping or prompt defect — chrome-stripping
-    correctly left real (non-nav) content in place; the truncation window
-    just happened to end before the more valuable content began.
-    *Fix, not yet chosen*: options include chunking the page for
-    extraction instead of a single truncated call (more LLM calls per
-    page), raising `MAX_EMBED_CHARS`-style truncation for extraction
-    specifically (cost tradeoff, needs its own measurement per
-    `LESSONS_LEARNED.md` #10's established token-inefficiency of
-    markdown), or leaving it as an accepted low-value-pair-rate cost of
-    truncation. Needs a broader sample before picking one — this is one
-    confirmed instance, not yet a measured rate. **Size: S–M once a
-    direction is picked.**
+21. **[RESOLVED, step 8 Part A] 4000-char truncation can land the
+    extraction window on low-value content when a page front-loads
+    boilerplate before its real content.** `extraction_units.py` +
+    `config.EXTRACTION_STRATEGY` (default `PER_CHUNK`) replace the single
+    truncated call with one call per parent chunk -- confirmed on the
+    same FastAPI page: 84% of the resulting pairs (68/81) cover content
+    the old 4000-char window could never reach. See
+    `LESSONS_LEARNED.md` #26. **This fixed reachability only** -- see
+    #22 and #23 below for what it didn't fix.
+
+22. **`per_chunk` extraction doesn't reduce low-value pairs, only
+    increases coverage.** Confirmed on the same FastAPI re-run
+    (`LESSONS_LEARNED.md` #26): the sponsor/testimonial "low-value"
+    pairs #25 flagged didn't disappear under `per_chunk`, they
+    multiplied (13 pairs across 5 chunks). Every chunk gets extracted
+    regardless of relevance -- a page that front-loads several low-value
+    chunks before its real content produces more low-value pairs, not
+    fewer.
+    *Fix*: `TOP_K_CHUNKS_BY_RELEVANCE` is already implemented in
+    `extraction_units.py` for exactly this case, but needs a real intent
+    to rank chunks against (falls back to `per_chunk` without one) --
+    hasn't been measured on a real page with a real intent yet. Try it
+    against a page with a real intent set and compare the low-value-pair
+    rate against this step's `per_chunk` baseline. **Size: S (mechanism
+    exists; needs a measurement, not new code).**
+
+23. **No dedup for near-duplicate pairs from chunk-overlap boundaries or
+    same-chunk paraphrase padding.** Measured, not assumed
+    (`LESSONS_LEARNED.md` #26): ~27% of FastAPI's `per_chunk` pairs and
+    ~47% of Cloudflare's are near-duplicates by answer-text similarity,
+    from two distinct causes -- adjacent chunks re-covering the ~10%
+    overlap region, and the "3 to 5 diverse pairs" prompt instruction
+    padding with rephrasings when a chunk only supports one real fact.
+    `export_formats.py::dedup_by_question`'s exact-normalized-text dedup
+    catches neither, since every pair is a fresh generation with
+    different wording.
+    *Fix, not yet chosen*: options include semantic similarity dedup at
+    export time (embed each question, cluster/threshold, keep one per
+    cluster -- costs embed calls per row), a smaller `top_k`-per-page
+    instruction to the LLM to reduce same-chunk padding directly, or
+    reducing `PARENT_CHUNK_OVERLAP` to shrink the boundary-duplicate
+    contribution specifically (only one of the two causes, per the
+    measurement). Needs a decision informed by cost, not made here.
+    **Size: M.**
+
+24. **Whether a listing/index page should pass `extract_threshold` at
+    all is unanswered.** `blog.cloudflare.com`'s root (item 20 above) is
+    grounded and accurate but mostly produces "who wrote/when was X
+    published" trivia about *other* articles, since that's genuinely
+    most of what a listing page's markup contains -- not an extraction
+    defect, but a relevance-gating question: is this page worth
+    extracting from at all, or should relevance scoring (step 6) learn
+    to recognize and skip listing/index pages specifically.
+    *Fix, not yet chosen*: no clear mechanism proposed yet -- would need
+    either a structural signal (many short same-shaped teaser blocks) or
+    a content-based one (relevance score against intent, which already
+    exists but wasn't the mechanism that flagged this case). **Size:
+    unclear until a detection approach is picked.**
+
+25. **LLaMA-Factory/Axolotl packaging only has verified field mappings
+    for 2-3 schemas each.** `export.py`'s `package_llama_factory` (alpaca,
+    conversational, openai_finetune) and `package_axolotl` (alpaca,
+    conversational, openai_finetune) refuse other schemas rather than
+    emit an unverified `columns`/`type` mapping -- deliberate (see the
+    comments at `_LLAMA_FACTORY_KNOWN_SCHEMAS`/`_AXOLOTL_TYPE_BY_SCHEMA`
+    in `export.py`), not an oversight, but it does mean
+    `prompt_completion`/`embedding_pairs`/`rag_eval`/`vertex` can only be
+    exported as `plain-jsonl` or `mlx` today.
+    *Fix*: check each framework's docs for the exact expected shape
+    before adding it (Axolotl's `input_output` or `completion` types are
+    plausible fits for `prompt_completion` but weren't confirmed this
+    session). **Size: XS per schema, once confirmed.**
 
 ---
 

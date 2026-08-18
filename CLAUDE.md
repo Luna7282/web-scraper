@@ -110,6 +110,64 @@ and `query_chunks()` call `verify_embedding_identity()`, which raises
 `EmbeddingIdentityMismatch` (not a log line) if the model in use doesn't
 match what the collection was built with.
 
+**Extraction is per-chunk by default, not a single truncated call**:
+`config.EXTRACTION_STRATEGY` (default `PER_CHUNK`) drives
+`extraction_units.py::select_extraction_units()`, which `extract_worker`
+loops over — one LLM call per parent-sized chunk instead of one call over
+`content[:MAX_EXTRACT_CHARS]`. `FIRST_N_CHARS` (the old behavior) and
+`TOP_K_CHUNKS_BY_RELEVANCE` (embeds chunks, keeps only the most
+intent-relevant — falls back to `PER_CHUNK` with no intent set) are also
+available. **This fixes reachability only, not relevance or redundancy**
+— confirmed on a real re-run (`LESSONS_LEARNED.md` #26): 84% of the extra
+pairs were content the old truncated call could never reach, but
+low-value pairs (e.g. sponsor lists) multiplied rather than disappeared,
+and ~27-47% of pairs measured as near-duplicates from chunk-overlap
+boundaries or same-chunk paraphrase padding. See `ROADMAP.md` #22/#23 —
+neither is fixed yet.
+
+**The canonical record (`canonical.py`) is the only file `Writer` ever
+writes, and it is never a training file directly**: one row per Q&A pair
+— question, answer, `source_chunk` (the exact unit that produced it —
+non-negotiable, every downstream projection needs it), source_url,
+section, page_title, generation_model, extraction_strategy, timestamp,
+crawl_date, license_signal (best-effort text-pattern match, not a legal
+determination). `data/canonical.jsonl` replaces the old `unified.jsonl`
+name — the schema changed, and no live crawl had produced real data
+under the old name yet, so no migration was needed.
+
+**Export is a separate CLI, over the canonical file, never re-crawling**:
+`uv run python export.py data/canonical.jsonl --schema alpaca --framework
+huggingface --out data/export/...`. Pipeline, always in this order:
+validate (`export_formats.py::validate_records` — rejects empty/
+equal/too-short answers) → dedup (`dedup_by_question`, exact-normalized-
+text only — does **not** catch the near-duplicates `ROADMAP.md` #23
+describes) → split (`split_records`, grouped by section/source_url,
+never random — docs repeat content across pages, a random split leaks
+near-duplicates into eval; seeded for reproducibility) → project
+(`SCHEMA_PROJECTIONS`/`BATCH_PROJECTIONS` — conversational, alpaca,
+prompt_completion, raw_text, embedding_pairs, triplets, rag_eval,
+openai_finetune, vertex; `UNSUPPORTED_WITHOUT_EXTRA_PASS` refuses
+dpo/orpo/kto/classification loudly rather than faking them) → package
+(mlx/huggingface/llama-factory/axolotl/plain-jsonl). Every export writes
+a `dataset_card.json` (sites, crawl dates, intent, model, row counts,
+license signals observed). **LLaMA-Factory/Axolotl only have verified
+field mappings for a few schemas** (checked against their real docs, not
+guessed — see `export.py`'s `_LLAMA_FACTORY_KNOWN_SCHEMAS`/
+`_AXOLOTL_TYPE_BY_SCHEMA`); an unmapped schema+framework combination
+refuses rather than emitting an unverified mapping.
+
+**Section labels and export filenames are two different transforms**
+(`sectioning.py`): `derive_section(url, depth=config.SECTION_DEPTH)`
+(default 2 path segments) is the canonical record's human-readable
+`section` field; `slugify`/`cap_slug`/`disambiguate_slugs` turn a set of
+those labels into filesystem-safe names at export time — lowercased,
+hyphenated, capped at 60 chars with a content-hash suffix on truncation,
+collision-disambiguated with a numeric suffix, and checked against
+reserved Windows device names (this repo runs on `D:\scraper`, not a
+hypothetical). `plain-jsonl` packaging writes `manifest.json` mapping
+each section slug to its derived URL prefix (`scope.py::derive_prefix`,
+reused, not reimplemented) and row count.
+
 **Relevance scoring uses `score_headings`, not the intuitive default
 (max-over-chunks)** — chosen from a real measurement, not assumed. See
 `LESSONS_LEARNED.md` #17 before changing this: `whole_page` and

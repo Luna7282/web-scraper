@@ -942,4 +942,91 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-18 — Step 8 Part A: per-chunk extraction fixes reachability, not relevance or redundancy
+
+### 26. per_chunk extraction reaches 84% more real content on a long page, but doesn't reduce low-value or duplicate pairs -- two separate problems it was never going to solve
+- **Fix implemented**: `extraction_units.py::select_extraction_units()` +
+  `config.EXTRACTION_STRATEGY` (default `PER_CHUNK`) replace the single
+  `content[:4000]` extraction call with one call per parent-sized chunk
+  (`config.PARENT_CHUNK_SIZE`/`_OVERLAP`, same units already used for
+  Chroma). `TOP_K_CHUNKS_BY_RELEVANCE` is also implemented (embeds each
+  chunk, keeps the top_k most similar to the intent) but not the default
+  -- it needs an intent to rank against and falls back to `PER_CHUNK`
+  without one. `FIRST_N_CHARS` (the old behavior) stays available as an
+  explicit opt-in. `pipeline.py::extract_worker` now loops over units,
+  tags each resulting pair with its `source_chunk` (feeds `canonical.py`,
+  see #27), and only fails the whole page if *no* unit parsed -- one bad
+  chunk's malformed JSON doesn't lose the rest of a page's real content.
+- **Live re-run, same page (FastAPI homepage), same prompt/model as the
+  cross-site check (#25)**: 18 calls instead of 1, 81 pairs instead of 5.
+  **84% of the new pairs (68/81) cover content the old single-call
+  window structurally could not reach** -- full sponsor/testimonial
+  lists, Typer, the actual installation + code walkthrough, running the
+  dev server, Swagger/ReDoc mechanics, the type-hint/Pydantic validation
+  example, deployment, dependencies, license. This is the real payoff
+  the truncation fix was for.
+- **What it did NOT fix, found by the same re-run**: the "sponsors"
+  question from #25 didn't disappear -- it multiplied (units 2-6, ~13
+  pairs across keystone/gold/silver sponsors and testimonials, all
+  low-value by the same standard #25 flagged). `per_chunk` fixes
+  *reachability* (nothing past the old window is skipped); it does
+  nothing about *relevance* (every chunk gets extracted regardless of
+  value) -- a page that front-loads several low-value chunks before its
+  real content produces more low-value pairs, not fewer. That's
+  specifically what `TOP_K_CHUNKS_BY_RELEVANCE` exists to address and
+  `PER_CHUNK` doesn't -- worth keeping distinct, not treating the
+  reachability fix as if it were also a relevance fix.
+- **Duplicate rate measured, not eyeballed, and found to have two
+  separate causes**: answer-text similarity (not question-phrasing --
+  question templates like "Who are the authors of..." repeat across
+  unrelated topics and inflate a naive question-only measure) between
+  pairs from the same or adjacent chunks only. Correction to the
+  original framing: the extraction units are the *parent* chunks
+  (2000/200 = 10% overlap), not the child chunks used for Chroma
+  (400/200 = 50%) -- a different config, and 10% is what's actually in
+  play for extraction.
+  - **Adjacent-chunk boundary duplicates** (real chunk-overlap artifact):
+    FastAPI 8/81 (~10%, concentrated at exactly the 2 chunk boundaries
+    that happened to split a UI-mechanic explanation and a dependency
+    list); Cloudflare's listing page 13/45 (~29%, higher because its
+    dense teaser-block format packs more distinct facts per 200 char
+    window, so more boundaries land mid-teaser).
+  - **Same-chunk paraphrase duplicates** (not an overlap artifact at all):
+    FastAPI 14/81 (~17%), Cloudflare 8/45 (~18%) -- the prompt's "3 to 5
+    diverse pairs" instruction pads with rephrasings when one chunk's
+    content only supports one real fact (e.g. 4 near-identical "who are
+    the gold sponsors" pairs from a single sponsor-list chunk).
+  - **Combined: ~27% of FastAPI's pairs, ~47% of Cloudflare's, are some
+    form of near-duplicate** -- and none of them would be caught by
+    export-time exact-question dedup (`export_formats.py::dedup_by_question`),
+    since every one is a fresh generation with different wording.
+    Deduping earlier would need semantic similarity, not exact-match
+    normalization -- not built this step; see `ROADMAP.md`.
+- **Heading-less page (blog.cloudflare.com's root listing, 0 headings,
+  closing the gap #25 flagged), 45 pairs from 10 chunks**: 7 factual
+  claims spot-checked directly against the stripped source text (DoD IL4
+  commitment, FedRAMP certification, the Kitesurf description, WebMCP's
+  launch, "only vendor named Visionary," the Agent Access Model
+  description, the 519% DDoS stat) -- **all matched verbatim or
+  faithfully, including one subtle case** (a pair correctly used the
+  eclipse's own date, Aug 12, distinct from that post's own Aug 13
+  publish date, both present in the source). No hallucination found in
+  this sample. But the page's real content genuinely *is* mostly
+  title/author/date teaser metadata for other articles -- so per-chunk
+  extraction faithfully produces mostly "who wrote/when was X" trivia,
+  not because it invented anything, but because that's most of what a
+  listing page's markup actually contains. Not an extraction-quality
+  problem; closer to "should a listing page pass `extract_threshold` at
+  all" -- a relevance-gating question, not this step's to answer.
+- **Why it matters**: three genuinely separate concerns got conflated in
+  the original ask and needed separating by measurement:
+  *reachability* (fixed this step), *relevance/low-value content* (not
+  addressed by `per_chunk`, needs `top_k_chunks_by_relevance` + a real
+  intent, or extract_threshold gating upstream), and *redundancy* (not
+  addressed by anything built so far -- needs semantic dedup, which
+  doesn't exist yet). Treating "more chunks reached" as "problem solved"
+  would have missed the other two entirely.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->
