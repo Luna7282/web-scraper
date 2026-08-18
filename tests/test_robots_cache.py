@@ -1,7 +1,7 @@
 """Offline tests for robots_cache.py -- stub fetch_text_fn, no network."""
 import unittest
 
-from robots_cache import RobotsCache
+from crawl.robots_cache import RobotsCache
 
 
 def make_stub(responses: dict[str, str | None]):

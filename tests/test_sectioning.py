@@ -1,7 +1,7 @@
 """Offline tests for sectioning.py -- pure string/URL logic, no I/O."""
 import unittest
 
-from sectioning import (
+from content.sectioning import (
     FALLBACK_SECTION,
     cap_slug,
     derive_section,

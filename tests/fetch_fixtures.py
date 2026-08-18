@@ -31,7 +31,7 @@ import requests
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from scope import normalize_url
+from crawl.scope import normalize_url
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 

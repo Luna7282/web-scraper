@@ -3,9 +3,11 @@ Writer during a crawl) into whatever training/eval shape a specific
 framework wants (step 8 plan, Part B, levels 2-3).
 
 Separate entry point from main.py on purpose -- changing output format
-must never require re-crawling. Run as:
+must never require re-crawling. Run as a module from the repo root (not
+as a direct script -- the absolute `export.export_formats`-style imports
+below need the repo root on sys.path, which only `-m` guarantees):
 
-    uv run python export.py data/canonical.jsonl --schema alpaca --framework huggingface --out data/export/hf_alpaca
+    uv run python -m export.export data/canonical.jsonl --schema alpaca --framework huggingface --out data/export/hf_alpaca
 
 Cross-cutting steps always run in this order, regardless of
 schema/framework: validate -> dedup -> split -> project -> package.
@@ -18,7 +20,7 @@ import os
 import sys
 from datetime import datetime, timezone
 
-from export_formats import (
+from export.export_formats import (
     BATCH_PROJECTIONS,
     SCHEMA_PROJECTIONS,
     UNSUPPORTED_WITHOUT_EXTRA_PASS,
@@ -27,8 +29,8 @@ from export_formats import (
     to_raw_text,
     validate_records,
 )
-from scope import derive_prefix
-from sectioning import disambiguate_slugs
+from crawl.scope import derive_prefix
+from content.sectioning import disambiguate_slugs
 
 
 def load_canonical_records(path: str) -> list[dict]:

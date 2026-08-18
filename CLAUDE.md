@@ -9,7 +9,8 @@ someone remembers to.
 A general-purpose, prompt-steered crawler for any website — give it a root
 URL and a natural-language intent, and it crawls, judges pages against that
 intent, and turns the result into training datasets (multiple schemas and
-framework-specific packagings via `export.py`) plus a Chroma RAG index. It
+framework-specific packagings via `export/export.py`) plus a Chroma RAG
+index. It
 is **not** documentation-specific: docs sites are one input type this
 project has been tested against, not the target. Don't let "docs"/
 "documentation" framing creep back into how this tool is described — it's
@@ -25,6 +26,38 @@ file, in-session). The pre-rebuild source is preserved in git history —
 see the "Snapshot pre-rebuild source as-is" commit — before assuming
 something described in `ARCHITECTURE.md` is still accurate, check whether a
 later commit has already changed it.
+
+## File map
+
+Package-by-role (moved from a flat 24-file root — step 8 Phase 1B). All
+imports are absolute (`from crawl.frontier import ...`), including
+within a package — this codebase has no relative imports, by convention,
+not by accident.
+
+| Package | Module | Role |
+|---|---|---|
+| `crawl/` | `frontier.py` | SQLite-backed crawl state machine, quiescence, retries |
+| | `pipeline.py` | `crawl_worker`/`extract_worker`/`writer_worker` — the real loops `main.py` runs |
+| | `robots_cache.py` | robots.txt/sitemap.xml/llms.txt, own RFC 9309 Allow/Disallow resolver |
+| | `scope.py` | `normalize_url`/`derive_prefix`/`is_in_scope` — pure, no site-specific logic |
+| | `discovery.py` | `discover_branches`/`fetch_page_links` — one-page link discovery |
+| | `score_report.py` | `--score-report`: relevance-score distribution from a prior run |
+| `content/` | `chrome_strip.py` | Nav/header/footer/aside/button exclusion, applied in `main.py::_make_fetch_fn` |
+| | `extraction.py` | `parse_qa_json`, the Q&A system prompt |
+| | `extraction_units.py` | Extraction-strategy chunk selection (`first_n_chars`/`per_chunk`/`top_k_chunks_by_relevance`) |
+| | `sectioning.py` | `derive_section` (canonical record field) + filename slugify/cap/disambiguate (export time) |
+| | `relevance.py` | Embedding-based relevance scoring (`score_headings`, chosen by measurement) |
+| `storage/` | `writer.py` | Sole owner of the canonical JSONL file + Chroma upsert calls |
+| | `chunk_store.py` | Content-hash chunk IDs, `ChunkStore.add_or_merge_chunk`, embedding-identity check |
+| | `canonical.py` | The canonical record schema + `build_canonical_record` |
+| | `query.py` | `--query`: embed a question, search Chroma, print parent text |
+| `export/` | `export.py` | `-m export.export`: canonical.jsonl → training-format files (separate CLI) |
+| | `export_formats.py` | Pure schema projections + validate/dedup/split (no I/O) |
+| | `dataset_report.py` | `--dataset-report`: redundancy/duplicate diagnostics over a completed run |
+| (root) | `main.py` | Interactive crawl CLI + `--dry-run`/`--score-report`/`--query`/`--dataset-report` |
+| | `config.py` | All tunable constants — no config value hardcoded in the module that uses it |
+| | `llm_factory.py` | `get_llm()`, `LocalOllamaEmbeddings` (the one hard provider-routing invariant, below) |
+| | `progress_display.py` | Read-only Rich live view against the frontier |
 
 ## Environment / uv workflow
 
@@ -75,32 +108,34 @@ see the invariant below), max pages/depth, relevance thresholds
 warning, not a buried default), crawl/extract worker concurrency.
 
 Output is JSONL by default; a `build_rag` prompt (step 7) optionally wires
-up a real Chroma collection (`chunk_store.py`, persisted to
+up a real Chroma collection (`storage/chunk_store.py`, persisted to
 `config.CHROMA_PERSIST_DIR`) alongside it — chunk/embed/upsert happens in
 `extract_worker`/`Writer` via injected `chunk_fn`/`chroma_upsert_fn`
-closures built in `main.py`. `split_jsonl` from the old `orchestrator.py`
-flow is still not wired in. Frontier state persists to `data/frontier.db`;
-a rerun resumes it (`Frontier.recover_crashed()` at startup) rather than
-starting over.
+closures built in `main.py`. There's no crawl-time per-section JSONL
+split — `data/canonical.jsonl` is always one unified file; per-section
+splitting happens at export time instead (`export/export.py`'s
+`plain-jsonl` packaging, see below). Frontier state persists to
+`data/frontier.db`; a rerun resumes it (`Frontier.recover_crashed()` at
+startup) rather than starting over.
 
 **Chrome-stripping runs on every real fetch**: `main.py::_make_fetch_fn`
-passes `chrome_strip.py`'s `DEFAULT_EXCLUDED_TAGS`/`DEFAULT_EXCLUDED_SELECTOR`
-into the real `CrawlerRunConfig` (crawl4ai's own HTML-cleaning stage) and
-applies `strip_text_patterns()` to the resulting markdown before it ever
-reaches extraction or Chroma chunking. **This was not true until step 8
-Part D** — `chrome_strip.py` existed and was validated since step 4, but
-nothing in the production path ever called it; every earlier
-"chrome-stripping validated" claim was against a standalone script
-calling `strip_chrome()` directly, never against `main.py` itself. See
-`LESSONS_LEARNED.md` #28 before assuming a component that's tested in
-isolation is therefore wired in — verify the call site, not just the
-function.
+passes `content/chrome_strip.py`'s `DEFAULT_EXCLUDED_TAGS`/
+`DEFAULT_EXCLUDED_SELECTOR` into the real `CrawlerRunConfig` (crawl4ai's
+own HTML-cleaning stage) and applies `strip_text_patterns()` to the
+resulting markdown before it ever reaches extraction or Chroma chunking.
+**This was not true until step 8 Part D** — `content/chrome_strip.py` existed and
+was validated since step 4, but nothing in the production path ever
+called it; every earlier "chrome-stripping validated" claim was against a
+standalone script calling `strip_chrome()` directly, never against
+`main.py` itself. See `LESSONS_LEARNED.md` #28 before assuming a
+component that's tested in isolation is therefore wired in — verify the
+call site, not just the function.
 
 **Retrieval**: `uv run python main.py --query "<question>"` embeds the
 question, searches child chunks in the existing Chroma collection, and
 prints parent text + sources + the matched child chunk + distance
-(`query.py::query_chunks`/`format_query_results`). This is the only code
-that reads from Chroma — see `ROADMAP.md` #3.
+(`storage/query.py::query_chunks`/`format_query_results`). This is the
+only code that reads from Chroma — see `ROADMAP.md` #3.
 
 **Chunking**: parent/child sizes and overlap are explicit in `config.py`
 (`PARENT_CHUNK_SIZE`/`_OVERLAP`, `CHILD_CHUNK_SIZE`/`_OVERLAP`), not a
@@ -109,7 +144,7 @@ library default — see `LESSONS_LEARNED.md` #22 before changing them
 9,204 vectors from 30 pages in the pre-rebuild audit; making that visible
 and changing it are separate decisions).
 
-**Chunk IDs are content hashes, not URL-scoped**: `chunk_store.py::chunk_id()`
+**Chunk IDs are content hashes, not URL-scoped**: `storage/chunk_store.py::chunk_id()`
 hashes normalized chunk text alone (whitespace-collapsed, lowercased,
 trailing-punctuation-stripped — see `normalize_chunk_text()`), so the same
 text repeated across pages collides to one Chroma id and its `sources`
@@ -132,7 +167,7 @@ match what the collection was built with.
 
 **Extraction is per-chunk by default, not a single truncated call**:
 `config.EXTRACTION_STRATEGY` (default `PER_CHUNK`) drives
-`extraction_units.py::select_extraction_units()`, which `extract_worker`
+`content/extraction_units.py::select_extraction_units()`, which `extract_worker`
 loops over — one LLM call per parent-sized chunk instead of one call over
 `content[:MAX_EXTRACT_CHARS]`. `FIRST_N_CHARS` (the old behavior) and
 `TOP_K_CHUNKS_BY_RELEVANCE` (embeds chunks, keeps only the most
@@ -145,7 +180,7 @@ and ~27-47% of pairs measured as near-duplicates from chunk-overlap
 boundaries or same-chunk paraphrase padding. See `ROADMAP.md` #22/#23 —
 neither is fixed yet.
 
-**The canonical record (`canonical.py`) is the only file `Writer` ever
+**The canonical record (`storage/canonical.py`) is the only file `Writer` ever
 writes, and it is never a training file directly**: one row per Q&A pair
 — question, answer, `source_chunk` (the exact unit that produced it —
 non-negotiable, every downstream projection needs it), source_url,
@@ -156,9 +191,12 @@ name — the schema changed, and no live crawl had produced real data
 under the old name yet, so no migration was needed.
 
 **Export is a separate CLI, over the canonical file, never re-crawling**:
-`uv run python export.py data/canonical.jsonl --schema alpaca --framework
-huggingface --out data/export/...`. Pipeline, always in this order:
-validate (`export_formats.py::validate_records` — rejects empty/
+`uv run python -m export.export data/canonical.jsonl --schema alpaca
+--framework huggingface --out data/export/...` — run as a module from the
+repo root, not as a direct script (`python export/export.py` breaks: its
+absolute `export.export_formats`-style imports need the repo root on
+`sys.path`, which only `-m` guarantees). Pipeline, always in this order:
+validate (`export/export_formats.py::validate_records` — rejects empty/
 equal/too-short answers) → dedup (`dedup_by_question`, exact-normalized-
 text only — does **not** catch the near-duplicates `ROADMAP.md` #23
 describes) → split (`split_records`, grouped by section/source_url,
@@ -172,12 +210,12 @@ dpo/orpo/kto/classification loudly rather than faking them) → package
 a `dataset_card.json` (sites, crawl dates, intent, model, row counts,
 license signals observed). **LLaMA-Factory/Axolotl only have verified
 field mappings for a few schemas** (checked against their real docs, not
-guessed — see `export.py`'s `_LLAMA_FACTORY_KNOWN_SCHEMAS`/
+guessed — see `export/export.py`'s `_LLAMA_FACTORY_KNOWN_SCHEMAS`/
 `_AXOLOTL_TYPE_BY_SCHEMA`); an unmapped schema+framework combination
 refuses rather than emitting an unverified mapping.
 
 **Section labels and export filenames are two different transforms**
-(`sectioning.py`): `derive_section(url, depth=config.SECTION_DEPTH)`
+(`content/sectioning.py`): `derive_section(url, depth=config.SECTION_DEPTH)`
 (default 2 path segments) is the canonical record's human-readable
 `section` field; `slugify`/`cap_slug`/`disambiguate_slugs` turn a set of
 those labels into filesystem-safe names at export time — lowercased,
@@ -185,7 +223,7 @@ hyphenated, capped at 60 chars with a content-hash suffix on truncation,
 collision-disambiguated with a numeric suffix, and checked against
 reserved Windows device names (this repo runs on `D:\scraper`, not a
 hypothetical). `plain-jsonl` packaging writes `manifest.json` mapping
-each section slug to its derived URL prefix (`scope.py::derive_prefix`,
+each section slug to its derived URL prefix (`crawl/scope.py::derive_prefix`,
 reused, not reimplemented) and row count.
 
 **Relevance scoring uses `score_headings`, not the intuitive default
@@ -224,11 +262,11 @@ OpenAI-compat wrapper remains the one hard, confirmed invariant above.
 
 ## Queue architecture invariants
 
-Crawling is a bounded work-queue pipeline (`frontier.py` + crawl workers +
-`content_queue` + extract workers + `results_queue` + one writer task), never
-recursive task-per-page spawning. Full state machine and schema live in
-`frontier.py`'s module docstring — this section covers the invariants that
-matter when touching it.
+Crawling is a bounded work-queue pipeline (`crawl/frontier.py` + crawl
+workers + `content_queue` + extract workers + `results_queue` + one writer
+task), never recursive task-per-page spawning. Full state machine and
+schema live in `crawl/frontier.py`'s module docstring — this section
+covers the invariants that matter when touching it.
 
 **Locking is structurally two-layered, not just documented.** Every
 `Frontier` method named `_locked_*` assumes `self._lock` is already held and
@@ -246,7 +284,7 @@ can block for unbounded time, and `content_queue`/`results_queue` are
 bounded for backpressure, so `await queue.put()` specifically can block
 indefinitely. Holding the lock across that stalls every other worker,
 including the ones that would drain the queue and unblock it — a full
-deadlock. `put_content`/`put_results` in `frontier.py` release the lock
+deadlock. `put_content`/`put_results` in `crawl/frontier.py` release the lock
 *before* the `await queue.put()` for exactly this reason; keep that pattern
 for any new put-site.
 
@@ -287,14 +325,15 @@ existing instruction-text preload) is the actual source of truth for "was
 this URL's content already persisted" — it survives independently of
 whatever the frontier's status column says.
 
-## Scope predicate (`scope.py`)
+## Scope predicate (`crawl/scope.py`)
 
 `normalize_url()`, `derive_prefix()`, and `is_in_scope()` are pure
-functions, no I/O — `pipeline.py`'s `crawl_worker` and `main.py --dry-run`
-both call them, and they're unit-tested offline against real fixture data
-from 5 structurally different sites in `tests/fixtures/` (see
-`tests/fetch_fixtures.py` to regenerate). **No site-specific logic
-belongs in `scope.py`** — if a site needs different behavior, it has to
+functions, no I/O — `crawl/pipeline.py`'s `crawl_worker` and
+`main.py --dry-run` both call them, and they're unit-tested offline
+against real fixture data from 5 structurally different sites in
+`tests/fixtures/` (see `tests/fetch_fixtures.py` to regenerate). **No
+site-specific logic belongs in `crawl/scope.py`** — if a site needs different
+behavior, it has to
 come from config (host allowlist, prefix list, exclude patterns), never a
 branch on a domain name inside the predicate. `derive_prefix` has already
 had one real bug from over-fitting to a single test site (a universal
@@ -302,14 +341,14 @@ had one real bug from over-fitting to a single test site (a universal
 containing its own section-index page — see `LESSONS_LEARNED.md` #8);
 treat that as the standing warning it is before changing this file.
 
-## Worker loops (`pipeline.py`, `writer.py`, `extraction.py`, `robots_cache.py`, `progress_display.py`)
+## Worker loops (`crawl/pipeline.py`, `storage/writer.py`, `content/extraction.py`, `crawl/robots_cache.py`, `progress_display.py`)
 
-`crawl_worker` / `extract_worker` / `writer_worker` in `pipeline.py` are
-the real implementations of `frontier.py`'s design — built and tested
-against stubs (`tests/stub_fetcher.py`, inline stub `score_fn`/`extract_fn`
-in the test files) before any of them ever touched the network. Not wired
-into `main.py` yet; `orchestrator.py` (the old single-queue crawler) is
-still what actually runs.
+`crawl_worker` / `extract_worker` / `writer_worker` in `crawl/pipeline.py`
+are the real implementations of `crawl/frontier.py`'s design — built and
+tested against stubs (`tests/stub_fetcher.py`, inline stub
+`score_fn`/`extract_fn` in the test files) before any of them ever touched
+the network, and proven against a real crawl in step 8 Part D (real
+extraction, real RAG index, real crash-resume).
 
 - **Every I/O dependency is injected** (`fetch_fn`, `score_fn`,
   `extract_fn`, `Writer`) — this is what makes offline testing possible at
@@ -324,7 +363,7 @@ still what actually runs.
   `tests/test_extract_worker.py` / `tests/test_crawl_worker.py`, and
   `LESSONS_LEARNED.md` #14 for what happens when a test forgets this (it
   hangs, it doesn't fail fast).
-- **Malformed LLM JSON**: `extraction.py::parse_qa_json` tries direct
+- **Malformed LLM JSON**: `content/extraction.py::parse_qa_json` tries direct
   parse, then a stripped code fence, then the substring between the first
   `[` and last `]` (salvages prose-wrapped JSON, the common case) before
   raising `MalformedExtractionError`. An empty-but-valid parse (`[]`) is
@@ -336,7 +375,7 @@ still what actually runs.
   `queued`; the worker moves on immediately. A worker `sleep`ing in place
   for a 429 blocks that concurrency slot for the full backoff — with a
   small pool, a few 429s idle the whole stage.
-- **`Writer` (in `writer.py`) has exactly one caller: `writer_worker`.**
+- **`Writer` (in `storage/writer.py`) has exactly one caller: `writer_worker`.**
   `crawl_worker`/`extract_worker`'s signatures structurally cannot receive
   a `Writer` or Chroma client (enforced by
   `tests/test_writer_ownership.py`, which fails if either one ever grows a
@@ -348,8 +387,14 @@ still what actually runs.
   branch** — `crawl_worker` checks `RobotsCache` before every fetch;
   disallowed URLs go straight to `failed` (`mark_permanently_failed`, no
   retry) with a loud print, never silently dropped or silently crawled
-  anyway. Per-host rate limiting/politeness delay is **not** built yet —
-  `Crawl-delay` is parsed by stdlib `RobotFileParser` but never read (see
+  anyway. `crawl/robots_cache.py` resolves Allow/Disallow itself (a
+  from-scratch RFC 9309 longest-match implementation) rather than
+  delegating to stdlib `urllib.robotparser`, which resolves by file order
+  instead of specificity and broke a real site's robots.txt — see
+  `LESSONS_LEARNED.md` #27 before assuming a "respects robots.txt" claim
+  extends to Allow-overrides-Disallow correctness without checking.
+  Per-host rate limiting/politeness delay is **not** built yet —
+  `Crawl-delay` isn't even collected by `_parse_rules()` (see
   `ROADMAP.md` #9); none of the 5 fixture sites specify one, so this is
   unverified against a real case, not proven safe.
 - **Progress display** (`progress_display.py`) is read-only against the

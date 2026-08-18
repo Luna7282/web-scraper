@@ -14,8 +14,8 @@ import asyncio
 import time
 import unittest
 
-from frontier import Frontier
-from pipeline import extract_worker, RateLimitError, ExtractionResult
+from crawl.frontier import Frontier
+from crawl.pipeline import extract_worker, RateLimitError, ExtractionResult
 
 SEED = "https://x.test/a"
 CONTENT = "markdown content"

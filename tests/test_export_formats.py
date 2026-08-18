@@ -2,7 +2,7 @@
 canonical records, no I/O."""
 import unittest
 
-from export_formats import (
+from export.export_formats import (
     dedup_by_question,
     mine_triplets,
     split_records,

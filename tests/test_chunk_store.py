@@ -12,7 +12,7 @@ import uuid
 
 import chromadb
 
-from chunk_store import (
+from storage.chunk_store import (
     normalize_chunk_text, chunk_id, split_into_parent_child_chunks,
     get_or_create_collection, verify_embedding_identity, EmbeddingIdentityMismatch,
     ChunkStore,

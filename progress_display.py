@@ -12,7 +12,7 @@ import time
 from rich.live import Live
 from rich.table import Table
 
-from frontier import Frontier
+from crawl.frontier import Frontier
 
 STATUS_ORDER = [
     "queued", "pending_score", "in_progress",

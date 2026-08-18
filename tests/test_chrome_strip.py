@@ -3,7 +3,7 @@ no dependency on fixture content (fixture-based before/after reporting is
 separate, see tests/report_chrome_strip.py)."""
 import unittest
 
-from chrome_strip import clean_html, strip_text_patterns, strip_chrome
+from content.chrome_strip import clean_html, strip_text_patterns, strip_chrome
 
 BASE = "https://example.com/page"
 

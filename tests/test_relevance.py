@@ -5,7 +5,7 @@ measured separately against real embeddings, not asserted here -- these
 tests only prove the math and the strategies wire together correctly."""
 import unittest
 
-from relevance import (
+from content.relevance import (
     cosine_similarity, extract_headings, chunk_text,
     score_whole_page, score_headings, score_max_chunk, make_score_fn,
 )

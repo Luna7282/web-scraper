@@ -7,7 +7,7 @@ query/fragment normalization, and trailing-slash equivalence.
 """
 import unittest
 
-from scope import normalize_url, derive_prefix, is_in_scope
+from crawl.scope import normalize_url, derive_prefix, is_in_scope
 
 BASE = "https://docs.manim.community/en/stable/"
 

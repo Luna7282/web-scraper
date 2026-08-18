@@ -9,7 +9,7 @@ it's a Writer/Chroma reference.
 import inspect
 import unittest
 
-import pipeline
+from crawl import pipeline
 
 
 class TestWriterSoleOwnership(unittest.TestCase):

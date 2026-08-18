@@ -33,7 +33,7 @@ from config import (
     PARENT_CHUNK_SIZE,
     ExtractionStrategy,
 )
-from relevance import chunk_text, cosine_similarity
+from content.relevance import chunk_text, cosine_similarity
 
 EmbedFn = Callable[[str], Awaitable[list[float]]]
 

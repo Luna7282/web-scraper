@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from writer import Writer
+from storage.writer import Writer
 
 
 class TestWriter(unittest.IsolatedAsyncioTestCase):

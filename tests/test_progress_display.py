@@ -4,7 +4,7 @@ terminates on quiescence rather than running forever."""
 import asyncio
 import unittest
 
-from frontier import Frontier
+from crawl.frontier import Frontier
 from progress_display import _render, run_progress_display
 
 SEED = "https://x.test/a"

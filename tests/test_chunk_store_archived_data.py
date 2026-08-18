@@ -17,7 +17,7 @@ import sqlite3
 import unittest
 from pathlib import Path
 
-from chunk_store import chunk_id, normalize_chunk_text
+from storage.chunk_store import chunk_id, normalize_chunk_text
 
 ARCHIVED_DB = Path(__file__).parent.parent / "archive" / "pre-rebuild" / "chroma_db" / "chroma.sqlite3"
 

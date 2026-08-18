@@ -7,7 +7,7 @@ import json
 import unittest
 from pathlib import Path
 
-from robots_cache import RobotsCache
+from crawl.robots_cache import RobotsCache
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "robots"
 

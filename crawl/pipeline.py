@@ -1,7 +1,5 @@
-"""Crawl / extract / write worker loops. Built alongside orchestrator.py,
-not replacing it in place -- orchestrator.py stays importable as a working
-fallback until this path is proven (see the rebuild plan). Wired into
-main.py as of step 6.
+"""Crawl / extract / write worker loops -- the real pipeline main.py runs
+(proven end-to-end by step 8 Part D's live crawl and crash-resume test).
 
 Every I/O dependency is injected (fetch_fn, score_fn, extract_fn, Writer,
 chunk_fn) so these loops are fully testable against stubs -- see
@@ -14,14 +12,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
-from canonical import build_canonical_record, detect_license_signal, extract_page_title
+from storage.canonical import build_canonical_record, detect_license_signal, extract_page_title
 from config import MAX_RETRIES
-from extraction import MalformedExtractionError, parse_qa_json
-from frontier import Frontier, FrontierRow
-from robots_cache import RobotsCache
-from scope import normalize_url
-from sectioning import DEFAULT_SECTION_DEPTH, derive_section
-from writer import Writer
+from content.extraction import MalformedExtractionError, parse_qa_json
+from crawl.frontier import Frontier, FrontierRow
+from crawl.robots_cache import RobotsCache
+from crawl.scope import normalize_url
+from content.sectioning import DEFAULT_SECTION_DEPTH, derive_section
+from storage.writer import Writer
 
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 5.0
 POLL_INTERVAL = 0.05

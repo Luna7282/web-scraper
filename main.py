@@ -13,22 +13,22 @@ from rich.table import Table
 
 import config
 from llm_factory import get_llm
-from discovery import discover_branches, fetch_page_links
-from scope import normalize_url, derive_prefix, is_in_scope
-from frontier import Frontier
-from pipeline import crawl_worker, extract_worker, writer_worker, FetchTimeout, FetchHTTPError, RateLimitError
-from extraction import QA_EXTRACTION_SYSTEM_PROMPT
-from relevance import make_score_fn
-from robots_cache import RobotsCache
-from writer import Writer
+from crawl.discovery import discover_branches, fetch_page_links
+from crawl.scope import normalize_url, derive_prefix, is_in_scope
+from crawl.frontier import Frontier
+from crawl.pipeline import crawl_worker, extract_worker, writer_worker, FetchTimeout, FetchHTTPError, RateLimitError
+from content.extraction import QA_EXTRACTION_SYSTEM_PROMPT
+from content.relevance import make_score_fn
+from crawl.robots_cache import RobotsCache
+from storage.writer import Writer
 from progress_display import run_progress_display
-from score_report import format_score_report
-from chunk_store import ChunkStore, get_or_create_collection, split_into_parent_child_chunks
-from query import query_chunks, format_query_results
-from extraction_units import make_extraction_units_fn
-from dataset_report import build_dataset_report
-from export import load_canonical_records
-from chrome_strip import DEFAULT_EXCLUDED_SELECTOR, DEFAULT_EXCLUDED_TAGS, strip_text_patterns
+from crawl.score_report import format_score_report
+from storage.chunk_store import ChunkStore, get_or_create_collection, split_into_parent_child_chunks
+from storage.query import query_chunks, format_query_results
+from content.extraction_units import make_extraction_units_fn
+from export.dataset_report import build_dataset_report
+from export.export import load_canonical_records
+from content.chrome_strip import DEFAULT_EXCLUDED_SELECTOR, DEFAULT_EXCLUDED_TAGS, strip_text_patterns
 
 EMBEDDING_MODEL_NAME = "nomic-embed-text"  # LocalOllamaEmbeddings' default; keep in sync (see get_llm)
 EMBEDDING_DIM = 768  # measured in step 6 -- see LESSONS_LEARNED.md #17

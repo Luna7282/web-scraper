@@ -15,8 +15,8 @@ crawl_worker setup to reach it indirectly.
 import asyncio
 import unittest
 
-from frontier import Frontier
-from pipeline import crawl_worker, FetchTimeout, FetchHTTPError
+from crawl.frontier import Frontier
+from crawl.pipeline import crawl_worker, FetchTimeout, FetchHTTPError
 
 
 SEED = "https://x.test/a"

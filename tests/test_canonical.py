@@ -1,7 +1,7 @@
 """Offline tests for canonical.py -- pure functions, no I/O."""
 import unittest
 
-from canonical import build_canonical_record, detect_license_signal, extract_page_title
+from storage.canonical import build_canonical_record, detect_license_signal, extract_page_title
 
 
 class TestBuildCanonicalRecord(unittest.TestCase):

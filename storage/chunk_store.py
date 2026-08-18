@@ -21,7 +21,7 @@ from __future__ import annotations
 import hashlib
 from typing import Awaitable, Callable
 
-from relevance import chunk_text as _split_text
+from content.relevance import chunk_text as _split_text
 
 EmbedFn = Callable[[str], Awaitable[list[float]]]
 

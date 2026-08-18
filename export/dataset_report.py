@@ -12,7 +12,7 @@ from collections import Counter
 from difflib import SequenceMatcher
 from re import sub as _sub
 
-from export_formats import dedup_by_question
+from export.export_formats import dedup_by_question
 
 # Picked from step 8 Part A's live-check analysis (LESSONS_LEARNED.md
 # #26), not a calibrated/labeled threshold -- questions are short enough

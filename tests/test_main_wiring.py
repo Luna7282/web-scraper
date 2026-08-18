@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from frontier import Frontier
-from pipeline import FetchTimeout, FetchHTTPError, RateLimitError
+from crawl.frontier import Frontier
+from crawl.pipeline import FetchTimeout, FetchHTTPError, RateLimitError
 from main import _make_scope_check, _make_extract_fn, _make_fetch_fn, _is_rate_limit_exception, score_report_command
 
 

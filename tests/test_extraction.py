@@ -3,7 +3,7 @@ explicitly required by the task: prose-wrapped (salvageable, the common
 case) and truly malformed (must fail loudly, not silently return [])."""
 import unittest
 
-from extraction import parse_qa_json, MalformedExtractionError
+from content.extraction import parse_qa_json, MalformedExtractionError
 
 
 class TestParseQaJson(unittest.TestCase):

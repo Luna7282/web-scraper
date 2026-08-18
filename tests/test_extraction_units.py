@@ -3,7 +3,7 @@ plus a stub embed_fn for the top_k strategy, no network."""
 import unittest
 
 from config import ExtractionStrategy
-from extraction_units import select_extraction_units
+from content.extraction_units import select_extraction_units
 
 
 class TestSelectExtractionUnits(unittest.IsolatedAsyncioTestCase):

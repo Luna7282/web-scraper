@@ -26,7 +26,7 @@ never discovered. Global quiescence must not do that.
 import asyncio
 import unittest
 
-from frontier import Frontier
+from crawl.frontier import Frontier
 
 HOST = "https://x.test"
 CHILDREN = {

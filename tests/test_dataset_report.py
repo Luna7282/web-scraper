@@ -3,7 +3,7 @@ built to exercise same_chunk / adjacent_chunk / other classification
 directly, no LLM calls, no network."""
 import unittest
 
-from dataset_report import (
+from export.dataset_report import (
     build_dataset_report,
     classify_redundancy_cause,
     find_near_duplicates,

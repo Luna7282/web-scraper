@@ -5,8 +5,8 @@ import uuid
 
 import chromadb
 
-from chunk_store import get_or_create_collection, EmbeddingIdentityMismatch
-from query import query_chunks, format_query_results, QueryResult
+from storage.chunk_store import get_or_create_collection, EmbeddingIdentityMismatch
+from storage.query import query_chunks, format_query_results, QueryResult
 
 
 def _unique_name() -> str:

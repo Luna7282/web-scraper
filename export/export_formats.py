@@ -13,7 +13,7 @@ from __future__ import annotations
 import random
 from typing import Callable
 
-from chunk_store import normalize_chunk_text
+from storage.chunk_store import normalize_chunk_text
 
 DEFAULT_MIN_ANSWER_LENGTH = 20
 

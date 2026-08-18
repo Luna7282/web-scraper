@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from chunk_store import verify_embedding_identity
+from storage.chunk_store import verify_embedding_identity
 
 EmbedFn = Callable[[str], Awaitable[list[float]]]
 

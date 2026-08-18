@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from export import UNSUPPORTED_WITHOUT_EXTRA_PASS, run_export
+from export.export import UNSUPPORTED_WITHOUT_EXTRA_PASS, run_export
 
 
 def _read_jsonl(path) -> list[dict]:

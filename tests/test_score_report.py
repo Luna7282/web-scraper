@@ -2,7 +2,7 @@
 frontier DB, no network."""
 import unittest
 
-from score_report import format_score_report
+from crawl.score_report import format_score_report
 
 
 class TestFormatScoreReport(unittest.TestCase):

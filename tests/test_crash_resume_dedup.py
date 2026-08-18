@@ -15,8 +15,8 @@ from pathlib import Path
 
 import chromadb
 
-from chunk_store import ChunkStore, get_or_create_collection, chunk_id
-from writer import Writer
+from storage.chunk_store import ChunkStore, get_or_create_collection, chunk_id
+from storage.writer import Writer
 
 URL = "https://x.com/install/linux"
 QA_PAIRS = [{"instruction": "How do I install X?", "response": "Run these steps."}]

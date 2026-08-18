@@ -1,7 +1,7 @@
 from urllib.parse import urlparse
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
 
-from scope import normalize_url
+from crawl.scope import normalize_url
 
 async def fetch_page_links(url: str) -> list[str]:
     """Fetch one page and return its outbound hrefs exactly as found --

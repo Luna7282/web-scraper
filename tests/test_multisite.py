@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from urllib.parse import urlparse
 
-from scope import normalize_url, derive_prefix, is_in_scope
+from crawl.scope import normalize_url, derive_prefix, is_in_scope
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 

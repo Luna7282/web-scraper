@@ -6,9 +6,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from frontier import Frontier
-from pipeline import writer_worker, ExtractionResult
-from writer import Writer
+from crawl.frontier import Frontier
+from crawl.pipeline import writer_worker, ExtractionResult
+from storage.writer import Writer
 
 SEED = "https://x.test/a"
 

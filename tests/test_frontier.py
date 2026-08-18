@@ -4,7 +4,7 @@ max_depth enforcement, seed exemption. Offline, in-memory SQLite."""
 import asyncio
 import unittest
 
-from frontier import Frontier
+from crawl.frontier import Frontier
 
 SEED = "https://x.test/a"
 
