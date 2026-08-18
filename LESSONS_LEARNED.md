@@ -463,4 +463,84 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-18 — Step 5 (part 1): frontier.py, quiescence design, and a real termination bug caught before it shipped
+
+### 12. Per-stage sentinel shutdown was wrong the moment extraction started feeding back into the frontier
+- **Problem**: the original plan's shutdown design (frontier drains →
+  crawl workers get sentinels and exit → content queue drains → extract
+  workers get sentinels → results queue drains → writer exits) assumed
+  each stage's completion only depends on the stage before it. It
+  doesn't — an extract worker promotes `pending_score → queued`, which
+  means the crawl stage's "am I done" question depends on the *extract*
+  stage, not just its own queue. "Crawl stage idle, nothing queued" can
+  be true while a slow extract worker is mid-flight and about to
+  produce an entire new wave of claimable work. A cascade design reads
+  that idle moment as "crawl is done," dispatches crawl-worker
+  sentinels, and the run ends after roughly one wave — silently, with
+  no error, just an incomplete crawl that looks like it finished
+  cleanly.
+- **Root cause**: the pipeline was drawn as a linear A→B→C chain when
+  designing shutdown, but it's actually cyclic — extraction feeds back
+  into the frontier that crawling reads from. A linear shutdown protocol
+  is only correct for a linear pipeline.
+- **Fix**: replaced per-stage sentinel cascades with one global
+  quiescence check: a single `in_flight` counter (incremented on claim,
+  `content_queue.put`, `results_queue.put`; decremented on leaving
+  `in_progress`, and on each queue's `task_done`), checked under the
+  same lock that mutates it. The run ends only when `in_flight == 0`
+  **and** (zero `queued` rows remain **or** `max_pages` is reached) —
+  verified with a literal `SELECT COUNT(*) WHERE status IN
+  (queued,pending_score,in_progress)` assertion whenever that condition
+  fires, so a violation of the invariant fails loudly instead of
+  quietly shipping a truncated crawl again.
+- **Caught before any worker code existed**: `tests/test_frontier_quiescence.py`
+  drives `frontier.py`'s real API with a deliberately slow extract
+  worker against a fast crawl worker over an 8-node graph shaped so the
+  crawl stage must idle multiple times waiting for promotions (measured
+  4 idle-then-resume cycles in one run, asserts ≥2). All 8 nodes reach
+  `done`; a cascade design would have stopped after node C at the
+  latest. Built and passing *before* `frontier.py`'s workers existed,
+  per the explicit build order — the test was shaped by the design, not
+  the other way around.
+- **Why it matters**: this is exactly the kind of bug that "works" in
+  every manual test with a fast, low-latency LLM and only shows up under
+  real production latency (slow provider, rate limiting, a genuinely
+  large page) — by which point it looks like "the crawl just didn't
+  find much" rather than "the shutdown logic raced itself." Caught at
+  design-review time, before a single worker existed to hide behind.
+
+### 13. JSONL crash-resume duplicates: file-layer marker, not a same-transaction DB column
+- **Problem**: `status='done'` is set by the writer, only after the
+  JSONL append and Chroma upsert both succeed — correct, so a crash
+  before persistence leaves the row retryable rather than falsely
+  `done`. But that retry re-runs extraction and re-appends to JSONL. Once
+  step 7's content-hash chunk IDs land, Chroma's upsert absorbs the
+  duplicate; JSONL has no such mechanism and would get a real duplicate
+  row.
+- **Two options considered.** (a) Hash the Q&A content and dedup on
+  load — rejected: LLM output isn't guaranteed byte-identical between
+  the original attempt and the retry (different phrasing of the same
+  answer is plausible), so an exact-content hash wouldn't reliably catch
+  the duplicate. (b) A same-transaction SQLite "written" marker,
+  updated alongside `status='done'` — rejected on inspection: the whole
+  reason this bug exists is a crash *between* the file write and the
+  status-update transaction committing. A marker inside that same
+  transaction is exactly as uncommitted as the status update is when
+  that crash happens — it can't detect a scenario it's part of.
+- **Fix chosen**: extend the JSONL rows with a `source_url` field, and
+  have the writer preload the set of already-written URLs from existing
+  JSONL files at startup — the same pattern `_preload_existing_instructions()`
+  already uses for exact-instruction dedup, just keyed by URL instead of
+  instruction text. Before appending, check membership; if already
+  present, skip the JSONL write (the content is genuinely already
+  captured) but still let the row reach `done` normally. The file itself
+  is the durable record of "was this persisted," independent of
+  whatever the frontier's status column says — which is exactly what
+  survives the crash window a DB-side marker can't.
+- **Why it matters**: recorded now, per the ask, rather than discovering
+  it as a mysterious duplicate-rows bug during step 8's kill test and
+  re-deriving this same reasoning under pressure.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->

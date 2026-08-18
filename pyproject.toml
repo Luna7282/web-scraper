@@ -13,6 +13,7 @@ dependencies = [
     "rich==15.0.0",
     "python-dotenv==1.2.3",
     "requests==2.34.2",
+    "aiosqlite==0.22.1",
     # Load-bearing upper bounds, not exact pins -- see LESSONS_LEARNED.md #1.
     # NumPy 2.x breaks this stack; urllib3 2.x was pinned alongside it.
     "numpy<2",

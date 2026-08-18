@@ -130,6 +130,19 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     already supports selecting external categories individually — just stop
     "all" from silently including them). **Size: S.**
 
+10a. **`frontier.py`'s claim query is host-blind.** `_locked_claim` picks
+    the oldest `queued` row regardless of host. Fine for a single-host
+    crawl (the only case exercised so far), but once cross-host crawling
+    with per-host politeness semaphores lands, a worker can claim a URL for
+    a host that's currently saturated (semaphore full) and block holding
+    that `in_progress` row while other hosts' `queued` rows sit unclaimed —
+    other workers can't help since claim() doesn't know to skip a
+    host-blocked row and try a different host's. Not fixed now; the
+    single-host case this project currently targets doesn't hit it.
+    *Fix*: claim query needs a host-aware `WHERE` clause (skip hosts
+    currently at their concurrency limit) once multi-host crawling is
+    actually exercised. **Size: M.**
+
 11. **LLM JSON output isn't schema-enforced.** `_generate_qa`
     (`output_manager.py:69-97`) relies on prompt instructions + manual
     ` ```json ` fence stripping + `json.loads`. Any deviation (extra prose,

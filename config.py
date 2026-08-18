@@ -5,6 +5,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Frontier / crawl-pipeline knobs (frontier.py). Chunk size/overlap and
+# relevance thresholds are step 6/7's job, not added speculatively here.
+MAX_RETRIES = 3
+FOLLOW_GATE_EXEMPT_DEPTH = 0  # seed's own children always promote regardless of score
+
 class LLMProvider(str, Enum):
     OPENAI = "openai"
     NVIDIA = "nvidia"

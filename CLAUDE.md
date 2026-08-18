@@ -90,9 +90,68 @@ OpenAI-compat wrapper remains the one hard, confirmed invariant above.
 
 ## Queue architecture invariants
 
-*(Filled in once the frontier/worker-pool crawler rebuild lands — see the
-in-progress plan. Placeholder until then: do not reintroduce recursive
-task-per-page spawning; crawling must stay a bounded work-queue.)*
+Crawling is a bounded work-queue pipeline (`frontier.py` + crawl workers +
+`content_queue` + extract workers + `results_queue` + one writer task), never
+recursive task-per-page spawning. Full state machine and schema live in
+`frontier.py`'s module docstring — this section covers the invariants that
+matter when touching it.
+
+**Locking is structurally two-layered, not just documented.** Every
+`Frontier` method named `_locked_*` assumes `self._lock` is already held and
+must never acquire it, and must never call a public (non-`_locked_`) method.
+`asyncio.Lock` is not reentrant — either violation is an instant permanent
+deadlock, not a slow path. Public methods acquire the lock, delegate to
+`_locked_*`, release.
+
+**What's allowed inside the lock, stated precisely** (an earlier draft of
+this rule said "no awaits in the critical section," which is now wrong and
+would read as license to relax further if left as-is): awaits inside the
+lock are permitted **only** for calls on the shared `aiosqlite` connection.
+Never a queue operation, a network call, an LLM call, or a `sleep` — those
+can block for unbounded time, and `content_queue`/`results_queue` are
+bounded for backpressure, so `await queue.put()` specifically can block
+indefinitely. Holding the lock across that stalls every other worker,
+including the ones that would drain the queue and unblock it — a full
+deadlock. `put_content`/`put_results` in `frontier.py` release the lock
+*before* the `await queue.put()` for exactly this reason; keep that pattern
+for any new put-site.
+
+**Termination is global quiescence, not a per-stage sentinel cascade.** An
+extract worker promoting `pending_score → queued` means extraction feeds
+back into the frontier — "crawl stage idle, nothing queued" is not a safe
+place to shut the crawl stage down on its own, since a slow extract worker
+still mid-flight is about to produce more claimable work. The run ends only
+when `in_flight == 0` (a single counter, incremented on claim/content-queue-put/
+results-queue-put, decremented on leaving `in_progress`/task_done) **and**
+either zero `queued` rows remain or `max_pages` has been reached. See
+`tests/test_frontier_quiescence.py` for the regression this guards against —
+a slow extract worker relative to a fast crawl worker causes multiple
+genuine idle-then-resume cycles mid-run; a cascade design stops after the
+first one.
+
+**`max_pages` leaves `queued` rows live in the frontier by design, not by
+accident.** When the cap trips, claim() stops returning rows even though
+some are still `queued` — they're never touched again *this run*. A resumed
+run against the same frontier DB will continue claiming them, since nothing
+marked them `failed` or `skipped_follow`. This means `max_pages` is a
+per-run fetch budget, not a per-database ceiling — surprising if you expect
+it to cap total pages ever processed against this frontier across restarts.
+Relevant to any test that resumes a capped run (step 8 exercises both the
+capped-stop path and the resume-past-cap path in one test).
+
+**JSONL duplicate-write risk on crash-resume, and why it's handled at the
+file layer, not a DB column**: see `LESSONS_LEARNED.md` for the incident
+this traces to. Short version — `status='done'` is set by the *writer*,
+only after the JSONL append and Chroma upsert both succeed, so a crash
+between "extraction finished" and "writer wrote it" correctly leaves the row
+`in_progress` (retried on resume) rather than falsely `done`. But that retry
+re-runs extraction and re-appends to JSONL — and a same-transaction SQLite
+"written" marker can't fix this, because it would be part of the same
+transaction as the status update, which is exactly what didn't commit. The
+JSONL file's own `source_url` field (scanned at startup, same pattern as the
+existing instruction-text preload) is the actual source of truth for "was
+this URL's content already persisted" — it survives independently of
+whatever the frontier's status column says.
 
 ## Scope predicate (`scope.py`)
 

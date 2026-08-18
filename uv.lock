@@ -1887,6 +1887,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "aiofiles" },
+    { name = "aiosqlite" },
     { name = "crawl4ai" },
     { name = "langchain-chroma" },
     { name = "langchain-core" },
@@ -1908,6 +1909,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiofiles", specifier = "==25.1.0" },
+    { name = "aiosqlite", specifier = "==0.22.1" },
     { name = "crawl4ai", specifier = "==0.9.2" },
     { name = "langchain-chroma", specifier = "==1.1.0" },
     { name = "langchain-core", specifier = "==1.5.5" },
