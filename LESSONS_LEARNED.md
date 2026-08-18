@@ -394,4 +394,73 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-18 — Step 4 close-out: two-page extraction test
+
+### 10. `.env` was still corrupted from the earlier paste mishap -- and it silently broke the Ollama cloud key
+- **Problem**: The first real extraction call against Ollama cloud
+  failed with `401 Unauthorized`, which looked at first like it might
+  confirm the endpoint uncertainty flagged in `LESSONS_LEARNED.md` #7
+  (`https://ollama.com/v1` unconfirmed by primary docs).
+- **Root cause**: it wasn't the endpoint. `.env` still had a leftover
+  corrupted line from an earlier paste mishap:
+  `ollama_api_key=# Copy this file to .env and fill in real values...`
+  (the entire contents of `.env.example`, mashed onto one line, under a
+  lowercase key name). Windows environment variables are case-insensitive,
+  so `ollama_api_key` and `OLLAMA_API_KEY` are the same underlying slot;
+  `python-dotenv`'s default `override=False` meant the garbage value set
+  first (from the lowercase line) blocked the correct value on the later
+  `OLLAMA_API_KEY=...` line from ever taking effect.
+  `os.getenv("OLLAMA_API_KEY")` was silently returning a truncated
+  comment string as the "key" the whole time.
+- **Fix**: deleted the corrupted line. Verified before/after by printing
+  the loaded key's length and a truncated form -- garbage string first,
+  real 57-character key after.
+- **Why it matters**: a `401` reads exactly like "your credential is
+  wrong," and it's tempting to jump straight to "the endpoint config
+  must be wrong" (the *documented* uncertainty) rather than "check what's
+  actually in the env var" (the *undocumented* one). Verify the simpler,
+  more mechanical explanation before the more interesting architectural
+  one. Also: this correctly resolves as **`https://ollama.com/v1` does
+  work** with a real key and `deepseek-v4-flash` -- the step 2 endpoint
+  uncertainty in `LESSONS_LEARNED.md` #7 is no longer "untested," it's
+  confirmed working for chat/extraction. (Embeddings remain confirmed
+  absent from Ollama cloud regardless -- unrelated finding, unchanged.)
+
+### 11. Chrome-stripped extraction test: real, usable Q&A on both pages
+- Ran the actual production code path (`OutputManager._generate_qa`,
+  unmodified, same system prompt and 4000-char truncation) against
+  chrome-stripped markdown for two real pages, via Ollama cloud /
+  `deepseek-v4-flash`:
+  - **Page 1** (`docs.manim.community` root -- the exact nav-heavy
+    landing page whose *unstripped* Q&A output was the original evidence
+    for `LESSONS_LEARNED.md` #4's "nav junk" problem): 5 pairs, all
+    genuine FAQ-style questions about Manim itself (what ManimCE is and
+    how it differs from the original, where to find install instructions,
+    how to try it without installing, where tutorials/help live). **Zero**
+    questions about the navigation menu's own structure -- the exact
+    failure mode #4 documented is gone on this page once chrome is
+    stripped before extraction.
+  - **Page 2** (`manim.mobject.geometry.arc.Circle` reference page): 5
+    pairs, all real API content -- constructor parameters, a usage
+    example, the methods list, inherited attributes, a full code sample
+    with explanation. This is exactly the kind of content the original
+    system prompt asked for and the unstripped pipeline wasn't reliably
+    producing.
+  - Fixture used for page 2: `tests/fixtures/docs_manim_reference.html`
+    (added this step) -- also the fixture that confirmed `<button>`
+    exclusion structurally removes manim's actual "Copy to clipboard" /
+    "Make interactive" markup (Furo's `<button class="copybtn"
+    data-tooltip="Copy">` and `<button class="manim-binder-button">Make
+    interactive</button>` -- both genuine `<button>` tags, closing the
+    "honest gap" noted in entry #9).
+- **Why it matters**: this is the actual verification step 4 was for --
+  the chunk-dump categorization (#9) explained *what* was duplicating and
+  *why*, but only a real extraction call proves whether the fix produces
+  usable training data. It does, on both a chrome-heavy landing page and
+  a dense reference page, which were chosen specifically to be different
+  page shapes rather than both being favorable cases. Two real,
+  unmodified pairs of evidence beat one plausible-sounding theory.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->

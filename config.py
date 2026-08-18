@@ -47,19 +47,16 @@ def get_llm_config(provider: LLMProvider) -> LLMConfig:
     elif provider == LLMProvider.OLLAMA_CLOUD:
         # Chat/extraction only -- see EMBEDDING_CAPABLE_PROVIDERS above.
         #
-        # base_url is UNVERIFIED against Ollama's own documentation. Confirmed
-        # from docs.ollama.com (2026-08-18): cloud models are documented as
-        # reachable via the native API (`https://ollama.com/api/chat`, via
-        # Ollama's own Python/JS client or raw curl) with
-        # `Authorization: Bearer $OLLAMA_API_KEY`. docs.ollama.com's
-        # OpenAI-compatibility page documents only `http://localhost:11434/v1`
-        # and never mentions ollama.com. `https://ollama.com/v1` mirrors
-        # local's OpenAI-compat path and is reported by secondary/aggregator
-        # sources, but no primary Ollama doc confirms it responds. Untested
-        # end-to-end (no OLLAMA_API_KEY available this session) -- see
-        # LESSONS_LEARNED.md #7 before relying on this in a real run. If it
-        # doesn't work, the fallback is the native `/api/chat` protocol via
-        # Ollama's own client, not another guessed OpenAI-compat path.
+        # base_url's correctness was originally unverified against Ollama's
+        # own docs (docs.ollama.com's OpenAI-compatibility page only ever
+        # documents `http://localhost:11434/v1` and never mentions
+        # ollama.com; only the native `/api/chat` protocol was documented
+        # for cloud). CONFIRMED WORKING (2026-08-18, step 4): a real
+        # end-to-end call through ChatOpenAI against this exact base_url,
+        # with model "deepseek-v4-flash", succeeded (see
+        # LESSONS_LEARNED.md #10-11). If a future call gets 401, check the
+        # env var loaded correctly before suspecting this endpoint again --
+        # that's what actually happened here first.
         return LLMConfig(
             base_url="https://ollama.com/v1",
             api_key=os.getenv("OLLAMA_API_KEY")

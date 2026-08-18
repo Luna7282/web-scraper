@@ -77,13 +77,15 @@ Ollama **cloud** is the opposite case for *embeddings* — it has none (no
 embedding models exist in Ollama's cloud catalog at all, verified against
 docs.ollama.com; see `LESSONS_LEARNED.md` #7) — never build an embeddings
 path against it. For *chat*, it's routed through `ChatOpenAI` at
-`https://ollama.com/v1`, but unlike every other provider entry in
-`config.py`, that base_url is **not confirmed by Ollama's own
-documentation** — only the native `/api/chat` protocol is documented for
-cloud. It's wired and usable but genuinely unverified, not just
-untested-for-lack-of-a-key; check `LESSONS_LEARNED.md` #7 before trusting
-it in a real run. Local Ollama chat has no such doubt — only cloud's
-OpenAI-compat path is in question. Local embeddings staying off the
+`https://ollama.com/v1` — not confirmed by Ollama's own docs (only the
+native `/api/chat` protocol is documented for cloud) but **confirmed
+working in practice** via a real end-to-end call with `deepseek-v4-flash`
+(`LESSONS_LEARNED.md` #10-11). If it 401s in a future session, check the
+loaded env var before suspecting the endpoint — that's what actually
+went wrong the first time (a corrupted `.env` line shadowing the real
+key on case-insensitive Windows env vars), not the URL. Local Ollama
+chat has no such doubt either way — only cloud's OpenAI-compat path was
+ever in question. Local embeddings staying off the
 OpenAI-compat wrapper remains the one hard, confirmed invariant above.
 
 ## Queue architecture invariants
