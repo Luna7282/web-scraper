@@ -255,7 +255,7 @@ def _make_scope_check(host_prefix_pairs: list[tuple[str, str | None]]):
 
 
 async def main():
-    console.print(Panel.fit("[bold blue]Prompt-Steered Documentation Scraper[/bold blue]"))
+    console.print(Panel.fit("[bold blue]Prompt-Steered Crawler[/bold blue]"))
 
     root_url = Prompt.ask("Enter the Root URL to start discovery")
     if not root_url.startswith("http"):

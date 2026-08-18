@@ -6,12 +6,19 @@ someone remembers to.
 
 ## What this is
 
-A prompt-steered crawler: give it a root URL and a natural-language intent,
-it crawls, judges pages against that intent, and emits Q&A JSONL for
-fine-tuning and/or a Chroma vector index. See `ARCHITECTURE.md` for the
-as-built system and `ROADMAP.md` for known gaps. `LESSONS_LEARNED.md` is the
-running problem → root cause → fix log — **append to it after every
-significant step or run**, not just when something breaks.
+A general-purpose, prompt-steered crawler for any website — give it a root
+URL and a natural-language intent, and it crawls, judges pages against that
+intent, and turns the result into training datasets (multiple schemas and
+framework-specific packagings via `export.py`) plus a Chroma RAG index. It
+is **not** documentation-specific: docs sites are one input type this
+project has been tested against, not the target. Don't let "docs"/
+"documentation" framing creep back into how this tool is described — it's
+a scope regression, not a simplification.
+
+See `ARCHITECTURE.md` for the as-built system and `ROADMAP.md` for known
+gaps. `LESSONS_LEARNED.md` is the running problem → root cause → fix log —
+**append to it after every significant step or run**, not just when
+something breaks.
 
 Currently mid-rebuild per a step-by-step plan (steps tracked outside this
 file, in-session). The pre-rebuild source is preserved in git history —
