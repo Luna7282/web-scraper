@@ -332,4 +332,66 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-18 — Step 4: chrome-stripping built and tested offline against 5 sites
+
+### 9. Parser-layer chrome stripping, developed and measured against cached fixtures
+- **What was built** (`chrome_strip.py`): two layers, no site-specific
+  logic. (1) Structural — `nav`/`header`/`footer`/`aside`/`button`/
+  `script`/`style`/`noscript` tags plus ARIA-role selectors
+  (`role="navigation"`, `role="banner"`, `role="contentinfo"`,
+  `role="complementary"`, `role="button"`, `aria-hidden="true"`) excluded
+  via crawl4ai's own `excluded_tags`/`excluded_selector` HTML-cleaning
+  stage (`LXMLWebScrapingStrategy`), same mechanism `CrawlerRunConfig`
+  exposes for the real pipeline. (2) Text-pattern fallback — a small
+  config-driven phrase list (`DEFAULT_TEXT_PATTERNS`:
+  "copy to clipboard", "copied to clipboard", "copied!",
+  "make interactive") for UI text that survives structural exclusion,
+  matched as a whole line only (not substring-anywhere), so real content
+  that happens to *discuss* clipboard copying in a sentence isn't deleted.
+- **Verified `<button>` exclusion against a real, confirmed instance**:
+  fastapi.tiangolo.com's cached HTML has
+  `<button class="md-code__button" title="Copy to clipboard" ...>` on
+  every code block — a genuine `<button>` tag, no theme-specific class
+  needed to target it. Excluding the tag removed it.
+- **Measured before/after across all 5 fixtures, offline** (no network):
+
+  | site | chars before → after | survival | dup pairs before → after |
+  |---|---|---|---|
+  | docs.manim.community | 67,970 → 14,505 | 21% | 7 (all nav-pattern) → 0 |
+  | fastapi.tiangolo.com | 47,456 → 24,647 | 52% | 2 (real content) → 3 (real content) |
+  | www.manim.community | 8,365 → 5,708 | 68% | 0 → 0 |
+  | stackblitz.com | 4,072 → 2,629 | 65% | 0 → 0 |
+  | blog.cloudflare.com | 29,505 → 18,147 | 62% | 7 (6 nav + 1 real) → 0 |
+
+  Every nav/link-list-pattern duplicate, on every site that had one,
+  went to zero. Real-content duplicates (fastapi's) stayed flat (2→3,
+  noise-level) — exactly the expected outcome per the corrected
+  understanding in `LESSONS_LEARNED.md` #4's amendment: category C isn't
+  a chrome problem, so stripping correctly leaves it alone rather than
+  accidentally destroying real content. **Cross-page duplicate reduction
+  was not measured** — each fixture is a single root page, so the
+  cross-page category-C cases (installation steps repeated across
+  Linux/macOS/Windows/uv pages) can't be exercised from this fixture set;
+  they're expected to persist regardless of stripping (see `ROADMAP.md`
+  #6's revised chunk-ID fix, which is the actual mechanism for that case,
+  not chrome-stripping).
+- **Honest gap, not papered over**: the `<button>` exclusion is verified
+  against FastAPI's real markup, not manim's. None of the 5 cached
+  fixtures are the manim pages that actually produced the original
+  "Copy to clipboard" / "Make interactive" duplicate chunks (`examples.html`,
+  `installation/*.html`, `tutorials/*.html` — the root page fixture used
+  for manim throughout this project doesn't have code blocks). So for
+  manim specifically, it's the **text-pattern fallback** doing the
+  confirmed work, not structural exclusion — Furo's sphinx-copybutton
+  markup may render differently than mkdocs-material's `<button>`. Worth
+  fetching one of those specific manim pages before considering the
+  manim case structurally (not just textually) solved.
+- **Also confirmed empirically**: `chunk_overlap` defaults to 200 on both
+  the 2000-char parent and 400-char child `RecursiveCharacterTextSplitter`
+  in `langchain_text_splitters==1.1.2` (the version actually installed) —
+  50% overlap on child chunks, documented cause rather than inferred, for
+  the 9,204-vector figure in the original audit.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->

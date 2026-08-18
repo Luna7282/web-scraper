@@ -71,8 +71,24 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
    so Chroma has no way to recognize "I've already indexed this chunk."
    JSONL is protected from row duplication by the instruction-text dedup,
    but Chroma has no equivalent guard.
-   *Fix*: derive a deterministic id (e.g. `sha256(url + child_text)`) and
-   pass `ids=` to `add_documents`, which makes it an upsert. **Size: S–M.**
+   *Fix, revised (step 4)*: originally planned as `sha256(url + child_text)`
+   — wrong once cross-page content duplication is accounted for (step 4's
+   chunk-dump analysis found real content genuinely repeated verbatim
+   across different pages, e.g. identical install instructions on every
+   OS's page — category C in `LESSONS_LEARNED.md` #4's amendment).
+   Hashing `url + text` gives each page's copy a different ID, so those
+   duplicates would survive upsert entirely and still produce N
+   near-identical competing vectors in retrieval. Hash the **normalized
+   chunk text alone** — `sha256(child_text)` — so the same content from
+   any page maps to the same Chroma id. Carry `sources` as a **list** in
+   metadata instead of a single `source` string: first write creates the
+   record, a subsequent identical chunk from a different page appends its
+   URL to the existing list rather than creating a second vector.
+   **Tradeoff, stated explicitly**: one canonical chunk means a retrieval
+   hit returns one attribution path, not "this exact sentence also
+   appears on 4 other pages" — the `sources` list is what preserves that
+   provenance instead, so it must actually get surfaced wherever query
+   results are used, not just stored and ignored. **Size: S–M.**
 
 7. **No resumability.** `visited` (`orchestrator.py:61`) is a plain in-memory
    `set()`. If the process dies at page 400 of 500, restarting re-crawls and
