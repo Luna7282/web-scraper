@@ -1370,4 +1370,125 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-19 — Step 8 Phase 2B-2D: three findings from reading the real canonical.jsonl directly (2A is entry #30, above)
+
+### 31. Nearly half of every chunk's characters are markdown link syntax, not content -- the largest single finding of this phase
+- **The number, measured across all 264 real chunks (deduped by
+  source_url+chunk_index, not per-pair)**: **46.7% of all chunk
+  characters sit inside markdown link syntax** `[text](url)`. Of that,
+  the *visible* link text a reader would actually see is only **2.9%**
+  of total chars -- the remaining **43.8 percentage points is pure URL +
+  syntax overhead**. Not a few outlier chunks skewing an average: mean
+  45.6%, median 45.0% per chunk, and it reaches 89.5% on the worst one.
+  A concrete real example, not an abstraction: a font-template
+  reference table where every row is `` [`biolinum`](https://docs.
+  manim.community/.../TexFontTemplates.html#....biolinum
+  "manim.utils.tex_templates.TexFontTemplates.biolinum") `` -- **8
+  characters of actual signal (the symbol name) wrapped in roughly 230
+  characters of repeated full URL and a duplicated title attribute
+  identical to the anchor fragment.**
+- **Why this dwarfs the redundancy problem in impact**: this isn't a
+  content-quality issue affecting some pairs -- it's a character-budget
+  tax on *everything* that touches this text. Every embedding call
+  (relevance scoring, Chroma child chunks), every extraction LLM call
+  (`content[:MAX_EXTRACT_CHARS]` truncation included), and every
+  chunk's `PARENT_CHUNK_SIZE`/`CHILD_CHUNK_SIZE` budget is spending
+  roughly half its allotment on link machinery instead of real page
+  content. On a reference-heavy site like this one, that means
+  `MAX_EXTRACT_CHARS`/`MAX_EMBED_CHARS` effectively cover about half
+  the real content their raw character counts suggest, and it's a
+  significant, previously-unquantified contributor to the original
+  audit's 9,204-vectors-from-30-pages figure -- more chunks were needed
+  partly because each chunk carried less actual content than its length
+  implied. Not fixed here -- see `ROADMAP.md`, ranked above the
+  near-duplicate work precisely because of this scale.
+
+### 32. chrome_strip.py misses content that is neither semantically marked nor visually rendered -- two distinct mechanisms, both confirmed
+- **Root cause 1 -- invisible SVG icon-sprite `<title>` text.** Furo's
+  theme ships an `<svg style="display:none">` block near the top of
+  `<body>` containing icon `<symbol>` definitions, each with a
+  `<title>` (`<title>Light mode</title>`, `<title>Expand</title>`,
+  etc.) -- accessibility labels for icons referenced later via
+  `<use href="#svg-sun">`, never rendered themselves. crawl4ai's
+  markdown conversion extracts this title text as real content anyway,
+  producing exactly the "Contents Menu Expand Light mode Dark mode Auto
+  light/dark, in light mode Auto light/dark, in dark mode" sequence
+  found at the start of `image_mobject.html`'s chunk 0 (and confirmed
+  present in every other chunk-0 sampled). `svg` isn't in
+  `DEFAULT_EXCLUDED_TAGS`, and CSS `display:none` isn't something the
+  structural-exclusion mechanism evaluates -- it works on tag/role
+  presence, not computed visibility.
+- **Root cause 2 -- bare utility links with no landmark tag or ARIA
+  role.** `<a class="skip-to-content muted-link"
+  href="#furo-main-content">Skip to content</a>`, plus "Back to top" /
+  "View this page" / "Edit this page", sit in plain `<div>`/`<label>`
+  wrappers -- not `<nav>`/`<header>`/`<aside>`/`<button>`, and no
+  `role="navigation"` or equivalent. Neither `DEFAULT_EXCLUDED_TAGS`
+  nor `DEFAULT_EXCLUDED_SELECTOR` has anything to match against.
+  Verified both mechanisms survive the real `strip_chrome()` call
+  end-to-end (not just in raw HTML) against the cached reference
+  fixture.
+- **General lesson, stated for the next time this category of gap
+  shows up**: structural exclusion (tag names) and semantic exclusion
+  (ARIA roles) both assume chrome is *marked* as chrome, one way or the
+  other. Content that's neither semantically labeled (no role, no
+  landmark tag) nor actually visible (`display:none`, referenced only
+  indirectly) falls through both nets at once -- it isn't hiding in a
+  gap between the two mechanisms, it's outside what either mechanism
+  was ever designed to see. Not fixed here -- reported per the explicit
+  ask to measure before proposing anything.
+
+### 33. Overlap and padding measured, and a real decision made not to build split chunking
+- **2B (same-chunk paraphrase padding)**: corpus-wide, 98.9% of 264
+  chunks produced 4 or 5 pairs regardless of content richness --
+  essentially none produced 1 or 2. Official near-dup accounting: 380
+  same-chunk near-duplicate answer pairs, touching 52.7% of chunks and
+  37.8% of rows. A controlled 12-chunk real A/B test (old prompt vs. a
+  variable-count + explicit-anti-reword prompt, reusing the exact
+  stored `source_chunk` text for `building_blocks.html` chunks 19/22 --
+  the cited examples -- plus 4 more chunks and 6 from the Circle
+  reference fixture, zero new fetches) cut pair count 56 -> 43 (-23%).
+  Per-chunk read of every reduction: 6 of 7 reduced chunks lost pure
+  restatement with no real content lost (one, `building_blocks#10`,
+  going from 4 near-identical rewordings of one fact down to a single
+  complete answer); one chunk (`building_blocks#22`) kept the same pair
+  count but reallocated toward a fact the old prompt had missed
+  entirely (play()/wait()) instead of two separately-worded pairs about
+  the same Scene-role fact -- better coverage, not just fewer pairs.
+  One chunk (`building_blocks#2`) showed a small, real loss: a pair
+  about whether plain `Mobject` is commonly used carried minor practical
+  framing beyond pure restatement. No prompt change applied to
+  production code -- this was the measurement, not the fix.
+- **2C (adjacent-chunk overlap)**: confirmed and traced precisely --
+  the cited `np.roll` question in `building_blocks.html` chunk 22 draws
+  from the tail of chunk 21's code example, present in chunk 22 only via
+  the 200-char parent overlap; chunk 21 already had 2 pairs about the
+  same code. Quantified directly (matched the real overlap substring
+  between every consecutive same-page chunk pair, checked what fraction
+  of each pair's answer is contained in that substring specifically):
+  **24 of 1144 pairs (2.1%) draw >=50% of their answer's distinctive
+  content from an overlap region.** `dataset_report.py`'s
+  `adjacent_chunk`-classified near-duplicates (a related but broader
+  measure -- two separate pairs from neighboring chunks resembling each
+  other, not necessarily both drawing from the shared text) sit at
+  300/2396 (12.5% of near-duplicates) -- same direction, same
+  conclusion: real, but roughly 15x smaller than 2B's same-chunk
+  padding by pair count.
+- **Decision: do not build split chunking (extraction skips overlap,
+  retrieval keeps it) -- evaluated, not implemented, per the explicit
+  ask.** At a measured 2.1% direct-overlap-pair rate, the fix's
+  benefit is small. The cost is real: a zero-overlap extraction chunker
+  reintroduces a smaller version of the exact boundary-truncation
+  problem step 8 Part A fixed (content straddling a chunk edge could go
+  fully unextracted on both sides, not just duplicated), plus a second
+  chunking config to keep in sync with the first indefinitely. **Chosen
+  direction instead: pair-level semantic dedup** (already flagged as
+  unbuilt in `ROADMAP.md` #23) -- it catches 2B's same-chunk padding
+  and 2C's overlap duplication in one mechanism, regardless of which
+  structural cause produced a given near-duplicate pair, without
+  touching the chunking architecture at all. Not built this step --
+  the decision is the direction, not an implementation.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->

@@ -320,16 +320,22 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     rate against this step's `per_chunk` baseline. **Size: S (mechanism
     exists; needs a measurement, not new code).**
 
-23. **No dedup for near-duplicate pairs from chunk-overlap boundaries or
-    same-chunk paraphrase padding.** Measured, not assumed
-    (`LESSONS_LEARNED.md` #26): ~27% of FastAPI's `per_chunk` pairs and
-    ~47% of Cloudflare's are near-duplicates by answer-text similarity,
-    from two distinct causes -- adjacent chunks re-covering the ~10%
-    overlap region, and the "3 to 5 diverse pairs" prompt instruction
-    padding with rephrasings when a chunk only supports one real fact.
-    `export_formats.py::dedup_by_question`'s exact-normalized-text dedup
-    catches neither, since every pair is a fresh generation with
-    different wording.
+23. **[Lower priority than #31 -- see there] No dedup for near-duplicate
+    pairs from chunk-overlap boundaries or same-chunk paraphrase
+    padding.** Measured, not assumed (`LESSONS_LEARNED.md` #26): ~27%
+    of FastAPI's `per_chunk` pairs and ~47% of Cloudflare's are
+    near-duplicates by answer-text similarity, from two distinct causes
+    -- adjacent chunks re-covering the ~10% overlap region, and the "3
+    to 5 diverse pairs" prompt instruction padding with rephrasings when
+    a chunk only supports one real fact. `export_formats.py::dedup_by_question`'s
+    exact-normalized-text dedup catches neither, since every pair is a
+    fresh generation with different wording. Re-measured on real
+    Part D data in step 8 Phase 2B/2C (`LESSONS_LEARNED.md` #33): 380
+    same-chunk near-duplicate pairs (52.7% of chunks affected) vs. only
+    24 pairs (2.1%) directly attributable to overlap -- same-chunk
+    padding is the far bigger of the two causes on real data,
+    confirming semantic dedup (catches both) over a chunking-overlap
+    change (catches only the smaller one).
     *Fix, not yet chosen*: options include semantic similarity dedup at
     export time (embed each question, cluster/threshold, keep one per
     cluster -- costs embed calls per row), a smaller `top_k`-per-page
@@ -454,6 +460,39 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     now-baked `section` field itself). The dataset card seems like the
     natural place to record seed prefixes if this fix is chosen. **Size:
     XS to remove the flag; S-M to make it real.**
+
+31. **[Ranked above #23 -- larger measured impact] Markdown link syntax
+    consumes ~44% of every chunk's character budget as pure URL/syntax
+    overhead, not content.** Measured across all 264 real chunks in the
+    Part D corpus (`LESSONS_LEARNED.md` #31): 46.7% of all chunk
+    characters sit inside `[text](url)` link syntax; only 2.9% of that
+    is the visible text a reader would see, so **43.8 percentage points
+    is pure overhead** -- consistent per-chunk (mean 45.6%, median
+    45.0%), not a few outliers, reaching 89.5% on the worst chunk (a
+    font-template table where every row is 8 characters of real symbol
+    name wrapped in ~230 characters of repeated URL and a duplicated
+    title attribute). This taxes everything that touches chunk text:
+    `MAX_EXTRACT_CHARS`/`MAX_EMBED_CHARS` truncation windows effectively
+    cover about half the real content their character counts suggest on
+    a reference-heavy site, and it's a real, previously-unquantified
+    contributor to the original pre-rebuild audit's 9,204-vectors-from-
+    30-pages figure -- more chunks were needed partly because each one
+    carried less actual content than its length implied. Ranked above
+    #23's near-duplicate work specifically because the measured impact
+    is larger and touches every chunk, not a redundancy subset of pairs.
+    *Fix, not yet chosen -- evaluate, don't guess, when this is picked
+    up*: crawl4ai's `DefaultMarkdownGenerator` may have options that
+    already address this (not checked); a post-conversion transform
+    reducing `[text](url "title")` to just its visible text, with URLs
+    either dropped entirely or collected into a per-chunk reference
+    list, is the other candidate shape. **The tradeoff to settle before
+    picking one**: on API reference pages specifically, the link target
+    often *is* information -- a method name links to its own canonical
+    URL, and stripping that wholesale could lose real signal on exactly
+    the pages that are densest with links, not just remove noise. Needs
+    real measurement of what's lost, not an assumption that all link
+    overhead is equally disposable. **Size: S-M once a direction is
+    chosen; the direction itself needs the tradeoff measured first.**
 
 ---
 
