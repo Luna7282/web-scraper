@@ -40,14 +40,31 @@ def make_fixture_fetcher(slug: str, report: dict):
 
 
 class TestRobotsCacheAgainstRealFixtures(unittest.IsolatedAsyncioTestCase):
-    async def test_docs_manim_community_disallows_root_for_everyone(self):
+    async def test_docs_manim_community_allow_overrides_the_blanket_disallow(self):
+        """The real robots.txt is:
+            Disallow: /
+            Allow: /en/stable/
+        The correct answer per RFC 9309 (longest matching pattern wins,
+        regardless of file order) is that /en/stable/* IS allowed --
+        it's the one version of the docs this site's owner explicitly
+        wants crawled. This test previously asserted the opposite
+        (disallowed) and passed, because it was checking stdlib
+        urllib.robotparser's behavior, which resolves rules in file
+        order (first match wins) rather than by specificity -- a real
+        bug caught only once a live crawl against this exact site
+        exercised the path, not by this fixture-based suite. See
+        LESSONS_LEARNED.md for the incident."""
         report = json.loads((FIXTURES_DIR / "docs_manim_community.json").read_text())
         cache = RobotsCache(make_fixture_fetcher("docs_manim_community", report))
         policy = await cache.get_policy("docs.manim.community")
         self.assertTrue(policy.robots_found)
-        # Real robots.txt: "Disallow: /" for User-agent: * -- everything
-        # blocked except whatever's explicitly allowed underneath it.
-        self.assertFalse(policy.is_allowed("https://docs.manim.community/en/stable/"))
+        self.assertTrue(policy.is_allowed("https://docs.manim.community/en/stable/"))
+        self.assertTrue(policy.is_allowed("https://docs.manim.community/en/stable/reference/manim.mobject.geometry.arc.Circle.html"))
+        # Everything NOT under the explicitly-allowed /en/stable/ prefix
+        # is still blocked by the blanket Disallow: / -- the override is
+        # specific to that one path, not a general "allow everything".
+        self.assertFalse(policy.is_allowed("https://docs.manim.community/en/latest/"))
+        self.assertFalse(policy.is_allowed("https://docs.manim.community/"))
 
     async def test_stackblitz_missing_robots_txt_defaults_allowed(self):
         # Genuine 404, not a synthetic one -- confirms the real miss path.
@@ -82,10 +99,10 @@ class TestRobotsCacheAgainstRealFixtures(unittest.IsolatedAsyncioTestCase):
 
     async def test_crawl_delay_present_in_none_of_the_five_but_would_be_silently_ignored(self):
         # None of the 5 sites specify Crawl-delay, so this can't be proven
-        # against real data -- but confirmed directly against
-        # RobotFileParser (see LESSONS_LEARNED.md): it parses Crawl-delay
-        # fine, HostPolicy just never reads it. Documented as a real gap,
-        # not fabricated evidence against sites that don't exercise it.
+        # against real data -- _parse_rules() only ever collects allow/
+        # disallow directives, so Crawl-delay is silently dropped
+        # regardless. Documented as a real gap, not fabricated evidence
+        # against sites that don't exercise it.
         for slug in SLUGS:
             report = json.loads((FIXTURES_DIR / f"{slug}.json").read_text())
             self.assertIsNone(report.get("crawl_delay"))

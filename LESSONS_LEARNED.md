@@ -1029,4 +1029,86 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-18 — Step 8 Part D kickoff: robots.txt Allow-override bug caught by the first real crawl against its own test site
+
+### 27. stdlib urllib.robotparser resolves Allow/Disallow by file order, not specificity -- a step-5 test asserted the wrong answer and passed
+- **Problem**: firing Part D's real crawl against `docs.manim.community/en/stable/`
+  (deliberately chosen so the new pipeline's output would be comparable
+  to the pre-rebuild audit) produced 469 `robots_disallowed` failures
+  out of ~500 discovered URLs within the first few seconds -- almost the
+  entire site, including the exact `/en/stable/` pages the crawl was
+  supposed to fetch. `robots_disallowed` is permanent
+  (`mark_permanently_failed`, no retry by design, `LESSONS_LEARNED.md`
+  step-5 entries) -- every one of those rows was unrecoverable in that
+  frontier.db. Caught immediately because 2 `done` vs. 469 `failed`
+  after a few seconds was an obviously wrong ratio, not left to run to
+  completion.
+- **Root cause**: `docs.manim.community`'s real `robots.txt` is
+  ```
+  User-agent: *
+  Disallow: /
+  Allow: /en/stable/
+  ```
+  -- intentionally blocking every other doc version while explicitly
+  allowing the current stable one. Per RFC 9309 (and every major real
+  crawler), the *longest matching pattern wins*, regardless of which
+  line appears first -- so `/en/stable/*` should resolve to allowed.
+  stdlib `urllib.robotparser.RobotFileParser.can_fetch()` does not
+  implement this: confirmed by direct reproduction
+  (`parser.can_fetch('*', '.../en/stable/')` returns `False`) that it
+  resolves rules in **file order** -- the blanket `Disallow: /` is
+  checked first, matches every path, and returns before the more
+  specific `Allow: /en/stable/` line is ever considered.
+- **This bug was already visible in step 5's own fixture data and
+  missed anyway**: `tests/fixtures/robots/docs_manim_community.json`
+  (fetched during step 5) already recorded
+  `"disallows_root_for_star": true` for this exact site. The dedicated
+  test, `test_docs_manim_community_disallows_root_for_everyone`, even
+  had a comment reading "everything blocked except whatever's explicitly
+  allowed underneath it" -- correctly describing the semantics -- and
+  then asserted `assertFalse(policy.is_allowed(".../en/stable/"))`,
+  the literal opposite of what its own comment said, checking the one
+  URL that was supposed to be allowed. The test passed because
+  robotparser's buggy behavior happened to agree with the wrong
+  assertion. Nobody re-read the assertion against the comment it sat
+  next to, and the fixture-based test suite recorded the robots.txt's
+  *shape* but never actually exercised the one path that mattered until
+  a live crawl against this exact site did.
+- **Fix**: `robots_cache.py` no longer delegates to
+  `urllib.robotparser` at all -- `_parse_rules()`/`_is_path_allowed()`
+  are a from-scratch implementation of RFC 9309's group-selection and
+  longest-match-wins resolution (wildcard `*` and end-anchor `$`
+  supported; an equal-length Allow/Disallow tie resolves to Allow, the
+  less restrictive rule, per spec). `HostPolicy.is_allowed()` dropped
+  its now-vestigial per-call `user_agent` parameter in the same change
+  -- rule-group selection already happens once at `get_policy()` time
+  against `RobotsCache`'s configured agent, so a parameter that looked
+  like it selected a group per call but silently didn't would be a
+  worse API than removing it. Verified against the real live
+  `docs.manim.community/robots.txt` directly (not just the cached
+  fixture): `/en/stable/` and a real reference page under it now
+  resolve `True`; `/en/latest/` and bare `/` still correctly resolve
+  `False` -- the override is specific to the one allowed prefix, not a
+  blanket allow.
+- **The wrong test was rewritten, not deleted**, with the real failure
+  mode as its docstring, plus new dedicated unit tests in
+  `tests/test_robots_cache.py` for: order-reversed Allow/Disallow (same
+  outcome either way, proving it's resolved by specificity and not "last
+  line wins," which would have coincidentally fixed the original case
+  for the wrong reason), wildcard/end-anchor patterns, an equal-length
+  tie, and named-user-agent-group preference over `*`.
+- **Why it matters**: this is exactly the failure mode "verify, don't
+  assume" exists to catch, and it slipped through anyway because the
+  verification itself (the fixture test) asserted the wrong ground
+  truth with a comment that contradicted its own assertion sitting right
+  next to it. A fixture capturing a site's robots.txt *shape*
+  (`disallows_root_for_star: true`) is not the same as verifying the
+  crawler's *decision* on the specific paths it will actually request --
+  the gap between those two is exactly where this bug lived,
+  undetected, since step 5. Any future robots.txt test should assert
+  the decision for the real paths the crawler will hit, not just record
+  what the file looks like.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->

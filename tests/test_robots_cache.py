@@ -67,6 +67,57 @@ class TestRobotsCache(unittest.IsolatedAsyncioTestCase):
         cache = RobotsCache(make_stub({}))
         self.assertTrue(cache.is_allowed("never-checked.com", "https://never-checked.com/x"))
 
+    async def test_more_specific_allow_overrides_a_blanket_disallow_regardless_of_order(self):
+        """The exact real-world case this module was rewritten for: a
+        blanket Disallow: / listed BEFORE a more specific Allow -- the
+        more specific rule must win regardless of which line appears
+        first. stdlib urllib.robotparser gets this wrong (file-order,
+        first-match-wins); this is the regression that fix is for."""
+        cache = RobotsCache(make_stub({
+            "https://x.com/robots.txt": "User-agent: *\nDisallow: /\nAllow: /docs/stable/\n",
+        }))
+        policy = await cache.get_policy("x.com")
+        self.assertTrue(policy.is_allowed("https://x.com/docs/stable/page.html"))
+        self.assertFalse(policy.is_allowed("https://x.com/docs/old/page.html"))
+        self.assertFalse(policy.is_allowed("https://x.com/"))
+
+    async def test_disallow_listed_after_a_more_specific_allow_does_not_override_it(self):
+        """Same precedence rule, reversed file order -- confirms the
+        resolution is genuinely by specificity, not just "later line
+        wins" (which would coincidentally fix the case above but for
+        the wrong reason)."""
+        cache = RobotsCache(make_stub({
+            "https://x.com/robots.txt": "User-agent: *\nAllow: /docs/stable/\nDisallow: /\n",
+        }))
+        policy = await cache.get_policy("x.com")
+        self.assertTrue(policy.is_allowed("https://x.com/docs/stable/page.html"))
+
+    async def test_wildcard_and_end_anchor_patterns(self):
+        cache = RobotsCache(make_stub({
+            "https://x.com/robots.txt": "User-agent: *\nDisallow: /*.pdf$\nAllow: /docs/*\n",
+        }))
+        policy = await cache.get_policy("x.com")
+        self.assertFalse(policy.is_allowed("https://x.com/report.pdf"))
+        self.assertTrue(policy.is_allowed("https://x.com/report.pdf.html"))  # '$' anchors end, not just a substring match
+        self.assertTrue(policy.is_allowed("https://x.com/docs/anything"))
+
+    async def test_equal_length_tie_resolves_to_allow(self):
+        cache = RobotsCache(make_stub({
+            "https://x.com/robots.txt": "User-agent: *\nDisallow: /x/\nAllow: /x/\n",
+        }))
+        policy = await cache.get_policy("x.com")
+        self.assertTrue(policy.is_allowed("https://x.com/x/"))
+
+    async def test_named_user_agent_group_preferred_over_star(self):
+        cache = RobotsCache(make_stub({
+            "https://x.com/robots.txt": (
+                "User-agent: *\nDisallow: /\n\n"
+                "User-agent: scraper\nAllow: /\n"
+            ),
+        }), user_agent="scraper")
+        policy = await cache.get_policy("x.com")
+        self.assertTrue(policy.is_allowed("https://x.com/anything"))
+
 
 if __name__ == "__main__":
     unittest.main()
