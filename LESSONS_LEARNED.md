@@ -865,4 +865,81 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-18 — Step 7 close-out: cross-site extraction check before step 8
+
+### 25. The Q&A extraction prompt held up on 3 new site shapes, with one real gap left unexercised
+- **Why this check happened**: step 4's extraction validation (`LESSONS_LEARNED.md`
+  #11) only ever ran on 2 pages, both Sphinx-generated Python docs from the
+  same site (manim). That's the component producing the actual training
+  data, it fails quietly (bad output looks plausible, no exception), and it
+  had never been run against a fundamentally different site shape. Checked
+  before step 8's real end-to-end run, not after.
+- **Method**: 4 real calls, same prompt (`extraction.py::QA_EXTRACTION_SYSTEM_PROMPT`,
+  byte-identical to step 4's) and same model (Ollama cloud, `deepseek-v4-flash`)
+  as step 4 — site was the only variable. Ran the actual production
+  extraction call shape (`main.py::_make_extract_fn` + `extraction.py::parse_qa_json`),
+  not a resurrected copy of the retired `output_manager.py`. Sites: FastAPI's
+  docs homepage (cached fixture, 24,528 stripped chars — substantial, not
+  thin); a real Cloudflare blog article fetched for this check
+  (`good-and-bad-agentic-behaviors/`, 15,914 stripped chars — the cached
+  root fixture is a listing page, not a single article, so it couldn't
+  have stood in for "prose" content); a real StackBlitz docs page fetched
+  for this check (`developer.stackblitz.com/guides/user-guide/what-is-stackblitz`,
+  6,721 stripped chars — the cached `stackblitz.com` root is a thin
+  marketing page with no in-domain article of its own); and
+  `www.manim.community`'s cached root as-is (5,369 stripped chars),
+  deliberately kept as the thin-marketing-page case since step 6
+  (`LESSONS_LEARNED.md` #17) already flagged this exact page as
+  outranking real docs content for one intent — worth stress-testing here
+  too, not swapped away. Both newly-fetched pages cached permanently under
+  `tests/fixtures/`.
+- **Result — no parse failures, no nav/chrome questions, no hallucination
+  found on any of the 4 sites.** All 4 calls returned valid JSON on the
+  first parse (no salvage path needed). Zero questions referencing
+  navigation/menu structure on any site — the original `LESSONS_LEARNED.md`
+  #4 failure mode did not reproduce outside the manim case that originally
+  surfaced it. Spot-checked the two highest-risk-looking pairs against
+  actual source text: FastAPI's "200% to 300% faster / 40% fewer bugs"
+  claim and Manim's `SquareToCircle` code example (rotation angle, fill
+  color/opacity, method call order) both matched the source verbatim —
+  no invented structure in this sample.
+- **The anticipated "vague prose" risk didn't materialize either, on this
+  one sample.** Cloudflare's 5 pairs are specific and directly grounded
+  in the article's own framing (Risk vs. Trust, the doorbell analogy,
+  "hybrid" bot/human traffic) — not vaguer or lower-quality than the
+  reference-page pairs. **Stated as a limit, not a conclusion**: this is
+  one prose article, once — it doesn't prove prose sites are safe in
+  general, only that this specific sample didn't trigger the concern.
+- **Real gap, left open rather than papered over**: none of the 4 pages
+  selected for this check lack markdown headings after stripping (checked
+  before running any LLM call) — including the deliberately-thin
+  `www.manim.community` root. So the "does extraction degrade on a page
+  with no headings" question (motivated by `score_headings`'s no-headings
+  fallback bug in `LESSONS_LEARNED.md` #17) remains **untested for the
+  Q&A extraction path specifically** — #17's finding was against the
+  relevance-scoring path, a different function entirely
+  (`score_whole_page`'s fallback), not `_make_extract_fn`/`parse_qa_json`.
+  A genuinely heading-less real page still needs to be run through
+  extraction before this case is closed. See `ROADMAP.md`.
+- **One real, un-asked-for finding**: FastAPI's pairs include an accurate
+  (verified against source, not hallucinated) but low-value question
+  about the page's sponsor list. Not a chrome-stripping or prompt defect
+  — it's the 4000-char truncation window (`LESSONS_LEARNED.md` #10's
+  established limit) landing on the page's sponsor-badge section, which
+  happens to sit early in FastAPI's homepage markup, before the page's
+  actual technical content further down. A page whose real content is
+  front-loaded *after* low-value boilerplate will produce technically
+  correct but low-value pairs regardless of how well chrome-stripping and
+  the prompt otherwise perform — a distinct failure mode from both "nav
+  junk" and "vague prose," worth naming separately. See `ROADMAP.md`.
+- **Per instruction, the prompt was not touched in this step** — all 4
+  sites produced usable output as-is, and retuning against 4 samples of
+  one call each would risk overfitting in a new direction rather than
+  fixing a demonstrated problem. The one real gap (no-headings case) and
+  the one real finding (truncation-window content ordering) are recorded
+  here and in `ROADMAP.md` for a future, evidence-driven fix — not fixed
+  now.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->

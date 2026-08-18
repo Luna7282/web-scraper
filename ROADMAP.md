@@ -279,6 +279,39 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     *Fix*: either document this as the intentional target schema, or add a
     converter step. **Size: XS–S.**
 
+20. **Q&A extraction on a real page with zero markdown headings is
+    untested.** Step 7's cross-site extraction check (`LESSONS_LEARNED.md`
+    #25) deliberately covered 3 new site shapes plus a thin marketing page,
+    but all 4 happened to have real headings after chrome-stripping — the
+    no-headings case is a different, still-open question for the *Q&A
+    extraction* path specifically (`score_headings`' no-headings fallback,
+    `LESSONS_LEARNED.md` #17, is a separate function, `score_whole_page`,
+    not `_make_extract_fn`/`parse_qa_json`).
+    *Fix*: find or fetch one real page with no markdown headings after
+    stripping (a single-paragraph landing page, a FAQ page rendered as
+    plain prose, etc.), run it through the real extraction path, and
+    record the result — don't retune the prompt speculatively before
+    seeing an actual failure. **Size: XS (mostly finding a fixture).**
+
+21. **4000-char truncation can land the extraction window on low-value
+    content when a page front-loads boilerplate before its real content.**
+    Confirmed on `fastapi.tiangolo.com`'s homepage (`LESSONS_LEARNED.md`
+    #25): the sponsor-badge section sits within the first 4000 stripped
+    characters, ahead of the page's actual technical content, so one of
+    5 extracted pairs is an accurate but low-value "who are the sponsors"
+    Q&A. Not a chrome-stripping or prompt defect — chrome-stripping
+    correctly left real (non-nav) content in place; the truncation window
+    just happened to end before the more valuable content began.
+    *Fix, not yet chosen*: options include chunking the page for
+    extraction instead of a single truncated call (more LLM calls per
+    page), raising `MAX_EMBED_CHARS`-style truncation for extraction
+    specifically (cost tradeoff, needs its own measurement per
+    `LESSONS_LEARNED.md` #10's established token-inefficiency of
+    markdown), or leaving it as an accepted low-value-pair-rate cost of
+    truncation. Needs a broader sample before picking one — this is one
+    confirmed instance, not yet a measured rate. **Size: S–M once a
+    direction is picked.**
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
