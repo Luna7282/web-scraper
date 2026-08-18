@@ -132,13 +132,9 @@ passes `content/chrome_strip.py`'s `DEFAULT_EXCLUDED_TAGS`/
 `DEFAULT_EXCLUDED_SELECTOR` into the real `CrawlerRunConfig` (crawl4ai's
 own HTML-cleaning stage) and applies `strip_text_patterns()` to the
 resulting markdown before it ever reaches extraction or Chroma chunking.
-**This was not true until step 8 Part D** — `content/chrome_strip.py` existed and
-was validated since step 4, but nothing in the production path ever
-called it; every earlier "chrome-stripping validated" claim was against a
-standalone script calling `strip_chrome()` directly, never against
-`main.py` itself. See `LESSONS_LEARNED.md` #28 before assuming a
-component that's tested in isolation is therefore wired in — verify the
-call site, not just the function.
+**This was not true until step 8 Part D** — see `LESSONS_LEARNED.md` #28
+before assuming a component that's tested in isolation is therefore
+wired into `main.py` — verify the call site, not just the function.
 
 **Retrieval**: `uv run python main.py --query "<question>"` embeds the
 question, searches child chunks in the existing Chroma collection, and
@@ -157,13 +153,12 @@ and changing it are separate decisions).
 hashes normalized chunk text alone (whitespace-collapsed, lowercased,
 trailing-punctuation-stripped — see `normalize_chunk_text()`), so the same
 text repeated across pages collides to one Chroma id and its `sources`
-metadata grows as a list instead of duplicating the vector. Verified
-against real cross-page duplicates in `archive/pre-rebuild/chroma_db/`
-and against two freshly-fetched real pages — see `LESSONS_LEARNED.md`
-#19/#23. **Use `ChunkStore.add_or_merge_chunk()` for every chunk write,
-never `collection.add()`/`upsert()` directly** — `add()` silently no-ops
-on a duplicate id (drops the new source), and `upsert()` replaces
-metadata wholesale instead of merging the `sources` list; only
+metadata grows as a list instead of duplicating the vector — verified
+against real cross-page duplicates, see `LESSONS_LEARNED.md` #19/#23.
+**Use `ChunkStore.add_or_merge_chunk()` for every chunk write, never
+`collection.add()`/`upsert()` directly** — `add()` silently no-ops on a
+duplicate id (drops the new source), and `upsert()` replaces metadata
+wholesale instead of merging the `sources` list; only
 `add_or_merge_chunk()`'s get-then-update path preserves prior sources
 (`LESSONS_LEARNED.md` #20).
 
@@ -182,12 +177,8 @@ loops over — one LLM call per parent-sized chunk instead of one call over
 `TOP_K_CHUNKS_BY_RELEVANCE` (embeds chunks, keeps only the most
 intent-relevant — falls back to `PER_CHUNK` with no intent set) are also
 available. **This fixes reachability only, not relevance or redundancy**
-— confirmed on a real re-run (`LESSONS_LEARNED.md` #26): 84% of the extra
-pairs were content the old truncated call could never reach, but
-low-value pairs (e.g. sponsor lists) multiplied rather than disappeared,
-and ~27-47% of pairs measured as near-duplicates from chunk-overlap
-boundaries or same-chunk paraphrase padding. See `ROADMAP.md` #22/#23 —
-neither is fixed yet.
+— see `LESSONS_LEARNED.md` #26 for the measured numbers and
+`ROADMAP.md` #22/#23 for what's still open.
 
 **The canonical record (`storage/canonical.py`) is the only file `Writer` ever
 writes, and it is never a training file directly**: one row per Q&A pair
@@ -195,9 +186,7 @@ writes, and it is never a training file directly**: one row per Q&A pair
 non-negotiable, every downstream projection needs it), source_url,
 section, page_title, generation_model, extraction_strategy, timestamp,
 crawl_date, license_signal (best-effort text-pattern match, not a legal
-determination). `data/run/canonical.jsonl` replaces the old `unified.jsonl`
-name — the schema changed, and no live crawl had produced real data
-under the old name yet, so no migration was needed.
+determination).
 
 **Export is a separate CLI, over the canonical file, never re-crawling**:
 `uv run python -m export.export data/run/canonical.jsonl --schema alpaca
@@ -237,12 +226,11 @@ reused, not reimplemented) and row count.
 
 **Relevance scoring uses `score_headings`, not the intuitive default
 (max-over-chunks)** — chosen from a real measurement, not assumed. See
-`LESSONS_LEARNED.md` #17 before changing this: `whole_page` and
-`max_chunk` both ranked a marketing page above the actual best-matching
-API reference page for a real test intent; `headings` was the only one of
-three candidates that got the ranking right, and it's also the cheapest
-(1 embed call/page vs. `max_chunk`'s 5-13). Caveat carried forward: one
-intent/one known-correct-page validation, not a robust multi-query proof.
+`LESSONS_LEARNED.md` #17 before changing this: it's the only one of three
+candidates that ranked a real API reference page above a marketing page
+for a real test intent, and it's also the cheapest. Caveat carried
+forward: one intent/one known-correct-page validation, not a robust
+multi-query proof.
 
 ## Provider routing — one hard invariant
 
@@ -262,12 +250,11 @@ path against it. For *chat*, it's routed through `ChatOpenAI` at
 native `/api/chat` protocol is documented for cloud) but **confirmed
 working in practice** via a real end-to-end call with `deepseek-v4-flash`
 (`LESSONS_LEARNED.md` #10-11). If it 401s in a future session, check the
-loaded env var before suspecting the endpoint — that's what actually
-went wrong the first time (a corrupted `.env` line shadowing the real
-key on case-insensitive Windows env vars), not the URL. Local Ollama
-chat has no such doubt either way — only cloud's OpenAI-compat path was
-ever in question. Local embeddings staying off the
-OpenAI-compat wrapper remains the one hard, confirmed invariant above.
+loaded env var before suspecting the endpoint (`LESSONS_LEARNED.md` #10
+has the exact prior incident). Local Ollama chat has no such doubt either
+way — only cloud's OpenAI-compat path was ever in question. Local
+embeddings staying off the OpenAI-compat wrapper remains the one hard,
+confirmed invariant above.
 
 ## Queue architecture invariants
 
