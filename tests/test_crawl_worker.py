@@ -13,10 +13,12 @@ tests frontier.py's mechanism in isolation rather than contriving a
 crawl_worker setup to reach it indirectly.
 """
 import asyncio
+import time
 import unittest
 
 from crawl.frontier import Frontier
 from crawl.pipeline import crawl_worker, FetchTimeout, FetchHTTPError
+from crawl.politeness import HostPoliteness
 
 
 SEED = "https://x.test/a"
@@ -164,6 +166,44 @@ class TestCrawlWorkerFailureModes(unittest.IsolatedAsyncioTestCase):
         urls = await self.frontier.get_all_urls()
         self.assertIn("https://x.test/in-scope", urls)
         self.assertNotIn("https://other.test/off-scope", urls)  # never inserted at all
+
+    async def test_politeness_spaces_out_successive_fetches_to_the_same_host(self):
+        # Real regression the chrome_strip wiring gap (LESSONS_LEARNED.md
+        # #28) established a pattern for: prove the dependency is actually
+        # invoked through the real crawl_worker call site, not just that
+        # HostPoliteness itself works in isolation (tests/test_politeness.py).
+        frontier = Frontier(":memory:")
+        await frontier.open()
+        await frontier.seed([("https://x.test/a", None), ("https://x.test/b", None)])
+        content_queue = asyncio.Queue(maxsize=4)
+        fetch_times = []
+
+        async def fetch_fn(url):
+            fetch_times.append(time.monotonic())
+            return "<html></html>", []
+
+        async def drain():
+            while True:
+                url, _content = await content_queue.get()
+                await frontier.mark_written(url)
+                await frontier.content_done(content_queue)
+
+        drain_task = asyncio.create_task(drain())
+        delay = 0.15
+        politeness = HostPoliteness(max_concurrent_per_host=5, default_delay_seconds=delay)
+        task = asyncio.create_task(
+            crawl_worker(frontier, fetch_fn, content_queue, lambda u: True, politeness=politeness, poll_interval=0.01)
+        )
+        await run_to_quiescence(task, frontier)
+        drain_task.cancel()
+        try:
+            await drain_task
+        except asyncio.CancelledError:
+            pass
+        await frontier.close()
+
+        self.assertEqual(len(fetch_times), 2)
+        self.assertGreaterEqual(fetch_times[1] - fetch_times[0], delay * 0.9)
 
 
 if __name__ == "__main__":

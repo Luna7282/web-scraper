@@ -9,6 +9,16 @@ load_dotenv()
 MAX_RETRIES = 3
 FOLLOW_GATE_EXEMPT_DEPTH = 0  # seed's own children always promote regardless of score
 
+# Per-host politeness (crawl/politeness.py, ROADMAP.md #9). A capped
+# small-page run against one host never surfaces the lack of this; a
+# larger run against a single host would. MAX_CONCURRENT_REQUESTS_PER_HOST
+# caps concurrent in-flight requests regardless of total worker count;
+# DEFAULT_POLITENESS_DELAY_SECONDS is the minimum spacing between
+# successive requests to a host that specifies no Crawl-delay of its own
+# in robots.txt (a site's own Crawl-delay always overrides this default).
+MAX_CONCURRENT_REQUESTS_PER_HOST = 2
+DEFAULT_POLITENESS_DELAY_SECONDS = 0.5
+
 # Parent/child chunking (chunk_store.py). Values are the same ones the old
 # pipeline used via library defaults -- made explicit here, not retuned.
 # CHILD_CHUNK_OVERLAP == half of CHILD_CHUNK_SIZE is the measured, documented

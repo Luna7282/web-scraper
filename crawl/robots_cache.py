@@ -52,12 +52,16 @@ def _pattern_to_regex(pattern: str) -> re.Pattern:
     return re.compile("^" + escaped)
 
 
-def _parse_rules(text: str, user_agent: str) -> list[_Rule]:
+def _parse_rules(text: str, user_agent: str) -> tuple[list[_Rule], float | None]:
     """RFC 9309 group selection: an exact user-agent match wins over the
     '*' group; consecutive User-agent lines with no directive between
     them belong to the same group (a robots.txt convention -- one rule
-    set applying to multiple named agents)."""
+    set applying to multiple named agents). Crawl-delay (a widely
+    supported extension, not part of RFC 9309 itself) is collected
+    per-group the same way Allow/Disallow are -- previously dropped
+    entirely, since nothing read it (ROADMAP.md #9)."""
     groups: dict[str, list[_Rule]] = {}
+    crawl_delays: dict[str, float] = {}
     current_agents: list[str] = []
     group_open = False  # true while still accepting more User-agent lines into current_agents
 
@@ -80,13 +84,21 @@ def _parse_rules(text: str, user_agent: str) -> list[_Rule]:
                 continue  # an empty Disallow value means "allow everything" by convention
             for agent in current_agents:
                 groups[agent].append(_Rule(directive=key, pattern=value))
+        elif key == "crawl-delay" and current_agents:
+            group_open = False
+            try:
+                delay = float(value)
+            except ValueError:
+                continue  # malformed value -- ignore rather than crash the whole parse
+            for agent in current_agents:
+                crawl_delays[agent] = delay
 
     ua = user_agent.lower()
     if ua in groups:
-        return groups[ua]
+        return groups[ua], crawl_delays.get(ua)
     if "*" in groups:
-        return groups["*"]
-    return []
+        return groups["*"], crawl_delays.get("*")
+    return [], None
 
 
 def _is_path_allowed(rules: list[_Rule], path: str) -> bool:
@@ -110,6 +122,7 @@ class HostPolicy:
     sitemap_urls: list[str] = field(default_factory=list)
     llms_txt_found: bool = False
     llms_txt: str | None = None
+    crawl_delay: float | None = None  # from robots.txt, if the site specifies one -- see crawl/politeness.py
 
     def is_allowed(self, url: str) -> bool:
         """No per-call user_agent parameter -- unlike stdlib robotparser's
@@ -149,7 +162,7 @@ class RobotsCache:
         robots_text = await self._fetch_text(f"{base}/robots.txt")
         if robots_text is not None:
             policy.robots_found = True
-            policy._rules = _parse_rules(robots_text, self._user_agent)
+            policy._rules, policy.crawl_delay = _parse_rules(robots_text, self._user_agent)
             for line in robots_text.splitlines():
                 if line.strip().lower().startswith("sitemap:"):
                     policy.sitemap_urls.append(line.split(":", 1)[1].strip())

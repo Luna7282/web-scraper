@@ -33,6 +33,35 @@ class TestRobotsCache(unittest.IsolatedAsyncioTestCase):
         policy = await cache.get_policy("x.com")
         self.assertIn("https://x.com/custom-sitemap.xml", policy.sitemap_urls)
 
+    async def test_crawl_delay_captured(self):
+        cache = RobotsCache(make_stub({
+            "https://x.com/robots.txt": "User-agent: *\nCrawl-delay: 3\nDisallow: /private/\n",
+        }))
+        policy = await cache.get_policy("x.com")
+        self.assertEqual(policy.crawl_delay, 3.0)
+
+    async def test_no_crawl_delay_specified_defaults_none(self):
+        cache = RobotsCache(make_stub({
+            "https://x.com/robots.txt": "User-agent: *\nDisallow: /private/\n",
+        }))
+        policy = await cache.get_policy("x.com")
+        self.assertIsNone(policy.crawl_delay)
+
+    async def test_crawl_delay_scoped_to_named_agent_not_leaked_to_star(self):
+        cache = RobotsCache(make_stub({
+            "https://x.com/robots.txt": "User-agent: SomeOtherBot\nCrawl-delay: 10\n\nUser-agent: *\nDisallow: /\n",
+        }), user_agent="*")
+        policy = await cache.get_policy("x.com")
+        self.assertIsNone(policy.crawl_delay)
+
+    async def test_malformed_crawl_delay_value_ignored_not_fatal(self):
+        cache = RobotsCache(make_stub({
+            "https://x.com/robots.txt": "User-agent: *\nCrawl-delay: not-a-number\nDisallow: /private/\n",
+        }))
+        policy = await cache.get_policy("x.com")
+        self.assertIsNone(policy.crawl_delay)
+        self.assertFalse(policy.is_allowed("https://x.com/private/x"))  # rest of the file still parses
+
     async def test_conventional_sitemap_checked_even_when_robots_declares_another(self):
         cache = RobotsCache(make_stub({
             "https://x.com/robots.txt": "Sitemap: https://x.com/custom.xml\n",

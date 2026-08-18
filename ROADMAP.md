@@ -114,9 +114,10 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
    mismatch. Includes dimensionality alongside the model name as asked
    — see `LESSONS_LEARNED.md` #21.
 
-9. **[Partially resolved, step 5; Allow/Disallow precedence fixed step 8
-   Part D] robots.txt is now respected, and correctly for Allow-overrides-
-   Disallow; per-host rate limiting/politeness delay is still missing.**
+9. **[RESOLVED -- step 5 (robots.txt respected), Allow/Disallow precedence
+   fixed step 8 Part D, per-host politeness added Phase 3 Step 5]
+   robots.txt is respected with correct Allow-overrides-Disallow
+   precedence; per-host concurrency and Crawl-delay are now enforced too.**
    `robots_cache.py` + `crawl_worker`'s pre-fetch check (`pipeline.py`)
    now refuse a disallowed URL outright (`mark_permanently_failed`, no
    retry, logged loudly) — this applies uniformly, including to a branch
@@ -128,20 +129,25 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
    blanket `Disallow: /` plus a more specific `Allow:` for the one
    version they want crawled (`docs.manim.community`'s real robots.txt
    is exactly this shape) — see `LESSONS_LEARNED.md` #27.
-   What's still missing: crawl_worker has no per-host concurrency
-   semaphore or inter-request delay at all — N crawl workers still hit a
-   single host as fast as they can claim work, with nothing throttling
-   concurrent requests to the *same* host specifically (the original gap
-   this item described). Confirmed against real data from the 5 fixture
-   sites (`tests/fixtures/robots/`): none of the 5 specify `Crawl-delay`,
-   so this hasn't bitten anything yet, and `_parse_rules()` doesn't even
-   collect it (only allow/disallow directives) — if a real target site
-   specifies one, it's silently dropped right now. *Fix*: add a per-host
-   `asyncio.Semaphore` (concurrency cap) and honor `Crawl-delay` as a
-   minimum inter-request spacing per host in `crawl_worker` — needs
-   `_parse_rules()` extended to also collect a `Crawl-delay` value per
-   group, since the stdlib parser this used to lean on for that is gone.
-   **Size: S–M.**
+   Was missing until Phase 3 Step 5: `crawl_worker` had no per-host
+   concurrency semaphore or inter-request delay at all — N crawl workers
+   would hit a single host as fast as they could claim work, with
+   nothing throttling concurrent requests to the *same* host
+   specifically. Confirmed against real data from the 5 fixture sites
+   (`tests/fixtures/robots/`) that this hadn't bitten anything yet (none
+   specify `Crawl-delay`), which is exactly why it was still open rather
+   than a proven-safe gap. *Fix, built*: `crawl/politeness.py::HostPoliteness`
+   — a per-host `asyncio.Semaphore` (default cap 2,
+   `config.MAX_CONCURRENT_REQUESTS_PER_HOST`) plus a per-host minimum
+   spacing between successive request starts
+   (`config.DEFAULT_POLITENESS_DELAY_SECONDS`, default 0.5s), overridden
+   by a site's own `Crawl-delay` when robots.txt specifies one.
+   `robots_cache.py::_parse_rules()` now collects `Crawl-delay` per
+   user-agent group the same way Allow/Disallow are collected — it was
+   previously silently dropped, not just unused. One shared
+   `HostPoliteness` instance is passed to every `crawl_worker` task from
+   `main.py` (per-host state has to be shared across workers to mean
+   anything). See `LESSONS_LEARNED.md` #38.
 
 9a. **Sitemap discovery doesn't follow a `sitemapindex`.** Confirmed
     against real data: `blog.cloudflare.com/sitemap.xml` is a

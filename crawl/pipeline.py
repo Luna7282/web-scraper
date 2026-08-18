@@ -8,6 +8,7 @@ tests/test_crawl_worker.py, tests/test_extract_worker.py.
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
@@ -16,6 +17,7 @@ from storage.canonical import build_canonical_record, detect_license_signal, ext
 from config import MAX_RETRIES
 from content.extraction import MalformedExtractionError, parse_qa_json
 from crawl.frontier import Frontier, FrontierRow
+from crawl.politeness import HostPoliteness
 from crawl.robots_cache import RobotsCache
 from crawl.scope import normalize_url
 from content.sectioning import DEFAULT_SECTION_DEPTH, derive_section
@@ -60,6 +62,7 @@ async def crawl_worker(
     content_queue: asyncio.Queue,
     scope_check: ScopeCheck,
     robots_cache: RobotsCache | None = None,
+    politeness: HostPoliteness | None = None,
     poll_interval: float = POLL_INTERVAL,
 ) -> None:
     while True:
@@ -70,6 +73,7 @@ async def crawl_worker(
             await asyncio.sleep(poll_interval)
             continue
 
+        policy = None
         if robots_cache is not None:
             policy = await robots_cache.get_policy(row.host)
             if not policy.is_allowed(row.url):
@@ -77,8 +81,18 @@ async def crawl_worker(
                 await frontier.mark_permanently_failed(row.url, "robots_disallowed")
                 continue
 
+        # One shared HostPoliteness instance across every crawl_worker task
+        # (see crawl/politeness.py) -- caps concurrent requests to this
+        # host and enforces the site's own Crawl-delay if it specified
+        # one, else this project's default spacing. nullcontext() when no
+        # politeness instance was configured -- same optional-dependency
+        # pattern as robots_cache above.
+        crawl_delay = policy.crawl_delay if policy is not None else None
+        gate = politeness.hold(row.host, crawl_delay) if politeness is not None else nullcontext()
+
         try:
-            html, raw_hrefs = await fetch_fn(row.url)
+            async with gate:
+                html, raw_hrefs = await fetch_fn(row.url)
         except FetchTimeout as e:
             await frontier.mark_fetch_failed(row.url, f"timeout: {e}")
             continue

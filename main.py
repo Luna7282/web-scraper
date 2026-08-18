@@ -17,6 +17,7 @@ from crawl.discovery import discover_branches, fetch_page_links
 from crawl.scope import normalize_url, derive_prefix, is_in_scope
 from crawl.frontier import Frontier
 from crawl.pipeline import crawl_worker, extract_worker, writer_worker, FetchTimeout, FetchHTTPError, RateLimitError
+from crawl.politeness import HostPoliteness
 from content.extraction import QA_EXTRACTION_SYSTEM_PROMPT
 from content.relevance import make_score_fn
 from crawl.robots_cache import RobotsCache
@@ -409,8 +410,18 @@ async def main():
         content_queue = asyncio.Queue(maxsize=max(4, crawl_workers_n * 2))
         results_queue = asyncio.Queue(maxsize=max(4, extract_workers_n * 2))
 
+        # One shared instance across every crawl_worker task -- per-host
+        # state (semaphore, last-request timestamp) has to be shared for
+        # the throttling to apply across workers, not reset per worker.
+        politeness = HostPoliteness(
+            max_concurrent_per_host=config.MAX_CONCURRENT_REQUESTS_PER_HOST,
+            default_delay_seconds=config.DEFAULT_POLITENESS_DELAY_SECONDS,
+        )
+
         tasks = [
-            asyncio.create_task(crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache))
+            asyncio.create_task(
+                crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness)
+            )
             for _ in range(crawl_workers_n)
         ] + [
             asyncio.create_task(

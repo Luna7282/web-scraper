@@ -1711,6 +1711,64 @@ report/applied/off-by-default wiring tests) against synthetic records
 only. The Step 6 re-run is where `--semantic-dedup-report` gets pointed
 at real data and the 0.4 default gets confirmed or adjusted.
 
+## 2026-08-19 — Phase 3 Step 5: per-host politeness (ROADMAP #9's remaining gap)
+
+### 38. Concurrency cap and Crawl-delay wired through the real crawl_worker call site, not just built in isolation
+`crawl/politeness.py::HostPoliteness` is new: a per-host
+`asyncio.Semaphore` (default `config.MAX_CONCURRENT_REQUESTS_PER_HOST` =
+2) bounding concurrent in-flight requests to one host regardless of
+total worker count, plus a per-host minimum spacing between successive
+request *starts* (`config.DEFAULT_POLITENESS_DELAY_SECONDS` = 0.5s,
+overridden by the site's own `Crawl-delay` when robots.txt specifies
+one). The per-host lock guarding the timestamp read/sleep/write is held
+only across that, never across the caller's actual fetch — it serializes
+request starts for one host without blocking workers assigned to other
+hosts or holding a concurrency slot idle longer than the delay itself
+requires.
+
+`robots_cache.py::_parse_rules()` now collects `Crawl-delay` per
+user-agent group the same way Allow/Disallow already are (RFC 9309 group
+selection: exact-agent match wins over `*`, a malformed value is
+ignored rather than aborting the whole parse) -- it was previously
+dropped entirely, silently, since nothing read it (confirmed in
+ROADMAP.md #9's prior text). `HostPolicy` gained a `crawl_delay: float |
+None` field, populated in `RobotsCache.get_policy()`.
+
+**Wired through the real call site in the same step it was built, per
+the pattern entry #28/#35 established**: `crawl_worker` takes an
+optional `politeness: HostPoliteness | None = None` param and wraps only
+the `fetch_fn` call in `politeness.hold(row.host, crawl_delay)` --
+`nullcontext()` when no instance is configured, same optional-dependency
+pattern as `robots_cache`. `main.py` creates exactly **one**
+`HostPoliteness` instance and passes the same object to every
+`crawl_worker` task it spawns -- per-host state (the semaphore, the last
+request timestamp) has to be shared across workers for the throttling to
+apply at all; one instance per worker would silently defeat the whole
+mechanism; a green test suite wouldn't catch that, only real cross-worker
+wiring would.
+
+Confirmed with `--dry-run` against `docs.manim.community` after wiring
+(no live crawl -- that's Step 6) that `main.py` still imports and runs
+cleanly.
+
+**Testing**: `tests/test_politeness.py` covers `HostPoliteness` in
+isolation (spacing enforced, different hosts not cross-throttled,
+`crawl_delay` override, concurrency cap holds under real concurrent
+tasks, semaphore released even when the caller raises).
+`tests/test_crawl_worker.py::test_politeness_spaces_out_successive_fetches_to_the_same_host`
+is the integration-level guard -- two seeded URLs on the same host
+through the real `crawl_worker`, asserting the measured gap between
+`fetch_fn` call timestamps, not just that the unit works standalone.
+`tests/test_robots_cache.py` covers `Crawl-delay` parsing (captured,
+absent-by-default, scoped to the matched agent group only, malformed
+value ignored without breaking the rest of the file's rules).
+
+Not yet exercised against a real site with a real `Crawl-delay` --
+none of the 5 fixture sites specify one (still true after this step);
+the mechanism is measured to work correctly in isolation and through the
+real call site, not proven against a real target's actual `Crawl-delay`
+value yet.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->
