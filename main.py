@@ -25,6 +25,7 @@ from progress_display import run_progress_display
 from score_report import format_score_report
 from chunk_store import ChunkStore, get_or_create_collection, split_into_parent_child_chunks
 from query import query_chunks, format_query_results
+from extraction_units import make_extraction_units_fn
 
 EMBEDDING_MODEL_NAME = "nomic-embed-text"  # LocalOllamaEmbeddings' default; keep in sync (see get_llm)
 EMBEDDING_DIM = 768  # measured in step 6 -- see LESSONS_LEARNED.md #17
@@ -38,7 +39,7 @@ console = Console()
 
 DATA_DIR = "data"
 FRONTIER_DB_PATH = os.path.join(DATA_DIR, "frontier.db")
-JSONL_PATH = os.path.join(DATA_DIR, "unified.jsonl")
+CANONICAL_PATH = os.path.join(DATA_DIR, "canonical.jsonl")  # one row per Q&A pair, never a training file directly -- see export.py
 HTTP_USER_AGENT = "Mozilla/5.0 (compatible; scraper/1.0)"
 
 
@@ -189,7 +190,7 @@ def _make_extract_fn(llm):
     async def extract_fn(content: str) -> str:
         messages = [
             SystemMessage(content=QA_EXTRACTION_SYSTEM_PROMPT),
-            HumanMessage(content=f"Text to process:\n\n{content[:4000]}"),
+            HumanMessage(content=f"Text to process:\n\n{content[:config.MAX_EXTRACT_CHARS]}"),
         ]
         try:
             response = await asyncio.to_thread(llm.invoke, messages)
@@ -327,6 +328,9 @@ async def main():
     intent_embedding = await embed_fn(intent) if intent else None
     score_fn = make_score_fn(intent_embedding, embed_fn)
     extract_fn = _make_extract_fn(llm)
+    extraction_units_fn = make_extraction_units_fn(
+        config.EXTRACTION_STRATEGY, embed_fn=embed_fn, intent_embedding=intent_embedding,
+    )
     robots_cache = RobotsCache(_http_get_text)
 
     chunk_fn = None
@@ -350,7 +354,7 @@ async def main():
             for c in chunks:
                 await chunk_store.add_or_merge_chunk(c["text"], url, c["parent_text"])
 
-    writer = Writer(JSONL_PATH, chroma_upsert_fn=chroma_upsert_fn)
+    writer = Writer(CANONICAL_PATH, chroma_upsert_fn=chroma_upsert_fn)
 
     console.print(f"\n[bold green]Starting: {crawl_workers_n} crawl workers, "
                   f"{extract_workers_n} extract workers, 1 writer[/bold green]")
@@ -366,7 +370,11 @@ async def main():
         ] + [
             asyncio.create_task(
                 extract_worker(frontier, content_queue, results_queue, score_fn, extract_fn,
-                                extract_threshold, follow_threshold, chunk_fn=chunk_fn)
+                                extract_threshold, follow_threshold, chunk_fn=chunk_fn,
+                                extraction_units_fn=extraction_units_fn,
+                                generation_model=model_name,
+                                extraction_strategy=config.EXTRACTION_STRATEGY.value,
+                                section_depth=config.SECTION_DEPTH)
             )
             for _ in range(extract_workers_n)
         ] + [

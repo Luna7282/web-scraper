@@ -24,6 +24,27 @@ CHILD_CHUNK_OVERLAP = 200
 CHROMA_PERSIST_DIR = "./chroma_db"
 CHROMA_COLLECTION_NAME = "scraper_docs"
 
+class ExtractionStrategy(str, Enum):
+    FIRST_N_CHARS = "first_n_chars"           # one call, content[:MAX_EXTRACT_CHARS] -- cheapest, but only ever sees a page's opening slice
+    PER_CHUNK = "per_chunk"                    # one call per parent chunk -- complete, N calls/page
+    TOP_K_CHUNKS_BY_RELEVANCE = "top_k_chunks_by_relevance"  # chunk, embed, keep the K most intent-relevant -- what makes a large intent-gated crawl affordable
+
+# per_chunk is the default: first_n_chars silently drops everything past
+# ~16% of a real reference page (LESSONS_LEARNED.md #25/ROADMAP.md #21 --
+# the FastAPI "sponsors" finding). top_k is cheaper but needs an intent to
+# rank chunks against; with no intent it falls back to per_chunk (see
+# extraction_units.py) rather than picking arbitrarily.
+EXTRACTION_STRATEGY = ExtractionStrategy.PER_CHUNK
+EXTRACTION_TOP_K = 3
+MAX_EXTRACT_CHARS = 4000  # same conservative bound as relevance.py's MAX_EMBED_CHARS -- one real per_chunk unit (2000 chars) is already well under this
+
+# Section granularity for canonical records / export-time filenames
+# (sectioning.py) -- how many leading URL path segments count as one
+# "section". A deep site with depth=full-path would produce hundreds of
+# near-empty per-section files at export time; 2 was picked as a
+# reasonable default, not measured against a real deep site yet.
+SECTION_DEPTH = 2
+
 class LLMProvider(str, Enum):
     OPENAI = "openai"
     NVIDIA = "nvidia"

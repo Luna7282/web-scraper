@@ -57,12 +57,13 @@ class TestExtractWorkerFailureModes(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.frontier.close()
 
-    def _spawn(self, score_fn, extract_fn, extract_threshold=0.5, follow_threshold=0.5, chunk_fn=None):
+    def _spawn(self, score_fn, extract_fn, extract_threshold=0.5, follow_threshold=0.5,
+               chunk_fn=None, extraction_units_fn=None):
         extract_task = asyncio.create_task(
             extract_worker(
                 self.frontier, self.content_queue, self.results_queue,
                 score_fn, extract_fn, extract_threshold, follow_threshold,
-                chunk_fn=chunk_fn, poll_interval=0.01,
+                chunk_fn=chunk_fn, extraction_units_fn=extraction_units_fn, poll_interval=0.01,
             )
         )
         recrawl_task = asyncio.create_task(
@@ -95,7 +96,12 @@ class TestExtractWorkerFailureModes(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.results_queue.qsize(), 1)
         result: ExtractionResult = self.results_queue.get_nowait()
-        self.assertEqual(result.qa_pairs, [{"instruction": "Q", "response": "A"}])
+        self.assertEqual(len(result.qa_pairs), 1)
+        pair = result.qa_pairs[0]
+        self.assertEqual(pair["question"], "Q")
+        self.assertEqual(pair["answer"], "A")
+        self.assertEqual(pair["source_chunk"], CONTENT)
+        self.assertEqual(pair["source_url"], SEED)
         counts = await self.frontier.counts_by_status()
         self.assertNotIn("failed", counts)
 
@@ -205,6 +211,88 @@ class TestExtractWorkerFailureModes(unittest.IsolatedAsyncioTestCase):
 
         result: ExtractionResult = self.results_queue.get_nowait()
         self.assertEqual(result.chunks, [{"text": CONTENT, "parent_text": CONTENT}])
+
+    async def test_per_chunk_extraction_calls_extract_fn_once_per_unit_and_tags_source_chunk(self):
+        async def score_fn(url, content):
+            return 1.0
+
+        calls = []
+
+        async def extract_fn(unit):
+            calls.append(unit)
+            return f'[{{"instruction": "Q about {unit}", "response": "A"}}]'
+
+        async def extraction_units_fn(content):
+            return ["chunk-1", "chunk-2", "chunk-3"]
+
+        tasks = self._spawn(score_fn, extract_fn, extraction_units_fn=extraction_units_fn)
+        for _ in range(50):
+            if self.results_queue.qsize() >= 1:
+                break
+            await asyncio.sleep(0.02)
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+        self.assertEqual(calls, ["chunk-1", "chunk-2", "chunk-3"])
+        result: ExtractionResult = self.results_queue.get_nowait()
+        self.assertEqual(len(result.qa_pairs), 3)
+        self.assertEqual([p["source_chunk"] for p in result.qa_pairs], ["chunk-1", "chunk-2", "chunk-3"])
+
+    async def test_one_malformed_unit_among_several_does_not_fail_the_page(self):
+        async def score_fn(url, content):
+            return 1.0
+
+        async def extract_fn(unit):
+            if unit == "bad-chunk":
+                return "I can't extract anything from this."
+            return '[{"instruction": "Q", "response": "A"}]'
+
+        async def extraction_units_fn(content):
+            return ["good-chunk", "bad-chunk"]
+
+        tasks = self._spawn(score_fn, extract_fn, extraction_units_fn=extraction_units_fn)
+        for _ in range(50):
+            if self.results_queue.qsize() >= 1:
+                break
+            await asyncio.sleep(0.02)
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+        result: ExtractionResult = self.results_queue.get_nowait()
+        self.assertEqual(len(result.qa_pairs), 1)  # only the good chunk's pair
+        counts = await self.frontier.counts_by_status()
+        self.assertNotIn("failed", counts)
+
+    async def test_all_units_malformed_fails_the_page(self):
+        attempts = []
+
+        async def score_fn(url, content):
+            return 1.0
+
+        async def extract_fn(unit):
+            attempts.append(unit)
+            return "I can't extract anything from this."
+
+        async def extraction_units_fn(content):
+            return ["chunk-1", "chunk-2"]
+
+        tasks = self._spawn(score_fn, extract_fn, extraction_units_fn=extraction_units_fn)
+        await run_to_quiescence(tasks, self.frontier)
+
+        self.assertEqual(len(attempts), 6)  # MAX_RETRIES=3 x 2 units/attempt
+        counts = await self.frontier.counts_by_status()
+        self.assertEqual(counts.get("failed"), 1)
+        self.assertEqual(self.results_queue.qsize(), 0)
 
     async def test_no_chunk_fn_leaves_chunks_none(self):
         async def score_fn(url, content):

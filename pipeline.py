@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
+from canonical import build_canonical_record, detect_license_signal, extract_page_title
 from config import MAX_RETRIES
 from extraction import MalformedExtractionError, parse_qa_json
 from frontier import Frontier, FrontierRow
 from robots_cache import RobotsCache
 from scope import normalize_url
+from sectioning import DEFAULT_SECTION_DEPTH, derive_section
 from writer import Writer
 
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 5.0
@@ -110,6 +113,10 @@ async def extract_worker(
     extract_threshold: float,
     follow_threshold: float,
     chunk_fn: Callable[[str], list[dict]] | None = None,
+    extraction_units_fn: Callable[[str], Awaitable[list[str]]] | None = None,
+    generation_model: str = "unknown",
+    extraction_strategy: str = "first_n_chars",
+    section_depth: int = DEFAULT_SECTION_DEPTH,
     poll_interval: float = POLL_INTERVAL,
 ) -> None:
     while True:
@@ -143,8 +150,40 @@ async def extract_worker(
             continue
 
         try:
-            raw_response = await extract_fn(content)
-            qa_pairs = parse_qa_json(raw_response)
+            units = await extraction_units_fn(content) if extraction_units_fn else [content]
+        except Exception as e:
+            await frontier.mark_extract_outcome(url, "failed", f"extraction_units: {type(e).__name__}: {e}")
+            await frontier.content_done(content_queue)
+            continue
+
+        page_title = extract_page_title(content)
+        license_signal = detect_license_signal(content)
+        section = derive_section(url, depth=section_depth)
+        now = datetime.now(timezone.utc)
+        timestamp, crawl_date = now.isoformat(), now.date().isoformat()
+
+        qa_pairs: list[dict] = []
+        parsed_any_unit = False
+        try:
+            for unit in units:
+                raw_response = await extract_fn(unit)
+                try:
+                    pairs = parse_qa_json(raw_response)
+                except MalformedExtractionError:
+                    # One bad unit doesn't fail the whole page -- each unit
+                    # is an independent LLM call; a page only fails below
+                    # if literally none of its units parsed.
+                    continue
+                parsed_any_unit = True
+                for pair in pairs:
+                    qa_pairs.append(build_canonical_record(
+                        question=pair["instruction"], answer=pair["response"],
+                        source_chunk=unit, source_url=url, section=section,
+                        page_title=page_title, generation_model=generation_model,
+                        extraction_strategy=extraction_strategy,
+                        timestamp=timestamp, crawl_date=crawl_date,
+                        license_signal=license_signal,
+                    ))
         except RateLimitError as e:
             await frontier.mark_extract_outcome(
                 url, "failed", "rate_limited (extraction)",
@@ -152,12 +191,15 @@ async def extract_worker(
             )
             await frontier.content_done(content_queue)
             continue
-        except MalformedExtractionError as e:
-            await frontier.mark_extract_outcome(url, "failed", f"malformed_json: {e}")
-            await frontier.content_done(content_queue)
-            continue
         except Exception as e:
             await frontier.mark_extract_outcome(url, "failed", f"extraction: {type(e).__name__}: {e}")
+            await frontier.content_done(content_queue)
+            continue
+
+        if units and not parsed_any_unit:
+            await frontier.mark_extract_outcome(
+                url, "failed", "malformed_json: no extraction unit produced valid JSON",
+            )
             await frontier.content_done(content_queue)
             continue
 
