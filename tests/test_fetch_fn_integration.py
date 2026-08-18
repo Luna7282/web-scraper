@@ -17,6 +17,8 @@ import unittest
 
 from crawl4ai import AsyncWebCrawler
 
+import config
+from content.extraction_units import select_extraction_units
 from main import _make_fetch_fn
 
 FIXTURE_HTML = """
@@ -50,6 +52,48 @@ class TestRealFetchFnStripsChrome(unittest.IsolatedAsyncioTestCase):
         self.assertIn("something real, worth extracting", markdown)
         self.assertIn("Widget", markdown)
         self.assertNotIn("reference/Widget.html", markdown)
+
+
+# Reproduces LESSONS_LEARNED.md #32's two root causes, in the same shape
+# real Furo-themed pages ship them: an invisible icon-sprite <title>
+# block with no landmark tag or excluded-tag match to catch it, and bare
+# utility links (skip-to-content, back-to-top, edit-this-page) sitting
+# directly under <body>, not inside <nav>/<header>/<aside>.
+FURO_STYLE_FIXTURE_HTML = """
+<html><body>
+<svg style="display: none;">
+  <symbol id="svg-sun"><title>Light mode</title></symbol>
+  <symbol id="svg-menu"><title>Menu</title></symbol>
+</svg>
+<a class="skip-to-content muted-link" href="#main-content">Skip to content</a>
+<main id="main-content">
+<h1>Real API Reference</h1>
+<p>This function does something real, worth extracting, and long enough on its own to form a full extraction chunk without needing to be padded out with filler content just to reach a reasonable chunk size for this test.</p>
+<a href="#" class="back-to-top muted-link"><span>Back to top</span></a>
+<div class="edit-this-page">
+  <a class="muted-link" href="https://github.com/example/repo/edit/main/page.rst" title="Edit this page">
+    <span class="visually-hidden">Edit this page</span>
+  </a>
+</div>
+</main>
+</body></html>
+"""
+
+
+class TestRealFetchFnStripsChromeFromChunkedOutput(unittest.IsolatedAsyncioTestCase):
+    async def test_furo_style_chrome_absent_from_every_extraction_chunk(self):
+        async with AsyncWebCrawler() as crawler:
+            fetch_fn = _make_fetch_fn(crawler)
+            markdown, _raw_hrefs = await fetch_fn("raw:" + FURO_STYLE_FIXTURE_HTML)
+
+        chunks = await select_extraction_units(markdown, config.EXTRACTION_STRATEGY)
+        self.assertTrue(chunks, "fixture should produce at least one extraction chunk")
+
+        chrome_phrases = ["Light mode", "Menu", "Skip to content", "Back to top", "Edit this page"]
+        for chunk in chunks:
+            for phrase in chrome_phrases:
+                self.assertNotIn(phrase, chunk, f"{phrase!r} leaked into a source_chunk: {chunk!r}")
+        self.assertIn("something real, worth extracting", "".join(chunks))
 
 
 if __name__ == "__main__":

@@ -45,28 +45,56 @@ DEFAULT_EXCLUDED_TAGS = ["nav", "header", "footer", "aside", "button", "script",
 # behave like one (<span role="button">, <a role="button">).
 # aria-hidden="true" marks an element as decorative/non-content by the
 # page's own accessibility markup -- a generic, theme-agnostic signal.
+# [hidden] (the native HTML attribute) and the two style*= clauses (the
+# common no-space/spaced CSS serializations of "display:none;") are the
+# same signal by a different route: an element the page itself marks as
+# never rendered. Structural tag/role exclusion doesn't evaluate CSS, so
+# without this an invisible icon-sprite <title> (real example: Furo's
+# `<svg style="display: none;">` accessibility-label block, see
+# LESSONS_LEARNED.md #32) gets extracted as if it were visible content.
 DEFAULT_EXCLUDED_SELECTOR = (
     '[role="navigation"], [role="banner"], [role="contentinfo"], '
-    '[role="complementary"], [role="button"], [aria-hidden="true"]'
+    '[role="complementary"], [role="button"], [aria-hidden="true"], '
+    '[hidden], [style*="display:none"], [style*="display: none"]'
 )
 
 # Fallback for UI-affordance text that survives structural exclusion.
 # Theme-specific by nature -- extend per-theme via the patterns param,
-# don't hardcode a new phrase into strip_text_patterns() itself.
-DEFAULT_TEXT_PATTERNS = ["copy to clipboard", "copied to clipboard", "copied!", "make interactive"]
+# don't hardcode a new phrase into strip_text_patterns() itself. The
+# skip-to-content/back-to-top/view-or-edit-this-page entries are Furo's
+# copy (LESSONS_LEARNED.md #32's root cause 2 -- bare utility links in
+# plain div/label wrappers with no landmark tag or ARIA role for
+# structural exclusion to match), but the phrases themselves are common
+# across many doc themes, not a Furo-only string.
+DEFAULT_TEXT_PATTERNS = [
+    "copy to clipboard", "copied to clipboard", "copied!", "make interactive",
+    "skip to content", "skip to main content", "skip navigation",
+    "back to top", "scroll to top", "view this page", "edit this page",
+    "toggle navigation", "toggle table of contents", "toggle theme",
+]
 
 # Link visible-text that carries no identifying information on its own --
-# heading-anchor pilcrows, generic "click here" style copy. Generic across
-# themes, not site-specific -- extend via the generic_text param, don't
-# hardcode a new phrase into normalize_link_text() itself. A link matching
-# one of these is dropped entirely (text and URL both), not just
-# unwrapped, since neither side is worth keeping.
+# heading-anchor pilcrows, generic "click here" style copy, and the same
+# utility-link phrases as DEFAULT_TEXT_PATTERNS above (these arrive as
+# markdown link text before strip_text_patterns ever sees them, since
+# they're <a> elements, not bare text). Generic across themes, not
+# site-specific -- extend via the generic_text param, don't hardcode a
+# new phrase into normalize_link_text() itself. A link matching one of
+# these is dropped entirely (text and URL both), not just unwrapped,
+# since neither side is worth keeping.
 DEFAULT_GENERIC_LINK_TEXT = {
     "here", "this", "link", "click here", "this page", "this link",
     "read more", "more", "learn more", "source", "top", "¶",
+    "skip to content", "skip to main content", "skip navigation",
+    "back to top", "scroll to top", "view this page", "edit this page",
 }
 
-_LINK_RE = re.compile(r'(!?)\[([^\]]*)\]\([^)\s]+(?:\s+"[^"]*")?\)')
+# Text group allows one level of nested [...] -- Sphinx's auto-generated
+# "[source]" links render as a bracketed label wrapped in markdown link
+# syntax (`[[source]](url)`), and a text group excluding all `]` can't
+# match past the inner one. Real example: confirmed present, unmatched
+# without this, on tests/fixtures/docs_manim_reference.html.
+_LINK_RE = re.compile(r'(!?)\[((?:[^\[\]]|\[[^\[\]]*\])*)\]\([^)\s]+(?:\s+"[^"]*")?\)')
 
 
 def clean_html(html: str, url: str, excluded_tags=None, excluded_selector=None) -> str:

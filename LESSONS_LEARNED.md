@@ -1557,6 +1557,73 @@ that a real content link survives as text with its URL gone, through
 the actual `AsyncWebCrawler` path, not `strip_chrome()` called
 directly.
 
+## 2026-08-19 — Phase 3 Step 2: the two strip_chrome root causes from entry #32
+
+### 35. Both fixes reused existing generic mechanisms -- no new preprocessing code
+Entry #32 diagnosed two distinct gaps: invisible `display:none` SVG
+icon-sprite `<title>` text, and bare utility links with no landmark tag
+or ARIA role. Both are fixed by extending the *data* behind mechanisms
+that already existed, not by adding new code paths -- consistent with
+this file's structural/text-pattern layering, which was already built to
+be extended this way.
+
+- **Root cause 1 (invisible content)**: added `[hidden]`,
+  `[style*="display:none"]`, `[style*="display: none"]` to
+  `DEFAULT_EXCLUDED_SELECTOR` -- the same structural-exclusion mechanism
+  that already removes `[role="navigation"]` etc., via crawl4ai's own
+  CSS-selector-based scraper. Verified the two `style*=` clauses catch
+  every realistic spacing/ordering variant (`display:none`,
+  `display: none;`, `color:red;display:none;`, `display: none;
+  margin:0`) without needing a full CSS parser. This generalizes past
+  SVG specifically -- any element the page marks invisible by CSS or the
+  native `hidden` attribute is now excluded, not just icon sprites.
+- **Root cause 2 (unmarked utility links)**: added
+  "skip to content"/"back to top"/"edit this page"/etc. to
+  `DEFAULT_TEXT_PATTERNS` (the existing text-pattern fallback) **and**
+  to `DEFAULT_GENERIC_LINK_TEXT` (step 1's new link-text list, since
+  these arrive as markdown link text before `strip_text_patterns` ever
+  runs). The phrases are Furo's copy but not Furo-specific vocabulary --
+  "skip to content" and "back to top" are standard UI copy across many
+  doc themes, which is exactly the kind of extension `DEFAULT_TEXT_PATTERNS`
+  was already designed for (see its docstring). No selector was written
+  against Furo's actual class names (`skip-to-content`,
+  `edit-this-page`) -- matching those would have been the site-specific
+  shortcut the task explicitly ruled out.
+
+**Found and fixed a third, unrelated bug while verifying against the
+real fixture**: step 1's `normalize_link_text()` regex used
+`[^\]]*` for the link-text group, which cannot match past an internal
+`]` -- and Sphinx's auto-generated "view source" links render as
+`[[source]](url)`, a bracketed label inside markdown link syntax. That
+construct silently failed to match at all, leaving the full
+`[[source]](https://...)` untouched in `strip_chrome()`'s output against
+`tests/fixtures/docs_manim_reference.html` (confirmed: the literal
+`_modules/.../arc.html#Circle` URL survived in the real fixture's real
+output before this fix). Regex changed to allow one level of nested
+`[...]`: `(?:[^\[\]]|\[[^\[\]]*\])*`. This is exactly the class of gap
+entry #28 warned about -- caught here by testing against real fixture
+content instead of only synthetic examples, before Step 1 was assumed
+complete.
+
+**Verification, both against the real fixture and a synthetic
+regression guard**: confirmed end-to-end against
+`tests/fixtures/docs_manim_reference.html` (the actual page entry #32's
+diagnosis was read from) that every one of "Light mode", "Dark mode",
+"Auto light/dark", "Skip to content", "Back to top", "View this page",
+"Edit this page", "Expand", "Menu" is absent from `strip_chrome()`'s
+output, with real page content (the `Circle` class docstring) intact.
+`tests/test_fetch_fn_integration.py` gained
+`TestRealFetchFnStripsChromeFromChunkedOutput`, built to satisfy the
+explicit ask to check `source_chunk`-level text, not just extraction
+questions: it runs a Furo-shaped fixture (the display:none sprite +
+unmarked skip-to-content/back-to-top/edit-this-page links, same shape as
+the real page) through the real `_make_fetch_fn` *and* the real
+`select_extraction_units()` chunker, then asserts every chrome phrase is
+absent from every resulting chunk. Confirmed this test fails against the
+pre-fix selector/pattern lists (all five phrases leak into chunks) before
+trusting it as a real regression guard, not just a test that happens to
+pass.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->
