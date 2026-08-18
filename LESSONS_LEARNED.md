@@ -723,4 +723,146 @@ factual errors; add new ones at the bottom.
 
 ---
 
+## 2026-08-18 — Step 7: content-hash chunk IDs, embedding-identity check, retrieval path
+
+### 19. Chunk ID = hash of normalized text alone, verified to collapse the exact duplicate set the archive measured
+- **Design**: `chunk_store.py::chunk_id()` hashes `normalize_chunk_text(text)`
+  only — never `url + text` — so the same instructional text repeated
+  across pages collides to one Chroma id instead of one row per page
+  (`ROADMAP.md` #6's correction). `normalize_chunk_text` is defined
+  strictly, not loosely: collapse all whitespace runs to a single space
+  (`" ".join(text.split())`), lowercase, then strip trailing
+  `.,;:!?`. Tested directly against two chunks differing only in
+  whitespace (`tests/test_chunk_store.py`) — they collide.
+- **Verified against the real archived pre-rebuild data, not just
+  synthetic cases**: `tests/test_chunk_store_archived_data.py` reads
+  `archive/pre-rebuild/chroma_db/chroma.sqlite3` directly and confirms
+  every known cross-page duplicate group from the original audit dump
+  (the "manimations" install-instructions text repeated across 4 real
+  install pages, and the broader set of duplicate groups) collapses to a
+  single `chunk_id` under the new function. This is the "assert the
+  collapse, don't hope for it" bar from the ask, met against real data
+  rather than a fixture built to make the test pass.
+- **Sources recorded as a list, append-not-overwrite**:
+  `ChunkStore.add_or_merge_chunk()` checks `collection.get(ids=[cid])`
+  first; if the id already exists, it reads the existing `sources` list,
+  appends the new URL only if not already present, and calls
+  `collection.update()` (metadata-only, no re-embed) rather than
+  `upsert()` — `upsert()` was empirically confirmed to replace metadata
+  wholesale, not merge it, so using it here would have silently dropped
+  earlier sources on every second write to the same chunk.
+
+### 20. chromadb's write-path semantics were characterized empirically before ChunkStore was built around them
+- Confirmed, not assumed, via `tests/test_chunk_store.py`: `add()` with a
+  duplicate id **silently no-ops** and drops the new call's metadata
+  entirely (no error, no update) — using `add()` for the merge path would
+  have looked like it worked while quietly losing every second source.
+  `upsert()` with a duplicate id **replaces metadata wholesale** — doesn't
+  merge lists. `update()` changes metadata without needing to resupply an
+  embedding, which is what makes the no-re-embed merge path possible.
+  `get_or_create_collection()` preserves the *original* metadata on
+  reopen — a second call with different `embedding_model`/`embedding_dim`
+  arguments does not silently overwrite the first collection's recorded
+  identity, which is exactly the property #21 below depends on.
+  `EphemeralClient()` instances share collection state across the same
+  process (not per-instance isolated) — this cost real test-debugging time
+  (5 failing tests) before being traced to hardcoded collection names
+  colliding across supposedly-independent test instances; fixed by
+  generating a unique collection name per test.
+
+### 21. Embedding-model identity is checked loudly on both the write and read path, and `collection.metadata` can be `None` entirely
+- `get_or_create_collection()` writes `{"embedding_model": ..., "embedding_dim": ...}`
+  into the collection's own metadata at creation. `verify_embedding_identity()`
+  is called from both the write path (on every `get_or_create_collection`
+  call, so a second run against an existing collection with a *different*
+  model immediately raises `EmbeddingIdentityMismatch`, not a warning) and
+  the read path (`query_chunks()`, so a query embedded with the wrong
+  model fails loudly instead of returning confidently wrong
+  nearest-neighbor results).
+- **Bug caught during testing**: `collection.metadata` can be `None` in
+  its entirety (not just missing the two expected keys) for a legacy
+  collection created without a metadata argument — `metadata.get(...)`
+  on `None` raises `AttributeError` before the mismatch check ever runs.
+  Fixed with `metadata = collection.metadata or {}` before any `.get()`
+  call. Caught by a test exercising a collection created via the plain
+  `client.create_collection(name)` path with no metadata, not discovered
+  in production.
+
+### 22. Chunk sizes/overlap made explicit in config, decision to retune deferred
+- `config.py` now states `PARENT_CHUNK_SIZE=2000`, `PARENT_CHUNK_OVERLAP=200`,
+  `CHILD_CHUNK_SIZE=400`, `CHILD_CHUNK_OVERLAP=200` explicitly — the exact
+  values `langchain_text_splitters` was defaulting to invisibly (confirmed
+  in entry #9). Restating the entry #9 finding here since it's now a
+  config value someone will actually look at: 200-char overlap on
+  400-char children is 50% overlap, the documented cause of 9,204 vectors
+  from 30 pages in the original audit. **Not changed in this commit** —
+  making it visible and making it smaller are different decisions, and
+  the ask was explicit that they shouldn't happen in the same commit.
+
+### 23. The retrieval path (query.py) run for real, against a real cross-page collision
+- `query_chunks()` embeds the question, searches child-chunk embeddings,
+  and returns `parent_text`/`sources`/`child_text`/`distance` per match —
+  this is the first code that reads from Chroma anywhere in the rebuild;
+  everything before this step was write-only (`ROADMAP.md` #3).
+- **Live demo, real embedding calls, local Ollama `nomic-embed-text`
+  (768-dim)**: indexed 3 real fixtures (`circle_reference`, and two newly
+  fetched pages, `docs.manim.community/installation/{linux,macos}.html`,
+  fetched specifically because the cached fixture set had zero real
+  cross-page duplication and a collision can't be demonstrated without
+  one — kept permanently under `tests/fixtures/` per instruction, so this
+  demo stays runnable offline).
+  - Naive per-page vector count: 146 (38 + 60 + 60). Actual unique
+    vectors after upsert: **100**. Collision reduction: **46**, all
+    between the linux/macos pair (circle_reference shares nothing with
+    either, as expected — it's a different content domain).
+  - **This differs from the archive's original count (49 pairs) on
+    purpose, not by error** — the archive measured duplication on
+    *unstripped* content; chrome-stripping (step 4) changes what the
+    chunker sees before chunk_id ever runs, so a changed count here is
+    the expected interaction between two independently-built pieces, not
+    a regression in either. 46 vs. 49 is close enough to read as "still
+    working," not as a discrepancy needing investigation — but it's
+    reported as a finding rather than silently assumed to match.
+  - Vector-count arithmetic checked directly: 100 = 146 − 46, exact, no
+    silent drift between the two counting methods.
+  - Retrieved a real shared chunk (a LaTeX-package list common to both
+    OS install pages) with `sources` containing both
+    `installation/linux.html` and `installation/macos.html` URLs on one
+    `chunk_id` — literal proof the merge path (entry #19) works on real
+    duplicate content, not just the synthetic/archived cases.
+  - 3 real queries: one whose answer is only in `circle_reference`
+    (top-3 all `circle_reference`, correctly excluding the install
+    pages); one whose answer is only in the install pages (top-3 all
+    carry **both** linux and macos in `sources`, proving the match is
+    the deduped cross-page chunk, not a coincidence of a one-page index);
+    one genuinely absent from all indexed content ("capital of France,"
+    distances 520–530 vs. 97–219 for the real matches — a real,
+    usable gap, roughly 2.5–5x).
+  - **Caveat worth carrying forward**: Chroma's default distance here is
+    raw squared-L2, not cosine similarity — the absolute numbers aren't
+    bounded or comparable across embedding models/dimensions. A future
+    "no good answer" cutoff needs calibrating per model, not hardcoded
+    as a universal constant from this one run.
+
+### 24. JSONL file-marker dedup and Chroma content-hash dedup verified to coexist correctly under crash-resume
+- `tests/test_crash_resume_dedup.py`, offline (temp JSONL file +
+  `EphemeralClient`, stub embed_fn), 3 scenarios: (1) full success then a
+  spurious retry — exactly 1 JSONL row, exactly 2 Chroma vectors (not 4),
+  and zero re-embed calls on the retry (both chunks already existed with
+  this source, so it's a pure metadata read). (2) the actual crash window
+  entry #13 is about — JSONL append succeeds, crash before Chroma upsert
+  — retry correctly skips the JSONL append (already-written) but *still*
+  performs the Chroma upsert (confirmed: `Writer.write()`'s Chroma call
+  isn't gated on the JSONL already-written check, so this doesn't silently
+  drop the vectors). (3) the combined case with a real cross-page-duplicate
+  chunk — write page A, retry page A, write page B sharing one chunk with
+  A — exactly 2 JSONL rows (one per page, not per `write()` call), exactly
+  1 Chroma vector for the shared chunk with both source URLs, and exactly
+  1 embed call ever for that chunk. This is the exact scenario step 8's
+  real kill test will exercise; verified structurally here first so step
+  8 confirms it under real interruption rather than discovering a gap for
+  the first time under pressure.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->

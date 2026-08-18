@@ -11,6 +11,7 @@ from rich.prompt import Prompt, Confirm
 from rich.panel import Panel
 from rich.table import Table
 
+import config
 from llm_factory import get_llm
 from discovery import discover_branches, fetch_page_links
 from scope import normalize_url, derive_prefix, is_in_scope
@@ -22,6 +23,11 @@ from robots_cache import RobotsCache
 from writer import Writer
 from progress_display import run_progress_display
 from score_report import format_score_report
+from chunk_store import ChunkStore, get_or_create_collection, split_into_parent_child_chunks
+from query import query_chunks, format_query_results
+
+EMBEDDING_MODEL_NAME = "nomic-embed-text"  # LocalOllamaEmbeddings' default; keep in sync (see get_llm)
+EMBEDDING_DIM = 768  # measured in step 6 -- see LESSONS_LEARNED.md #17
 
 # orchestrator.py / output_manager.py: the old pipeline. Deliberately left
 # importable but unreferenced here -- this file is the rewrite (see the
@@ -113,6 +119,30 @@ async def score_report_command(db_path: str):
     scores = await frontier.all_scores()
     await frontier.close()
     console.print(format_score_report(scores))
+
+
+async def query_command(question: str):
+    """Embeds the question, searches the persisted Chroma index, prints
+    each result's parent text and sources -- the proof the RAG index
+    stops being write-only (ROADMAP.md #3)."""
+    import chromadb
+    from llm_factory import LocalOllamaEmbeddings
+
+    embeddings = LocalOllamaEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    embed_fn = _make_embed_fn(embeddings)
+
+    client = chromadb.PersistentClient(path=config.CHROMA_PERSIST_DIR)
+    try:
+        collection = client.get_collection(config.CHROMA_COLLECTION_NAME)
+    except Exception:
+        console.print(
+            f"[red]No collection {config.CHROMA_COLLECTION_NAME!r} found in "
+            f"{config.CHROMA_PERSIST_DIR} -- run a crawl with RAG enabled first.[/red]"
+        )
+        sys.exit(1)
+
+    results = await query_chunks(collection, embed_fn, question, EMBEDDING_MODEL_NAME, EMBEDDING_DIM)
+    console.print(format_query_results(results))
 
 
 async def _http_get_text(url: str) -> str | None:
@@ -258,10 +288,10 @@ async def main():
     )
 
     console.print("\n[bold]Output[/bold]")
+    build_rag = Confirm.ask("Build Vector RAG index (Chroma)?", default=False)
     console.print(
-        "[dim]JSONL only for now -- Chroma/RAG output isn't wired into the new "
-        "pipeline yet (step 7). Old --build-rag flow is still in orchestrator.py "
-        "if needed.[/dim]"
+        "[dim]split_jsonl (by section) isn't wired into the new pipeline yet -- "
+        "unified JSONL only. Old orchestrator.py flow still has it if needed.[/dim]"
     )
 
     max_pages_input = Prompt.ask("Max pages to fetch (blank = unlimited)", default="")
@@ -297,8 +327,30 @@ async def main():
     intent_embedding = await embed_fn(intent) if intent else None
     score_fn = make_score_fn(intent_embedding, embed_fn)
     extract_fn = _make_extract_fn(llm)
-    writer = Writer(JSONL_PATH)
     robots_cache = RobotsCache(_http_get_text)
+
+    chunk_fn = None
+    chroma_upsert_fn = None
+    if build_rag:
+        import chromadb
+        chroma_client = chromadb.PersistentClient(path=config.CHROMA_PERSIST_DIR)
+        collection = get_or_create_collection(
+            chroma_client, config.CHROMA_COLLECTION_NAME, EMBEDDING_MODEL_NAME, EMBEDDING_DIM
+        )
+        chunk_store = ChunkStore(collection, embed_fn)
+
+        def chunk_fn(content: str) -> list[dict]:
+            pairs = split_into_parent_child_chunks(
+                content, config.PARENT_CHUNK_SIZE, config.PARENT_CHUNK_OVERLAP,
+                config.CHILD_CHUNK_SIZE, config.CHILD_CHUNK_OVERLAP,
+            )
+            return [{"text": child, "parent_text": parent} for child, parent in pairs]
+
+        async def chroma_upsert_fn(url: str, chunks: list[dict]) -> None:
+            for c in chunks:
+                await chunk_store.add_or_merge_chunk(c["text"], url, c["parent_text"])
+
+    writer = Writer(JSONL_PATH, chroma_upsert_fn=chroma_upsert_fn)
 
     console.print(f"\n[bold green]Starting: {crawl_workers_n} crawl workers, "
                   f"{extract_workers_n} extract workers, 1 writer[/bold green]")
@@ -314,7 +366,7 @@ async def main():
         ] + [
             asyncio.create_task(
                 extract_worker(frontier, content_queue, results_queue, score_fn, extract_fn,
-                                extract_threshold, follow_threshold)
+                                extract_threshold, follow_threshold, chunk_fn=chunk_fn)
             )
             for _ in range(extract_workers_n)
         ] + [
@@ -347,6 +399,14 @@ if __name__ == "__main__":
         help="Print the relevance score distribution recorded in an existing "
              "frontier DB (from a prior run) -- no crawl, no LLM calls.",
     )
+    parser.add_argument(
+        "--query",
+        metavar="QUESTION",
+        help="Embed QUESTION, search the persisted Chroma index "
+             f"({config.CHROMA_PERSIST_DIR}), print each result's parent text "
+             "and sources. Requires a prior run with RAG enabled. One live "
+             "embedding call.",
+    )
     args = parser.parse_args()
 
     try:
@@ -354,6 +414,8 @@ if __name__ == "__main__":
             asyncio.run(dry_run(args.dry_run))
         elif args.score_report:
             asyncio.run(score_report_command(args.score_report))
+        elif args.query:
+            asyncio.run(query_command(args.query))
         else:
             asyncio.run(main())
     except KeyboardInterrupt:

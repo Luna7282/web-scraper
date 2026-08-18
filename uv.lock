@@ -1888,6 +1888,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "aiofiles" },
     { name = "aiosqlite" },
+    { name = "chromadb" },
     { name = "crawl4ai" },
     { name = "langchain-chroma" },
     { name = "langchain-core" },
@@ -1910,6 +1911,7 @@ dev = [
 requires-dist = [
     { name = "aiofiles", specifier = "==25.1.0" },
     { name = "aiosqlite", specifier = "==0.22.1" },
+    { name = "chromadb", specifier = "==1.5.9" },
     { name = "crawl4ai", specifier = "==0.9.2" },
     { name = "langchain-chroma", specifier = "==1.1.0" },
     { name = "langchain-core", specifier = "==1.5.5" },

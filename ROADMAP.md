@@ -34,13 +34,13 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
    Ask before running — installs/upgrades need sign-off per session rules.
    **Size: S.**
 
-3. **Chroma is write-only — no retrieval/query code exists anywhere in the
-   repo** (`grep` for `similarity_search`, `as_retriever`, `.query(` returns
-   nothing across all `.py` files). The "Vector RAG database" output is
-   currently a database nobody can read from.
-   *Fix*: a small `query.py` / CLI flag wrapping
-   `chroma_client.similarity_search(query, k=...)`, returning `parent_text`
-   from metadata rather than the child chunk. **Size: S–M.**
+3. **[RESOLVED, step 7] Chroma is write-only — no retrieval/query code
+   exists anywhere in the repo.** `query.py::query_chunks()`/
+   `format_query_results()` embed a question, search child chunks, and
+   return parent text + sources + the matched child + distance;
+   `main.py --query "<question>"` wires it up. Proven against a real
+   index (3 fixtures, real local-Ollama embeddings) with 3 real queries,
+   not just code review — see `LESSONS_LEARNED.md` #23.
 
 ## (b) Fragile — will bite us soon
 
@@ -56,24 +56,29 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
    local-only; rotate the NVIDIA key since it's already sat in cleartext.
    **Size: S.**
 
-5. **Child chunks overlap ~50%, inflating embedding cost and hurting
-   retrieval precision.** Both `RecursiveCharacterTextSplitter`s in
-   `output_manager.py:41-42` use the library's default `chunk_overlap`
-   (200), which on a 400-char child splitter means every child chunk shares
-   half its content with its neighbor. Measured on the current `chroma_db`:
-   30 distinct source pages → 9,204 stored embeddings (~307 chunks/page),
-   with 87 (source, chunk-text) pairs already exact-duplicated within a
-   single page before any re-run.
-   *Fix*: set `chunk_overlap` explicitly and much smaller (e.g. 0–50) on the
-   child splitter. **Size: S.**
+5. **[Partially resolved, step 7] Child chunks overlap ~50%, inflating
+   embedding cost and hurting retrieval precision.** The overlap is now
+   an explicit, visible `config.py` value (`CHILD_CHUNK_OVERLAP=200` on
+   `CHILD_CHUNK_SIZE=400`) instead of an invisible library default — see
+   `LESSONS_LEARNED.md` #22. **Still 200/50%, unchanged** — making it
+   visible and shrinking it were deliberately kept as separate decisions;
+   this item stays open until the value itself is revisited.
+   *Fix*: lower `CHILD_CHUNK_OVERLAP` in `config.py` (e.g. 0–50) once
+   there's a reason to spend the (now-visible) cost/precision tradeoff.
+   **Size: S.**
 
-6. **No upsert / stable IDs into Chroma — re-running over the same site
-   re-embeds and re-inserts everything as new vectors.** `add_documents` is
-   called with no `ids=` anywhere in `_add_to_rag` (`output_manager.py:173`),
-   so Chroma has no way to recognize "I've already indexed this chunk."
-   JSONL is protected from row duplication by the instruction-text dedup,
-   but Chroma has no equivalent guard.
-   *Fix, revised (step 4)*: originally planned as `sha256(url + child_text)`
+6. **[RESOLVED, step 7] No upsert / stable IDs into Chroma — re-running
+   over the same site re-embeds and re-inserts everything as new
+   vectors.** `chunk_store.py::chunk_id()`/`ChunkStore.add_or_merge_chunk()`
+   implement exactly the revised fix below — hash the normalized chunk
+   text alone, `sources` as a list, merge (not overwrite) on collision.
+   Verified against real archived duplicate data
+   (`tests/test_chunk_store_archived_data.py`) and against a real live
+   index of two freshly-fetched pages known to share content (46 of 146
+   chunks collided) — see `LESSONS_LEARNED.md` #19/#23. The provenance
+   tradeoff noted below is honored: `sources` is surfaced in every
+   `QueryResult` returned by `query.py`, not stored and ignored.
+   *Original fix note, revised (step 4)*: originally planned as `sha256(url + child_text)`
    — wrong once cross-page content duplication is accounted for (step 4's
    chunk-dump analysis found real content genuinely repeated verbatim
    across different pages, e.g. identical install instructions on every
@@ -100,15 +105,14 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
    *Fix*: persist visited URLs to a small sqlite file or newline-delimited
    log, reload on startup. **Size: M.**
 
-8. **Embedding-model identity isn't recorded anywhere.** `embed
-   ding_model_name` defaults to `nomic-embed-text` (`llm_factory.py:34`) but
-   nothing stores which model produced a given collection's vectors. If a
-   future run indexes with a different embedding model into the same
-   `scraper_docs` collection, similarity search silently mixes incompatible
-   vector spaces with no error.
-   *Fix*: write the embedding model name into Chroma collection metadata (or
-   a `meta.json` beside `chroma_db/`) at creation time, and refuse/warn if a
-   later run's model doesn't match. **Size: S.**
+8. **[RESOLVED, step 7] Embedding-model identity isn't recorded
+   anywhere.** `chunk_store.py::get_or_create_collection()` writes
+   `embedding_model`/`embedding_dim` into the Chroma collection's own
+   metadata at creation; `verify_embedding_identity()` is called on both
+   the write path and `query.py::query_chunks()`, raising
+   `EmbeddingIdentityMismatch` (loud exception, not a warning) on a
+   mismatch. Includes dimensionality alongside the model name as asked
+   — see `LESSONS_LEARNED.md` #21.
 
 9. **[Partially resolved, step 5] robots.txt is now respected; per-host
    rate limiting/politeness delay is still missing.** `robots_cache.py` +
@@ -211,11 +215,16 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     models) per call, accumulate, print a total at the end of the run.
     **Size: S.**
 
-14. **No config surface** — chunk sizes (2000/400), default embedding model
-    name, etc. are all hardcoded (`output_manager.py:41-42`,
-    `llm_factory.py:33-34`).
-    *Fix*: move these into `config.py` with env-var overrides and sane
-    defaults. **Size: S.**
+14. **[Partially resolved, step 7] No config surface** — chunk sizes are
+    now explicit in `config.py` (`PARENT_CHUNK_SIZE`/`_OVERLAP`,
+    `CHILD_CHUNK_SIZE`/`_OVERLAP`, see `LESSONS_LEARNED.md` #22). Still
+    open: no env-var override mechanism for any config value yet
+    (these are plain module constants), and the embedding model
+    name/dimension (`EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM`) live as
+    constants in `main.py`, not `config.py`.
+    *Fix*: move `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` into `config.py`
+    alongside the chunk constants; add env-var overrides for all of them.
+    **Size: S.**
 
 15. **No structured logging** — everything is `print()`. A long crawl's
     history disappears once the terminal scrolls past it; no log levels, no

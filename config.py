@@ -5,10 +5,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Frontier / crawl-pipeline knobs (frontier.py). Chunk size/overlap and
-# relevance thresholds are step 6/7's job, not added speculatively here.
+# Frontier / crawl-pipeline knobs (frontier.py).
 MAX_RETRIES = 3
 FOLLOW_GATE_EXEMPT_DEPTH = 0  # seed's own children always promote regardless of score
+
+# Parent/child chunking (chunk_store.py). Values are the same ones the old
+# pipeline used via library defaults -- made explicit here, not retuned.
+# CHILD_CHUNK_OVERLAP == half of CHILD_CHUNK_SIZE is the measured, documented
+# cause of 9,204 vectors from only 30 pages in the original audit
+# (LESSONS_LEARNED.md #19) -- whether to change it is a separate decision
+# from making it visible, and isn't made in the same change as this comment.
+PARENT_CHUNK_SIZE = 2000
+PARENT_CHUNK_OVERLAP = 200
+CHILD_CHUNK_SIZE = 400
+CHILD_CHUNK_OVERLAP = 200
+
+# Chroma (chunk_store.py).
+CHROMA_PERSIST_DIR = "./chroma_db"
+CHROMA_COLLECTION_NAME = "scraper_docs"
 
 class LLMProvider(str, Enum):
     OPENAI = "openai"

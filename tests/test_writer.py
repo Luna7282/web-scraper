@@ -48,8 +48,8 @@ class TestWriter(unittest.IsolatedAsyncioTestCase):
     async def test_already_written_url_still_upserts_chroma(self):
         upserted = []
 
-        async def chroma_upsert_fn(chunks):
-            upserted.append(chunks)
+        async def chroma_upsert_fn(url, chunks):
+            upserted.append((url, chunks))
 
         Path(self.jsonl_path).write_text(
             json.dumps({"instruction": "Q", "response": "A", "source_url": "https://x.com/a"}) + "\n",
@@ -60,7 +60,7 @@ class TestWriter(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(upserted), 1)  # chroma still runs even though JSONL was skipped
 
     async def test_concurrent_calls_raise_instead_of_silently_serializing(self):
-        async def slow_chroma_upsert(chunks):
+        async def slow_chroma_upsert(url, chunks):
             await asyncio.sleep(0.05)
 
         w = Writer(self.jsonl_path, chroma_upsert_fn=slow_chroma_upsert)

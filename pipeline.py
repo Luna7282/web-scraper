@@ -1,10 +1,10 @@
 """Crawl / extract / write worker loops. Built alongside orchestrator.py,
 not replacing it in place -- orchestrator.py stays importable as a working
-fallback until this path is proven (see the rebuild plan). Nothing here is
-wired into main.py yet.
+fallback until this path is proven (see the rebuild plan). Wired into
+main.py as of step 6.
 
-Every I/O dependency is injected (fetch_fn, score_fn, extract_fn, Writer)
-so these loops are fully testable against stubs -- see
+Every I/O dependency is injected (fetch_fn, score_fn, extract_fn, Writer,
+chunk_fn) so these loops are fully testable against stubs -- see
 tests/test_crawl_worker.py, tests/test_extract_worker.py.
 """
 from __future__ import annotations
@@ -109,6 +109,7 @@ async def extract_worker(
     extract_fn: ExtractFn,
     extract_threshold: float,
     follow_threshold: float,
+    chunk_fn: Callable[[str], list[dict]] | None = None,
     poll_interval: float = POLL_INTERVAL,
 ) -> None:
     while True:
@@ -160,7 +161,8 @@ async def extract_worker(
             await frontier.content_done(content_queue)
             continue
 
-        await frontier.put_results(results_queue, ExtractionResult(url=url, qa_pairs=qa_pairs))
+        chunks = chunk_fn(content) if chunk_fn is not None else None
+        await frontier.put_results(results_queue, ExtractionResult(url=url, qa_pairs=qa_pairs, chunks=chunks))
         await frontier.content_done(content_queue)
 
 

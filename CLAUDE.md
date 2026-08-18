@@ -67,11 +67,48 @@ see the invariant below), max pages/depth, relevance thresholds
 (**default 0 for both — log-only**, shown with an explicit on-screen
 warning, not a buried default), crawl/extract worker concurrency.
 
-Output is JSONL-only right now (`data/unified.jsonl`) — `split_jsonl` and
-Chroma/RAG output existed as toggles in the old `orchestrator.py` flow but
-aren't wired into the new pipeline yet (step 7). Frontier state persists
-to `data/frontier.db`; a rerun resumes it (`Frontier.recover_crashed()` at
-startup) rather than starting over.
+Output is JSONL by default; a `build_rag` prompt (step 7) optionally wires
+up a real Chroma collection (`chunk_store.py`, persisted to
+`config.CHROMA_PERSIST_DIR`) alongside it — chunk/embed/upsert happens in
+`extract_worker`/`Writer` via injected `chunk_fn`/`chroma_upsert_fn`
+closures built in `main.py`. `split_jsonl` from the old `orchestrator.py`
+flow is still not wired in. Frontier state persists to `data/frontier.db`;
+a rerun resumes it (`Frontier.recover_crashed()` at startup) rather than
+starting over.
+
+**Retrieval**: `uv run python main.py --query "<question>"` embeds the
+question, searches child chunks in the existing Chroma collection, and
+prints parent text + sources + the matched child chunk + distance
+(`query.py::query_chunks`/`format_query_results`). This is the only code
+that reads from Chroma — see `ROADMAP.md` #3.
+
+**Chunking**: parent/child sizes and overlap are explicit in `config.py`
+(`PARENT_CHUNK_SIZE`/`_OVERLAP`, `CHILD_CHUNK_SIZE`/`_OVERLAP`), not a
+library default — see `LESSONS_LEARNED.md` #22 before changing them
+(200-char overlap on 400-char children is 50%, the documented cause of
+9,204 vectors from 30 pages in the pre-rebuild audit; making that visible
+and changing it are separate decisions).
+
+**Chunk IDs are content hashes, not URL-scoped**: `chunk_store.py::chunk_id()`
+hashes normalized chunk text alone (whitespace-collapsed, lowercased,
+trailing-punctuation-stripped — see `normalize_chunk_text()`), so the same
+text repeated across pages collides to one Chroma id and its `sources`
+metadata grows as a list instead of duplicating the vector. Verified
+against real cross-page duplicates in `archive/pre-rebuild/chroma_db/`
+and against two freshly-fetched real pages — see `LESSONS_LEARNED.md`
+#19/#23. **Use `ChunkStore.add_or_merge_chunk()` for every chunk write,
+never `collection.add()`/`upsert()` directly** — `add()` silently no-ops
+on a duplicate id (drops the new source), and `upsert()` replaces
+metadata wholesale instead of merging the `sources` list; only
+`add_or_merge_chunk()`'s get-then-update path preserves prior sources
+(`LESSONS_LEARNED.md` #20).
+
+**Embedding-model identity is checked loudly, not warned about**: every
+Chroma collection records `embedding_model`/`embedding_dim` in its
+metadata at creation (`get_or_create_collection()`); both the write path
+and `query_chunks()` call `verify_embedding_identity()`, which raises
+`EmbeddingIdentityMismatch` (not a log line) if the model in use doesn't
+match what the collection was built with.
 
 **Relevance scoring uses `score_headings`, not the intuitive default
 (max-over-chunks)** — chosen from a real measurement, not assumed. See

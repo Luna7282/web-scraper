@@ -57,12 +57,12 @@ class TestExtractWorkerFailureModes(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.frontier.close()
 
-    def _spawn(self, score_fn, extract_fn, extract_threshold=0.5, follow_threshold=0.5):
+    def _spawn(self, score_fn, extract_fn, extract_threshold=0.5, follow_threshold=0.5, chunk_fn=None):
         extract_task = asyncio.create_task(
             extract_worker(
                 self.frontier, self.content_queue, self.results_queue,
                 score_fn, extract_fn, extract_threshold, follow_threshold,
-                poll_interval=0.01,
+                chunk_fn=chunk_fn, poll_interval=0.01,
             )
         )
         recrawl_task = asyncio.create_task(
@@ -179,6 +179,55 @@ class TestExtractWorkerFailureModes(unittest.IsolatedAsyncioTestCase):
         counts = await self.frontier.counts_by_status()
         self.assertEqual(counts.get("skipped_extract"), 1)
         self.assertNotIn("failed", counts)
+
+    async def test_chunk_fn_result_attached_to_extraction_result_when_provided(self):
+        async def score_fn(url, content):
+            return 1.0
+
+        async def extract_fn(content):
+            return '[{"instruction": "Q", "response": "A"}]'
+
+        def chunk_fn(content):
+            return [{"text": content, "parent_text": content}]
+
+        tasks = self._spawn(score_fn, extract_fn, chunk_fn=chunk_fn)
+        for _ in range(50):
+            if self.results_queue.qsize() >= 1:
+                break
+            await asyncio.sleep(0.02)
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+        result: ExtractionResult = self.results_queue.get_nowait()
+        self.assertEqual(result.chunks, [{"text": CONTENT, "parent_text": CONTENT}])
+
+    async def test_no_chunk_fn_leaves_chunks_none(self):
+        async def score_fn(url, content):
+            return 1.0
+
+        async def extract_fn(content):
+            return '[{"instruction": "Q", "response": "A"}]'
+
+        tasks = self._spawn(score_fn, extract_fn)  # chunk_fn not provided
+        for _ in range(50):
+            if self.results_queue.qsize() >= 1:
+                break
+            await asyncio.sleep(0.02)
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+        result: ExtractionResult = self.results_queue.get_nowait()
+        self.assertIsNone(result.chunks)
 
 
 if __name__ == "__main__":

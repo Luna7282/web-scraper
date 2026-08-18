@@ -21,7 +21,7 @@ from typing import Awaitable, Callable
 
 import aiofiles
 
-ChromaUpsertFn = Callable[[list[dict]], Awaitable[None]]
+ChromaUpsertFn = Callable[[str, list[dict]], Awaitable[None]]  # (url, chunks) -- each chunk needs its source url
 
 
 class Writer:
@@ -75,4 +75,4 @@ class Writer:
                     await f.writelines(lines)
                 self._written_urls.add(url)
             if chunks and self._chroma_upsert_fn is not None:
-                await self._chroma_upsert_fn(chunks)
+                await self._chroma_upsert_fn(url, chunks)
