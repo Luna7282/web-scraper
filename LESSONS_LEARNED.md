@@ -2357,6 +2357,87 @@ cost" -- variant A is a genuine, verified win on the evidence gathered.
 numbers**, per the explicit instruction not to apply anything until
 they've been seen.
 
+## 2026-08-19 — Variant A applied; fabrication finding checked against real data
+
+### 47. ROADMAP #32 fix applied; the fabrication finding is real but small in the existing corpora, not the 52 it first looked like
+Applied Variant A (entry #46) to
+`content/extraction.py::QA_EXTRACTION_SYSTEM_PROMPT` -- verified win on
+both sites, Variant B's fragmentation cost confirmed by reading, not
+just by the (unreliable, see below) metric. Full test suite green,
+unaffected (no test asserts the prompt's exact wording).
+
+**Re-verified Variant A doesn't fabricate, on the exact chunk that has
+blank cells**: none of the 7 blank-description VGroup attribute rows
+(`animation_overrides`, `color`, `n_points_per_curve`, `sheen_factor`,
+`stroke_color`, `target`, `original_id`) appear anywhere in Variant A's
+8-pair output for that chunk -- checked directly, not inferred from the
+0% bare-row-coverage statistic alone.
+
+**Checked the archived corpora for existing fabrication, and the honest
+count is much smaller than the raw hit count suggested.** 103 blank-
+cell rows exist across the archived manim corpus (FastAPI's has zero --
+every one of its table cells has real text). 52 pair-instances mention
+a blank-cell row's name at all. Read every one, not just counted word-
+matches, because the raw count conflates several different things:
+- **31+ are honest name-only enumeration** -- several pairs literally
+  say `` `animation_overrides` (no description) `` rather than
+  inventing one. Not fabrication; if anything, transparent about the
+  gap.
+- **A handful are false positives of plain word-matching** -- e.g. a
+  `fill_color` explanation using the ordinary English phrase "fill
+  color" in prose, matching against the unrelated blank `color`
+  attribute row; a code example containing `color=RED` as a Python
+  kwarg matching the same way. Not about the row at all.
+- **A handful state a specific claim that turns out to be genuinely
+  grounded elsewhere in the same chunk** -- confirmed by reading the
+  full chunk, not just the flagged row: `CounterclockwiseTransform`'s
+  attribute table leaves `path_arc`'s description blank, but its
+  `_original__init__` signature elsewhere in the *same* chunk literally
+  reads `path_arc =3.141592653589793`, and the pair's claimed default
+  matches that number exactly. Sourced from a different part of the
+  chunk than the blank cell, not invented.
+- **~4 distinct pairs (touching ~9 row-instances) remain genuinely
+  ungrounded** -- plausible-sounding claims about standard, predictable
+  Animation-class parameters (`run_time`, `path_func`, a second,
+  vaguer `path_arc` claim) with no explicit textual basis found
+  anywhere in their chunk. Soft violations of "derived ONLY from the
+  provided text" -- none verifiably *false* (these are standard enough
+  Manim conventions that the claims are plausibly accurate), none as
+  clearly invented as the controlled test's `n_points_per_curve`
+  example, but not clean either.
+
+**Net finding, stated precisely per the ask**: the failure mode is
+real and demonstrated (the controlled test's `n_points_per_curve`/
+`color` example is unambiguous fabrication with zero textual basis),
+but its footprint in the actual archived production data is small --
+roughly 4 pairs, not 52, and none of those 4 are clearly false, just
+under-grounded. Recorded as ROADMAP #33, sized XS, not treated as an
+urgent existing-data cleanup. Variant A checked clean against the exact
+chunk that produced the controlled-test fabrication, so this shouldn't
+recur going forward.
+
+**The redundancy-similarity measure has now produced a false positive
+twice, in two different call sites, from the same root cause** -- worth
+its own note since it's the same measure a real feature depends on.
+Entry #40: `semantic_dedup()`'s near-dup detector ranked a false
+positive (two different Scene classes sharing a templated sentence)
+above a confirmed true positive, which is why pair-level semantic dedup
+stays off (ROADMAP #23). This entry: the same `SequenceMatcher`-on-
+answer-text approach, applied ad hoc to check the prompt variants
+above for redundancy, flagged 92-100% of clean, non-redundant,
+one-fact-per-pair table-coverage output as "redundant" -- confirmed by
+manually reading every flagged pair. Both failures have the identical
+shape: short, structurally-parallel-but-factually-distinct sentences
+("the `depth` attribute represents the depth of the mobject" / "the
+`height` attribute represents the height of the mobject") score high
+on character-sequence similarity despite describing different facts.
+Two independent occurrences is a stronger signal than one that this
+specific measure -- not just this specific application of it -- doesn't
+belong anywhere in this codebase's redundancy judgments without a
+different similarity signal underneath it. See ROADMAP #23's note
+cross-referencing this entry, so either one found first leads to the
+other.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->

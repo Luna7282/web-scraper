@@ -19,23 +19,41 @@ import re
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
-# Variable-count, anti-reword prompt -- replaces a fixed "3 to 5 pairs"
-# instruction that produced near-identical paraphrase padding on 98.9% of
-# real chunks regardless of content richness (LESSONS_LEARNED.md #33's
-# 2B measurement). A real 12-chunk A/B test against the fixed-count
-# version (reusing exact stored source_chunk text, zero new fetches) cut
-# pair count 56 -> 43 with 6 of 7 reductions being pure restatement
-# removal or improved coverage at the same count; one chunk showed a
-# small real loss, recorded below rather than left to be rediscovered.
-QA_EXTRACTION_SYSTEM_PROMPT = """You are an expert training data generator. Your task is to read the provided text and generate up to 5 diverse, high-quality instruction-response pairs for fine-tuning a Large Language Model.
+# Variable-count, anti-reword, table-coverage prompt. History:
+# - Fixed "3 to 5 pairs" (pre-Phase-3) produced near-identical paraphrase
+#   padding on 98.9% of real chunks regardless of content richness
+#   (LESSONS_LEARNED.md #33's 2B measurement).
+# - Phase 3 Step 3's variable-count/anti-reword version fixed that (a
+#   real 12-chunk A/B test cut pair count 56 -> 43), but a later
+#   diagnosis (LESSONS_LEARNED.md #43/#45, ROADMAP #32) found it
+#   under-covers table/list rows relative to prose: confirmed on two
+#   unrelated generators (manim/Sphinx, FastAPI/mkdocstrings), 894 real
+#   table rows measured, only 81.9% mentioned in any pair, and the
+#   misses weren't just thin rows -- 18.1% of *richly-described* rows
+#   (75 distinct names) got zero coverage.
+# - Rule 1 below adds a coverage rule scoped specifically to tables/
+#   lists of named items, alongside the unchanged anti-padding rule for
+#   everything else -- tested against 3 alternatives offline
+#   (LESSONS_LEARNED.md #46) and verified by manually reading every
+#   output, not just an automated redundancy score (which produced a
+#   false positive on this exact kind of output -- see #40/#46): this
+#   phrasing closed the coverage gap to 100% rich-row coverage on both
+#   generators with zero bare-row padding and no fragmentation
+#   regression, where a two-step "enumerate then one-pair-each"
+#   alternative matched the coverage number but genuinely fragmented
+#   prose (FastAPI tutorial pairs 5 -> 12 on one chunk) and re-split a
+#   multi-aspect method that this version and the prior baseline both
+#   correctly kept as one pair.
+QA_EXTRACTION_SYSTEM_PROMPT = """You are an expert training data generator. Your task is to read the provided text and generate diverse, high-quality instruction-response pairs for fine-tuning a Large Language Model.
 
 CRITICAL RULES:
-1. Generate one pair per genuinely distinct fact, concept, or capability described in the text -- not a fixed count. Thin content that only supports one or two real questions should produce only one or two pairs; do not pad with restatements to reach a target number.
-2. Never generate two pairs that ask about the same underlying fact from a different angle. Before adding a pair, check it against the ones you've already written -- if it's really the same question reworded, skip it instead.
-3. The 'instruction' must be a specific question or command that a user would realistically ask.
-4. The 'instruction' MUST be entirely self-contained. Never use pronouns like "he", "it", or "this company".
-5. The 'response' must be accurate, detailed, and derived ONLY from the provided text.
-6. If the text is just a navigation menu or footer with no real content, return an empty list.
+1. If the text contains a table, list, or enumeration of distinct named items (parameters, attributes, methods, classes, etc.), generate one pair per item that has real descriptive content -- do not skip an item just because its description is short, as long as it says something real about that item.
+2. For all other content, generate one pair per genuinely distinct fact or concept -- not a fixed count. Thin content that only supports one or two real questions should produce only one or two pairs; do not pad with restatements to reach a target number.
+3. Never generate two pairs that ask about the same underlying fact from a different angle. Before adding a pair, check it against the ones you've already written -- if it's really the same question reworded, skip it instead.
+4. The 'instruction' must be a specific question or command that a user would realistically ask.
+5. The 'instruction' MUST be entirely self-contained. Never use pronouns like "he", "it", or "this company".
+6. The 'response' must be accurate, detailed, and derived ONLY from the provided text.
+7. If the text is just a navigation menu or footer with no real content, return an empty list.
 
 Format your output EXACTLY as a JSON array of objects, where each object has an "instruction" key and a "response" key."""
 

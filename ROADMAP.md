@@ -368,6 +368,21 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     measure.** The report mode itself stays and is what should be run
     again first against any future corpus, since it's what established
     this. **Size: done, and correctly not applied.**
+    **Second independent occurrence of the same false positive**, this
+    time outside `semantic_dedup()` entirely: the same
+    `SequenceMatcher`-on-answer-text measure, applied as an ad-hoc same-
+    chunk redundancy check while testing ROADMAP #32's prompt fix,
+    flagged 92-100% of two prompt variants' table-coverage output as
+    "redundant" -- a manual read confirmed every flag was template
+    similarity ("The `depth` attribute represents the depth of the
+    mobject" vs. "The `height` attribute represents the height of the
+    mobject" -- different facts, near-identical sentence shape), not
+    real duplication. See `LESSONS_LEARNED.md` #46. Two independent
+    false positives from the same root cause, in two different call
+    sites, is a stronger signal than either alone that this measure
+    specifically fails on short, structurally-parallel-but-distinct
+    content -- worth remembering before reaching for it a third time
+    anywhere in this codebase.
 
 24. **Whether a listing/index page should pass `extract_threshold` at
     all is unanswered.** `blog.cloudflare.com`'s root (item 20 above) is
@@ -568,6 +583,49 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     a table, cover every row" as an exception to the anti-padding
     instruction). **Size: S-M -- the diagnosis is now solid enough across
     two generators to justify picking one, not measuring further first.**
+    ***RESOLVED***: a coverage rule scoped to "a table, list, or
+    enumeration of distinct named items" (leaving the anti-padding rule
+    for everything else unchanged) tested clean against 3 alternatives
+    offline -- 100% rich-row coverage on both generators, zero bare-row
+    padding, no fragmentation regression, verified by manually reading
+    every output pair, not just an automated score (which produced a
+    false positive here, see #23 above and `LESSONS_LEARNED.md` #46).
+    Applied to `content/extraction.py::QA_EXTRACTION_SYSTEM_PROMPT`.
+
+33. **[Found investigating #32] Baseline (pre-fix) extraction can
+    fabricate descriptions for table rows whose source cell is blank --
+    demonstrated live, but rare in the existing archived corpora.** A
+    controlled test (`LESSONS_LEARNED.md` #46) caught the old prompt
+    inventing specific, unsupported claims for undescribed VGroup
+    attributes ("`n_points_per_curve` relates to curve point density" --
+    the source cell is empty). Checked whether this happened in
+    practice: of 103 blank-cell rows across the archived manim corpus
+    (FastAPI's archived corpus has zero blank-cell rows), 52 pair
+    instances mention the row's name at all -- but reading every one
+    individually (not just counting word-matches) found **most are not
+    fabrication**: 31+ are honest name-only enumeration (several
+    literally say "(no description)"), several are false positives of
+    plain word-matching (e.g. "fill color" in prose triggering a match
+    against the unrelated blank `color` attribute), and several state a
+    specific value that turns out to be genuinely grounded elsewhere in
+    the same chunk (a constructor signature showing `path_arc
+    =3.141592653589793` even though the *attribute table's* description
+    cell for `path_arc` is blank). After removing all of those, roughly
+    4 distinct pairs (touching ~9 row-instances, all on standard/
+    predictable Animation-class parameters like `run_time`/`path_func`)
+    make plausible-sounding claims not explicitly grounded in that
+    chunk's own text -- a soft version of the same rule violation, none
+    verifiably false, none as clearly invented as the live-test example.
+    **Not a widespread existing-data problem** on the evidence gathered,
+    but the failure mode is real and confirmed reachable. Variant A
+    (item #32's fix, now applied) was specifically checked against this
+    and produces zero bare-row mentions on the same chunk that triggered
+    the live-test fabrication -- going forward this shouldn't recur.
+    *Not fixed here*: whether to retroactively review or drop the ~4
+    borderline pairs already in `archive/step6-manim-baseline/` is a
+    separate, low-priority decision given the small count and the fact
+    none are verifiably false. **Size: XS if pursued -- a short manual
+    list, not a systematic cleanup.**
 
 ---
 
