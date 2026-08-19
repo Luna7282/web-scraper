@@ -2996,4 +2996,93 @@ seeded at least once by an earlier process -- so `recover_crashed()`
 never saw a truly empty table at the moment that mattered. A clean-room
 first run was never actually exercised end-to-end before this session.
 
+---
+
+## 2026-08-19 — Relevance-gate threshold picked from real data, Phase 1
+
+### 54. Score distribution is narrow and unimodal-ish, not bimodal -- 0.50 preserves every confirmed-relevant article and cuts the worst 18%, but author-bio pages resist filtering by score alone
+Phase 1 of the relevance-gate test: real crawl of `blog.cloudflare.com`
+(intent: "Technical explanations of how DDoS attacks work and how they
+are detected and mitigated, including network-layer security and
+traffic-filtering techniques"), `extract_threshold` set above the
+maximum possible cosine similarity so every page got scored via local
+embeddings but none got extracted -- zero chat-LLM calls, per the
+explicit ask to measure the gate with scoring alone (see the discussion
+above #53; also see #53 for the fresh-db bug found and fixed getting
+this far). Capped at `max_pages=100`, overshot to 109 under concurrency
+(expected, `ROADMAP.md` #28).
+
+**Distribution**: min=0.4088, max=0.7291, mean=0.5523, median=0.5559,
+stdev=0.0545 -- a narrow band, not two separated clusters. Skip fraction
+by candidate threshold: 0.4 -> 0%, 0.5 -> 18%, 0.6 -> 86%, 0.7 -> 98%.
+The mass of the distribution sits in 0.50-0.60.
+
+**Threshold chosen: 0.50.** Reasoning, backed by reading real page
+content (not just scores) at both boundaries:
+- Every genuinely on-topic BGP/DDoS/routing-security article found in
+  this sample scores >= 0.5097 (`route-leak-incident-january-22-2026`,
+  confirmed by reading it -- a real BGP route-leak writeup, squarely
+  on-intent). 0.50 is the highest round threshold that keeps all of
+  them.
+- The 20 pages it skips were sample-checked, not assumed: read
+  `agents-week-review-august-2026` (0.4088, lowest score -- an AI-agents
+  product recap, confirmed off-topic) and `workers-ai-gateway-unification`
+  (0.4802 -- an AI Gateway/Workers AI product-merger announcement,
+  confirmed off-topic). Also read `cloudflare-incident-on-august-21-2025`
+  (0.4912, borderline-looking from the title) -- the page's own text
+  says explicitly "It was a network congestion event, not an attack or a
+  BGP hijack," which is exactly why the score correctly put it below the
+  cut. A real, checked case of the embedding score agreeing with the
+  content, not just the URL slug.
+
+**What the next level up costs (0.55 or 0.6)**: real relevant content,
+confirmed by reading. `route-leak-incident-january-22-2026` (0.5097) and
+`going-bgp-zombie-hunting` (0.5146) would both be wrongly cut at 0.55.
+At 0.6, the loss is much larger -- `bgp-origin-attribute`, `backbone2024`,
+`radar-routing`, `bgp-route-leak-venezuela`,
+`route-leak-detection-with-cloudflare-radar`,
+`cloudflare-1111-incident-on-june-27-2024`, `rfc9234-bgp-role-model`,
+`how-a-nigerian-isp-knocked-google-offline`, and more -- a large fraction
+of the genuinely on-topic articles in the sample. And raising the
+threshold doesn't even reliably buy precision in exchange:
+`good-and-bad-agentic-behaviors` (0.6030, read in full) survives even at
+0.6 despite being about bot/agent traffic *behavioral classification*,
+not DDoS detection -- tangentially security-adjacent at best, the same
+"topically adjacent but not actually on-intent" shape as the RAG
+evaluation's `m11` finding (#51).
+
+**What the next level down costs (0.4)**: nothing, and gains nothing --
+0.4088 is the literal minimum score in this sample, so threshold=0.4
+skips 0% just like threshold=0, matching the score-report's own number.
+
+**A structural finding the threshold can't fix**: `/author/*` pages (41
+of them site-wide per the branch discovery table) score across almost
+the *entire* range, not a separate low cluster -- `author/cloudforce` at
+0.7208 (second-highest score in the whole sample, just below the actual
+DDoS report) down to `author/matthew-conroy` at 0.4628. Read
+`author/celso` (0.5000, sitting exactly on the chosen cutoff): its
+content is a byline card for that author's own posts (here, the
+off-topic Kitesurf browser announcement) plus a row of co-author avatar
+images -- not real Q&A-worthy content by any definition, but embeds
+close enough to genuine article text that no single relevance threshold
+can cleanly separate it from real content. Same likely applies to
+`/tag/*` pages (10 of them), which are link listings, not prose.
+**Not fixed here** -- a global intent-relevance cutoff is the wrong tool
+for this specific problem; it would need a structural filter (URL
+pattern) independent of relevance scoring. Logged as `ROADMAP.md` #39.
+
+Also confirmed a related false-positive-by-domain-collision:
+`mcp-security-updates` (0.5780, read in full) is about *AI agent tool
+protocol* traffic inspection (Cloudflare One visibility into MCP
+traffic) -- a different "security" than DDoS/network-layer mitigation,
+kept by the chosen threshold as an acceptable false positive (real
+security content, just not the specific intent).
+
+**Net**: 0.50 is the threshold Phase 2 will run with. It costs nothing
+in confirmed-relevant recall in this sample and removes the clearest 18%
+of off-topic noise, but the honest remaining false-positive rate above
+the cutoff -- mostly author/tag pages plus a couple of adjacent-domain
+"security" posts -- is real and not something this mechanism alone
+resolves.
+
 <!-- Append new entries below this line, most recent last, dated. -->

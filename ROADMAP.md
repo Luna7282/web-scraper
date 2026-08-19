@@ -769,6 +769,28 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     surface (log the values found); a real decision about whether to
     gate the crawl on `ai-train=no` is a separate, bigger conversation.**
 
+39. **Intent-relevance scoring can't separate structurally-low-value
+    pages (author bios, tag/listing pages) from real content -- they
+    score across almost the entire distribution, not a low cluster.**
+    Found picking a real relevance threshold against `blog.cloudflare.com`
+    (`LESSONS_LEARNED.md` #54): `/author/*` pages scored from 0.4628 up
+    to 0.7208 -- the *second-highest* score in a 109-page sample,
+    higher than every genuinely on-topic article except the single best
+    match. Read one (`author/celso`, sitting exactly on the chosen
+    cutoff): it's a byline card (an author's post blurb plus co-author
+    avatar images), not real content, but it embeds close enough to real
+    article text that no relevance threshold value can cleanly exclude
+    it without also cutting genuinely relevant articles that happen to
+    score nearby. `/tag/*` pages (link listings, not prose) are likely
+    the same shape, not separately verified. *Not fixed*: the relevance
+    gate is the wrong mechanism for this -- would need a structural
+    filter (URL pattern, e.g. skip `/author/*`/`/tag/*` from extraction
+    regardless of score) as a separate mechanism from intent-relevance
+    scoring. **Size: S** (a config-driven exclude-pattern list checked
+    before scoring, analogous to how chrome-stripping already excludes
+    structural page regions rather than trying to detect them by
+    content).
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
