@@ -342,17 +342,32 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     far bigger of the two causes on real data, confirming semantic dedup
     (catches both) over a chunking-overlap change (catches only the
     smaller one).
-    *Fix, built and tested against synthetic data, not yet applied to a
-    real export*: `export_formats.py::semantic_dedup()` (Phase 3 Step 4,
-    `LESSONS_LEARNED.md` #37) -- reuses the already-calibrated
-    `find_near_duplicates()` text-similarity detector rather than a new
-    embedding-based measure, runs at export time (the only point that
-    naturally sees pairs from every chunk of a page at once), keeps the
+    *Fix, built, tested against synthetic data, and now measured against
+    a real export -- staying off*: `export_formats.py::semantic_dedup()`
+    (Phase 3 Step 4, `LESSONS_LEARNED.md` #37) reuses the already-
+    calibrated `find_near_duplicates()` text-similarity detector rather
+    than a new embedding-based measure, runs at export time, keeps the
     longer answer on a collision, and defaults to off with a
-    `--semantic-dedup-report` dry-run mode so the 0.4 threshold gets
-    confirmed against real data (the Step 6 re-run) before it's trusted
-    to actually drop rows. **Size: done -- what's left is a real-data
-    threshold check, not new code.**
+    `--semantic-dedup-report` dry-run mode. That report mode is what
+    caught the reason to leave it off: run against the real Step 6
+    corpus at the requested 0.80/0.85/0.90/0.95 thresholds, zero
+    candidates at all four (near-verbatim duplicates don't really exist
+    post-Steps-1-3); the only range with any candidates (0.4-0.7) has no
+    ratio cutoff that separates true from false positives -- **the
+    single highest-ratio candidate in the entire set (0.687) is a false
+    positive** (two different Scene classes sharing a templated
+    sentence, ranked above a confirmed true positive at 0.633) --
+    `LESSONS_LEARNED.md` #40. `SequenceMatcher.ratio()` over whole answer
+    text measures shared boilerplate phrasing as readily as shared
+    meaning, and since the false positive out-scores the true positive,
+    raising the threshold discards real duplicates before it discards
+    fake ones -- there is no cutoff to tune to. **Not enabled. If
+    revisited, the fix is a different similarity signal (shared
+    distinctive content words specifically, not character-sequence
+    overlap; or an LLM judge) — not a different cutoff on the current
+    measure.** The report mode itself stays and is what should be run
+    again first against any future corpus, since it's what established
+    this. **Size: done, and correctly not applied.**
 
 24. **Whether a listing/index page should pass `extract_threshold` at
     all is unanswered.** `blog.cloudflare.com`'s root (item 20 above) is
