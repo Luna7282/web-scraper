@@ -2253,6 +2253,110 @@ link-syntax leakage, in every pair sampled (18 from `reference/parameters`,
 (which facts get a pair), not a quality question (whether the pairs
 that do get generated are accurate).
 
+## 2026-08-19 — ROADMAP #32 fix attempt: characterized, tested, not applied
+
+### 46. Table-row coverage is a real, sizable gap -- and the fix that closes it exists, but wasn't applied pending review
+**Characterization first, offline, against both archived corpora** (no
+crawl, no new fetches): identified every markdown table row shaped like
+`` | `name` | description | `` across every chunk in both
+`archive/step6-manim-baseline/` and `archive/fastapi-baseline/` --
+155 table-shaped chunks, 997 rows -- and checked whether each row's name
+appears in any of that chunk's actual generated pairs.
+
+| | Count | Covered |
+|---|---|---|
+| Bare rows (description <10 chars, often empty) | 103 | 42.7% |
+| **Rich rows (real description present)** | **894** | **81.9%** |
+
+Per site, not pooled (manim's misses are disproportionately *inherited*
+attributes -- `always`/`depth`/`height`/`width` -- repeated near-
+identically across dozens of subclass pages, which is arguably correct
+to skip on the 40th repetition; FastAPI's misses are page-specific,
+real losses):
+- manim rich-row coverage: **59.8%**
+- FastAPI rich-row coverage: **87.8%**
+
+18.1% of rich rows overall (162 rows, 75 distinct names -- not a
+handful of repeated boilerplate) get zero mention in either the
+question or answer of any pair for that chunk. Real gap, not "nearly
+correct" -- matches the explicit ask's framing.
+
+**A separate, unrequested finding surfaced during characterization,
+worth recording on its own**: baseline's own behavior on the manim
+table chunk (this specific 12-attribute VGroup table, one live sample)
+included a "list all attributes" summary pair that **fabricated
+descriptions for bare/undescribed rows** -- e.g. stating `color` "holds
+the color of the mobject" and `n_points_per_curve` "relates to curve
+point density," neither of which the source table says (both cells are
+blank in the real page). This directly violates the prompt's own
+existing rule ("derived ONLY from the provided text"). Not something
+either prompt variant below does -- both leave bare rows alone entirely
+rather than inventing content for them -- but worth flagging as an
+existing failure mode independent of the coverage question, found
+because this test happened to sample it.
+
+**Prompt variants tested**: 3 prompts (baseline unchanged; variant A --
+coverage rule scoped specifically to "a table, list, or enumeration of
+distinct named items," anti-padding language otherwise unchanged;
+variant B -- an explicit two-step "enumerate every distinct item, then
+one pair per item" process) x 4 chunks (manim table/prose, FastAPI
+table/prose, exact chunks already analyzed, zero new fetches) = 12
+Ollama cloud deepseek-v4-flash calls, confirmed with the user before
+firing.
+
+**A methodology note that matters for reading the numbers below**: the
+automated same-chunk redundancy measure (`SequenceMatcher.ratio()` on
+normalized answer text, the same measure `semantic_dedup()`/
+`dataset_report.py` use) flags **92-100% "redundant"** on both variants'
+table-chunk output -- and a manual read of every flagged pair confirms
+this is a false positive, the identical template-similarity failure
+mode already documented in entry #40 ("What does the `depth` attribute
+represent?" / "The `depth` attribute represents the depth of the
+mobject." shares near-total sentence-template overlap with the
+`height` pair despite being a completely different, correctly-covered
+fact). The automated measure is not fit for judging redundancy on
+output shaped like "many short, structurally parallel, genuinely
+distinct one-liners" -- manual verification is the reliable signal here,
+consistent with #40's conclusion that this measure needs a different
+similarity signal to be trustworthy. Numbers below are the corrected,
+manually-verified read, not the raw automated flag.
+
+**Results, per site, not pooled** (rich-row coverage / genuine bare-row
+coverage / redundancy after manual correction):
+
+| | manim table (VGroup, 7 bare + 7 rich rows) | FastAPI table (parameters, 9 rich rows, 0 bare) |
+|---|---|---|
+| Baseline | 3 pairs. Rich 7/7 (100%, via one dump-style pair -- see fabrication finding above). Bare 6/7 "covered" but **fabricated**, not real. | 5 pairs. Rich 6/9 (67%) -- misses `alias_priority`, `title`, `description`, matching entry #45's original finding exactly. |
+| **Variant A** | 8 pairs, one per method/attribute. Rich **7/7 (100%)**. Bare **0/7 (0%, correctly and honestly skipped, no fabrication)**. `add` method stayed one consolidated pair (not fragmented). Manually confirmed non-redundant. | 9 pairs, one per parameter. Rich **9/9 (100%)** -- `alias_priority`/`title`/`description` now covered, accurately, each its own clean pair. Manually confirmed non-redundant. |
+| Variant B | 13 pairs. Rich 7/7 (100%). Bare 0/7 (0%; automated check initially showed 1/7 for `color`, traced to a false match on the word "color" inside the *`fill_color`* answer's own prose -- corrected by hand, a real limitation of plain word-boundary name matching worth noting for reuse). **But the `add` method got split into 4 separate pairs** (what it does / return type / error / parameters) where baseline and variant A used one -- a real, partial reversion toward the original padding pattern, scoped to multi-aspect methods rather than attribute tables. | 9 pairs, one per parameter. Rich **9/9 (100%)**. Same clean result as variant A -- no over-fragmentation on this chunk (it has no multi-aspect method to over-split, only flat parameter rows). |
+
+**Prose chunks -- this is where variant B actually fails**: manim
+prose pairs went 5 (baseline) -> 7 (variant A, genuinely distinct new
+facts on manual read: per-OS install commands split correctly,
+first-step, troubleshooting) -> 8 (variant B). FastAPI prose pairs went
+5 (baseline) -> **5 (variant A, unchanged)** -> **12 (variant B)**.
+Read variant B's 12 fastapi-prose pairs in full: real, confirmed
+fragmentation of one terminal-log block into thin individual facts
+("What command should I use to stop the FastAPI development server?" /
+"Press CTRL+C to quit the server." as its own standalone pair,
+alongside separate pairs for "what processes are started" and "what
+happens during startup") -- this is genuine padding, not a metric false
+positive, confirmed by direct read exactly as entry #40's methodology
+established: verify before trusting a number either direction.
+
+**Conclusion, per the explicit "don't apply until reviewed" instruction
+-- reported, not applied**: **Variant A closes the coverage gap
+(100% rich-row coverage on both sites, matching variant B) without
+variant B's regressions** (no bare-row padding on either, no method
+over-fragmentation on manim, no prose fragmentation on FastAPI --
+5 pairs unchanged from baseline). Variant B achieves the same coverage
+number but at a real, confirmed redundancy cost in two different
+places. This is not a case of "no variant improves coverage without
+cost" -- variant A is a genuine, verified win on the evidence gathered.
+**Not applied to `content/extraction.py` -- awaiting review of these
+numbers**, per the explicit instruction not to apply anything until
+they've been seen.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->
