@@ -377,12 +377,21 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     similarity ("The `depth` attribute represents the depth of the
     mobject" vs. "The `height` attribute represents the height of the
     mobject" -- different facts, near-identical sentence shape), not
-    real duplication. See `LESSONS_LEARNED.md` #46. Two independent
-    false positives from the same root cause, in two different call
-    sites, is a stronger signal than either alone that this measure
-    specifically fails on short, structurally-parallel-but-distinct
-    content -- worth remembering before reaching for it a third time
-    anywhere in this codebase.
+    real duplication. See `LESSONS_LEARNED.md` #46.
+    **Third independent occurrence**: the same measure, applied to check
+    for genuine near-duplicate content leaking across train/test splits
+    during the export-format audit, flagged candidates up to ratio 0.76
+    on FastAPI -- reading the top 15 by ratio found every single one was
+    the same templated-sentence pattern ("Where can I find the source
+    code for X? Located in file Y.py" repeated with a different function
+    and file each time; "type is `dict[str, Any] | None`, default
+    `None`" repeated across different, unrelated parameters), not one
+    genuine duplicated fact. See `LESSONS_LEARNED.md` #49. Three
+    independent false positives from the same root cause, in three
+    different call sites, is a stronger signal than either of the first
+    two alone that this measure specifically fails on short,
+    structurally-parallel-but-distinct content -- worth remembering
+    before reaching for it again anywhere in this codebase.
 
 24. **Whether a listing/index page should pass `extract_threshold` at
     all is unanswered.** `blog.cloudflare.com`'s root (item 20 above) is
@@ -626,6 +635,37 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     separate, low-priority decision given the small count and the fact
     none are verifiably false. **Size: XS if pursued -- a short manual
     list, not a systematic cleanup.**
+
+34. **`--framework mlx` performs zero schema validation, unlike
+    llama-factory/axolotl -- 4 of 7 schemas produce files mlx-lm's LoRA
+    loader cannot actually load.** Found doing an end-to-end export
+    audit against both archived corpora (`LESSONS_LEARNED.md` #49).
+    Verified against mlx-lm's real current docs (`mlx_lm/LORA.md`, not
+    guessed): the LoRA trainer auto-detects exactly four record shapes --
+    `messages` (chat), `messages`+`tool_calls`/`tools` (tools),
+    `prompt`+`completion` (completions), and `text` -- and explicitly
+    has no built-in Alpaca support: "a dataset using only Alpaca-style
+    keys would... fail automatic detection." Only `conversational`/
+    `openai_finetune` (-> chat) and `prompt_completion` (-> completions)
+    match a real mlx-lm shape. **`alpaca`, `embedding_pairs`, `rag_eval`,
+    and `vertex` all currently succeed and write files under
+    `--framework mlx`, but none of the four match a format mlx-lm's
+    loader recognizes** -- `alpaca` is the one that matters in practice
+    (an extremely common, otherwise-correct instruction-tuning schema);
+    the other three are for genuinely different tools anyway
+    (sentence-embedding training, RAG evaluation, Vertex AI) and were
+    never realistically mlx-lm targets, so their mismatch is less
+    surprising even though `package_mlx()` doesn't say so.
+    `package_llama_factory()`/`package_axolotl()` already refuse
+    schemas with no verified mapping instead of emitting one -- `mlx`
+    should follow the same pattern. *Fix, not yet chosen*: either
+    restrict `--framework mlx` to `{conversational, openai_finetune,
+    prompt_completion}` the same way llama-factory/axolotl are
+    restricted, or (better, since Alpaca is common enough to be worth
+    keeping) map `alpaca` onto mlx-lm's `text` format by assembling
+    `f"{instruction}\n{input}\n{output}"` the way mlx-lm's own docs
+    suggest for unsupported shapes ("use the `text` format to assemble
+    the content yourself"). **Size: S.**
 
 ---
 

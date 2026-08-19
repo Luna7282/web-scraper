@@ -2510,6 +2510,118 @@ coverage down not up, fabrication not reproduced at scale, and the one
 real caveat (39% of manim's gain being cross-page-repeated attributes)
 reported rather than hidden in the aggregate, as asked.
 
+## 2026-08-19 — Export formats run end-to-end on real data for the first time
+
+### 49. Every schema x framework combo run against both archived corpora -- one real gap found (mlx/alpaca), everything else holds up
+Export had only ever run in unit tests and one Part B demo -- same shape
+as the chrome_strip wiring gap (entry #28): code that passed its own
+tests without ever running the real path. Ran every (schema, framework)
+combination against both archived corpora (manim, FastAPI) -- 9 schemas
+(`conversational`, `alpaca`, `prompt_completion`, `embedding_pairs`,
+`rag_eval`, `openai_finetune`, `vertex`, `raw_text`, `triplets`) x 5
+frameworks where applicable (`raw_text`/`triplets` are batch
+projections that ignore the `framework` argument entirely and always
+write `train/validation/test.jsonl` directly -- confirmed by reading
+`run_export()`, not assumed). **114 combinations attempted: 58
+succeeded, 56 correctly refused** (llama-factory/axolotl's known-schema
+restrictions, and the dpo/orpo/kto/classification unsupported list) --
+**zero unexpected errors**. The unsupported-without-extra-pass list is
+confirmed accurate: dpo/orpo/kto/classification refuse loudly on both
+corpora, every framework, exactly as declared.
+
+**Record shape, both sites**: pulled the first 2 records for all 9
+schemas x 2 sites (18 samples) -- every schema produces the documented
+shape (`{"messages": [...]}` for conversational/openai_finetune,
+`{"instruction","input","output"}` for alpaca, `{"anchor","positive"}`
+for embedding_pairs, etc.), populated with real, grounded content, not
+placeholders.
+
+**Split checks**: reproducible with the same seed (two independent
+calls produce byte-identical split assignment); a different seed
+produces a genuinely different split (sanity that the seed isn't
+silently ignored); **zero sections span more than one split** on either
+corpus, confirming grouping is real, not incidental. **Checked for
+genuine near-duplicate content crossing train/eval, not just that
+grouping is section-based** -- this is the leak the section-based split
+is supposed to prevent, worth confirming rather than assuming the
+mechanism achieves it. Found candidates (60 on manim, 390 on FastAPI at
+`ratio>=0.4`) but reading the highest-ratio ones (up to 0.76 on
+FastAPI) found **every one is the established template-similarity false
+positive** ("Where can I find the source code for X? Located in file
+Y.py" repeated with a different function/file each time; "type is
+`dict[str, Any] | None`, default `None`" repeated across unrelated
+parameters) -- **zero genuine duplicated facts found spanning train and
+eval on either corpus.** This is the measure's **third** independent
+false positive in this project (entries #40, #46) -- cross-referenced
+in ROADMAP #23, now updated to say three, not two.
+
+**Derived schemas, checked at full scale, not just the first 2
+records**: `embedding_pairs`/`rag_eval`/`triplets` across all 5,492
+records on both sites combined -- **zero empty fields**, healthy
+minimum lengths on every field (`context`/`positive` minimum 62 chars
+on manim, 125 on FastAPI). Link stripping (Phase 3 Step 1) hasn't
+produced empty or degenerate `source_chunk`-derived context.
+
+**Loader verification, per framework** (real load-test where a loader
+is installed offline, spec-validated against current real docs
+otherwise -- stated explicitly which is which, per the ask):
+- **Axolotl -- real-load-tested.** `PyYAML` is installed; every
+  generated `axolotl_dataset.yaml` parses, has the expected
+  `datasets: [{path, type}]` structure, and its referenced
+  `dataset.jsonl` exists on disk. Cross-checked `type: alpaca` and
+  `type: chat_template` against Axolotl's *current* real docs
+  (`docs.axolotl.ai`, fetched fresh, not trusting the old code
+  comment's citation blindly) -- both mappings are exactly right:
+  `chat_template` expects `{"messages": [{"role", "content"}]}`
+  (confirmed our conversational/openai_finetune output matches
+  verbatim), `alpaca` expects `{"instruction", "input", "output"}`
+  (confirmed exact match).
+- **LLaMA-Factory -- spec-validated against current real docs**
+  (no LLaMA-Factory installation available to load against). Fetched
+  the real `dataset_info.json` from `hiyouga/LLaMA-Factory` fresh:
+  confirmed alpaca-shaped datasets need no `columns`/`formatting` entry
+  at all, and sharegpt-formatted (`messages`) datasets need exactly
+  `"formatting": "sharegpt"`, `"columns": {"messages": "messages"}`,
+  and the four-key `tags` dict we emit -- our generated
+  `dataset_info.json` matches both cases exactly, byte for byte on the
+  structure.
+- **HuggingFace -- spec-validated, explicitly not load-tested**
+  (`datasets` is not installed in this environment). Every
+  `train.jsonl`/`validation.jsonl`/`test.jsonl` across every schema on
+  both sites is valid JSON Lines with a **consistent key set within
+  each file** -- the actual requirement `datasets.load_dataset("json",
+  data_files=...)` has for inferring one Arrow schema per file. Zero
+  issues found.
+- **MLX -- spec-validated against current real docs, and this is where
+  the one real gap was found.** Fetched mlx-lm's real `LORA.md`: the
+  LoRA trainer auto-detects exactly four record shapes (`messages`
+  chat, `messages`+`tools` tool-calling, `prompt`+`completion`
+  completions, `text`) and explicitly has **no built-in Alpaca
+  support** -- confirmed directly against the docs, not inferred:
+  "a dataset using only Alpaca-style keys would... fail automatic
+  detection." Unlike `package_llama_factory()`/`package_axolotl()`,
+  **`package_mlx()` has no schema restriction at all** -- it happily
+  wrote `train.jsonl`/`valid.jsonl`/`test.jsonl` for `alpaca`,
+  `embedding_pairs`, `rag_eval`, and `vertex`, none of which mlx-lm's
+  loader would recognize. `alpaca` is the one that actually matters
+  (a common, otherwise-correct schema); the other three were never
+  realistic mlx-lm targets anyway (embedding-model training, RAG eval,
+  Vertex AI are different tools entirely), so their mismatch is
+  unsurprising even though nothing currently says so. Recorded as
+  ROADMAP #34 -- not fixed here, since this is the audit, not the
+  fix pass.
+
+**Net finding, stated per the ask**: everything declared supported
+*works* except one real gap (`mlx` + `alpaca`, and by extension
+`embedding_pairs`/`rag_eval`/`vertex` under `mlx`, none of which were
+ever realistic `mlx` targets anyway). The unsupported list is accurate.
+Splits are grouped correctly and don't leak genuine duplicate content.
+Derived schemas aren't degenerate. This is the same kind of "ran once,
+end to end, on real data" verification chrome_strip and robots.txt both
+needed before their own gaps surfaced -- worth remembering as a general
+pattern for any component that's only ever been exercised by its own
+unit tests plus one demo run.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->
