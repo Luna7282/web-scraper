@@ -1876,6 +1876,134 @@ against this real corpus, to see what the 0.4 threshold would flag on
 top of the near-dup counts already reported above, is the natural next
 check but wasn't run as part of this step's report.
 
+## 2026-08-19 — Two post-Step-6 checks: semantic-dedup threshold reality, and a direct pairs-per-page diff
+
+### 40. --semantic-dedup-report at 0.80-0.95 found nothing; the real range (0.4-0.7) is contaminated by template false positives, including at its own top
+Requested thresholds first: 0.80, 0.85, 0.90, 0.95 against the real
+Step 6 corpus (320 pairs) all produced **zero candidates**. Swept lower
+to find where candidates actually start: 0.7 -> 0, 0.6 -> 7, 0.5 -> 15,
+0.4 (the existing calibrated default) -> 47, 0.3 -> 177. Near-verbatim
+duplicates (what a 0.8+ ratio requires) essentially don't exist in this
+corpus anymore -- consistent with same-chunk padding (2B's dominant
+cause) being the thing Step 3's prompt targeted directly.
+
+**Read all 47 candidates at threshold 0.4 with both full pairs, not just
+a curated 10** -- and found the working range is not safe to apply
+blind. Two representative examples, verbatim, both directions:
+
+*True near-duplicate (correctly caught, survivor is the better pair --
+this is the PMobject case specifically asked about):*
+> DROPPED (ratio 0.633) Q: What does the `reset_points` method do in Manim? A: The `reset_points` method sets the `points` attribute of the mobject to an empty array.
+> SURVIVOR Q: What does the reset_points method do in PMobject? A: The reset_points method sets the 'points' attribute of the PMobject to be an empty array. This effectively clears all the points that were previously added. The method returns Self.
+
+The survivor is genuinely more complete (states the clearing effect and
+the return value) -- the longer-answer-wins collision rule worked as
+designed here.
+
+*False positive, and it is the single HIGHEST-ratio candidate in the
+entire set (0.687, higher than the true positive above):*
+> DROPPED Q: What does the SceneInteractRerun object do? A: The `SceneInteractRerun` object is used during scene interaction. When it is encountered in `Scene.interact()`, it triggers a rerun of the scene.
+> SURVIVOR Q: What does the SceneInteractContinue object do? A: The `SceneInteractContinue` object is used during scene interaction. When it is encountered in `Scene.interact()`, it triggers the end of the scene interaction and continues with the rest of the animations, if there are any remaining.
+
+These are two different classes with different behavior (rerun vs.
+continue) sharing a templated sentence ("X object is used during scene
+interaction. When it is encountered in Scene.interact(), it triggers
+Y") -- SequenceMatcher scores the shared template higher than the true
+positive above scores its shared content. Same pattern recurs
+repeatedly in the candidate list: per-OS install instructions
+(Windows/macOS LaTeX, Debian/Fedora TeX Live commands), different
+animation-module summaries, different mobject attributes (`always` vs
+`animate`), different changelog PRs -- all flagged as near-duplicate
+purely because Q&A pairs about structurally parallel but factually
+distinct facts share boilerplate phrasing. 37 of the 47 candidates are
+even *same-chunk* pairs, not cross-chunk -- so this isn't a same-chunk-
+is-safe/cross-chunk-is-risky distinction either; a single chunk that
+legitimately documents three parallel sub-facts (three OSes, two
+similarly-shaped classes) produces exactly this failure mode regardless
+of chunk boundaries.
+
+**Recommendation: do not enable `--semantic-dedup` on this corpus at any
+single fixed threshold as currently measured.** There is no ratio cutoff
+in the observed distribution that cleanly separates true from false
+positives -- the highest-ratio candidate in the whole set is a false
+positive, so raising the threshold doesn't reliably filter toward safety,
+it just removes real duplicates first while leaving some false positives
+in reach. This is exactly the finding the `dry_run`/report-mode design
+was built to surface before the threshold got trusted blind
+(`LESSONS_LEARNED.md` #37's stated purpose) -- it worked as intended.
+Not a mechanism bug: `find_near_duplicates()` measures answer-text
+similarity, and whole-answer `SequenceMatcher.ratio()` cannot distinguish
+"the same fact reworded" from "structurally parallel but distinct
+facts" -- that would need a different signal (shared distinctive
+content words specifically, not just character-sequence overlap) to
+fix, not a different number. Not built here -- this is the measurement,
+per the explicit ask.
+
+### 41. Direct pairs-per-page diff: mostly padding removal, but one page shows a real, specific, enumerable loss
+Compared the two archived corpora directly rather than trusting the
+aggregate 32.7 -> 7.8 pairs/page drop alone. 7 pages exist in both Part
+D's baseline and the Step 6 corpus; two read in full.
+
+**`tex_file_writing.html` (21 -> 13 pairs): clean consolidation, no
+real loss found.** Every function documented in Part D's 21 pairs
+(`compile_tex`, `convert_to_svg`, `delete_nonsvg_files`,
+`generate_tex_file`, `insight_inputenc_error`,
+`insight_package_not_found_error`, `make_tex_compilation_command`,
+`print_all_tex_errors`, `print_tex_error`, `tex_hash`,
+`tex_to_svg_file`) still has at least one pair in the new 13. The
+difference is pure consolidation: Part D routinely split one function
+into 2-3 separate pairs ("what does X do" / "what are X's parameters" /
+"what is X's return type"), the new corpus asks for "parameters and
+return type" together in one pair. Content-level cause, confirmed by
+chunk count: link-syntax removal (Step 1) let the same real content
+pack into 3 parent chunks instead of 5, so fewer chunk-boundary-driven
+question repeats existed to generate in the first place.
+
+**`VGroup.html` (26 -> 12 pairs): real, specific content loss alongside
+the padding removal -- not clean.** Confirmed real padding correctly
+removed (Part D had 4 separately-worded pairs all asking "what does the
+`add` method do", collapsed to one fuller pair in the new corpus; "what
+is VGroup" was asked and answered near-identically twice in Part D,
+once in the new corpus) and one Part D pair that was near content-free
+to begin with (`_original__init__`'s answer was the literal boilerplate
+"initializes self. See help(type(self)) for accurate signature." --
+losing this is not a loss). But three facts present in Part D's pairs
+are **not recoverable from any pair in the new 12**:
+- VGroup's base class (`VMobject`) -- a complete, standalone Part D pair,
+  absent entirely from the new corpus.
+- The **non-mutating** `+`/`-` operator behavior. The new corpus's
+  "combine two VGroups" pair covers `+=`/`-=` (mutates in place) fully
+  and correctly, but never states that plain `+`/`-` construct a new
+  VGroup *without* modifying the original -- Part D's pair stated both
+  halves of the contrast explicitly; the new corpus states only half.
+- The attribute list. Part D had one pair enumerating 12 VGroup
+  attributes with descriptions where available; the new corpus surfaces
+  3 of those 12 (`always`, `animate`, `fill_color`) as individual,
+  more-detailed pairs, but 9 (`animation_overrides`, `color`, `depth`,
+  `height`, `n_points_per_curve`, `sheen_factor`, `stroke_color`,
+  `width`, `target`, `original_id`) appear nowhere in the new corpus.
+  Worth qualifying, not overstating: 7 of those 9 had no description at
+  all in Part D's own answer (bare attribute names), so their loss is a
+  loss of *name presence*, not explained content; `depth`/`height`/
+  `width` did have real one-line descriptions ("The depth/height/width
+  of the mobject") that are now gone, though each was already close to
+  self-evident from the attribute name.
+- One code-example walkthrough (`ArcShapeIris`, a list-comprehension
+  example building several circles into a VGroup) has no equivalent
+  pair in the new corpus at all.
+
+**Conclusion, stated directly per the ask**: the pairs/page drop is
+*mostly* redundancy removal working as intended, confirmed by a second,
+cleaner page (`tex_file_writing.html`) showing no loss at all -- but
+`VGroup.html` proves it is not uniformly lossless, and the honest
+answer is "mostly junk, with a real minority of coverage loss on at
+least one page," not "confirmed junk-only." Not fixed here -- this was
+the direct check the aggregate numbers can't make, per the explicit
+ask; whether the loss rate justifies a fix (e.g. a lower per-chunk pair
+floor, or explicitly prompting for attribute/enum tables to stay
+list-form rather than being split one-per-item) is a decision for
+whoever scopes the next round, not made in this measurement.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->
