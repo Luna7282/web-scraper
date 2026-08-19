@@ -14,6 +14,9 @@ import asyncio
 import time
 import unittest
 
+import openai
+import requests
+
 from crawl.frontier import Frontier
 from crawl.pipeline import extract_worker, RateLimitError, ExtractionResult
 
@@ -318,6 +321,61 @@ class TestExtractWorkerFailureModes(unittest.IsolatedAsyncioTestCase):
 
         result: ExtractionResult = self.results_queue.get_nowait()
         self.assertIsNone(result.chunks)
+
+    async def test_embedding_timeout_retries_then_fails_with_reason_recorded(self):
+        """A hung LocalOllamaEmbeddings.embed_query() call now raises
+        requests.exceptions.Timeout instead of blocking forever
+        (config.OLLAMA_EMBED_TIMEOUT_SECONDS, LESSONS_LEARNED.md #56) --
+        confirms that turning an invisible hang into a real exception
+        actually reaches the existing retry-then-fail path, with the
+        reason recorded, rather than the row silently vanishing."""
+        attempts = []
+
+        async def score_fn(url, content):
+            attempts.append(url)
+            raise requests.exceptions.Timeout("simulated embedding timeout")
+
+        async def extract_fn(unit):
+            raise AssertionError("must never reach extraction -- scoring failed first")
+
+        tasks = self._spawn(score_fn, extract_fn)
+        await run_to_quiescence(tasks, self.frontier)
+
+        self.assertEqual(len(attempts), 3)  # MAX_RETRIES=3, re-fetched and re-scored each time
+        counts = await self.frontier.counts_by_status()
+        self.assertEqual(counts.get("failed"), 1)
+        cur = await self.frontier._conn.execute("SELECT last_error FROM frontier WHERE url = ?", (SEED,))
+        row = await cur.fetchone()
+        self.assertIn("Timeout", row["last_error"])
+        self.assertIn("scoring", row["last_error"])
+
+    async def test_llm_timeout_retries_then_fails_with_reason_recorded(self):
+        """Same as above for the extraction call site: ChatOpenAI's real
+        client now has an explicit timeout (config.LLM_EXTRACT_TIMEOUT_SECONDS)
+        instead of Timeout(timeout=None) -- a hung call raises
+        openai.APITimeoutError (the real exception type this project's
+        LLM client would actually produce) rather than blocking forever,
+        and that must reach the retry-then-fail path with the reason
+        recorded, not just disappear."""
+        attempts = []
+
+        async def score_fn(url, content):
+            return 1.0
+
+        async def extract_fn(unit):
+            attempts.append(unit)
+            raise openai.APITimeoutError(request=None)
+
+        tasks = self._spawn(score_fn, extract_fn)
+        await run_to_quiescence(tasks, self.frontier)
+
+        self.assertEqual(len(attempts), 3)  # MAX_RETRIES=3
+        counts = await self.frontier.counts_by_status()
+        self.assertEqual(counts.get("failed"), 1)
+        cur = await self.frontier._conn.execute("SELECT last_error FROM frontier WHERE url = ?", (SEED,))
+        row = await cur.fetchone()
+        self.assertIn("APITimeoutError", row["last_error"])
+        self.assertIn("extraction", row["last_error"])
 
 
 if __name__ == "__main__":

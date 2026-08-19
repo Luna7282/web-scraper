@@ -3343,4 +3343,43 @@ changed. `ROADMAP.md` #40 tracks adding explicit timeouts to both
 `requests.post` calls in `LocalOllamaEmbeddings` and to `ChatOpenAI`'s
 construction in `llm_factory.py::get_llm`.
 
+### 57. ROADMAP #40 fixed: explicit timeouts on both call sites, confirmed to actually reach the existing retry-then-fail path
+`config.py`: `LLM_EXTRACT_TIMEOUT_SECONDS = 600` (matches the `openai`
+SDK's own default -- the one `langchain_openai`'s wrapper was silently
+dropping -- and sits well above the 153.5s real max observed in #56, so
+a genuinely slow-but-working call is never mistaken for a dead one) and
+`OLLAMA_EMBED_TIMEOUT_SECONDS = 60` (generous headroom over the 2-6s
+real range for a *local* call -- anywhere near 60s already means the
+local Ollama server itself is wrong, not just busy). Wired into
+`llm_factory.py`: `ChatOpenAI(..., timeout=LLM_EXTRACT_TIMEOUT_SECONDS)`
+(confirmed empirically which of `timeout=`/`request_timeout=` actually
+reaches the real underlying `httpx.Client` before picking one -- both
+do, in this `langchain_openai` version) and
+`LocalOllamaEmbeddings(timeout_seconds=OLLAMA_EMBED_TIMEOUT_SECONDS)`,
+now a constructor parameter (defaulted, so the one other call site --
+`main.py::query_command` -- picks it up automatically without its own
+change) threaded into both `requests.post()` calls.
+
+**Confirmed the effect, not just the config, per the explicit ask**:
+does a timeout firing actually reach the existing retry-then-fail path
+with the reason recorded, or does it disappear silently? Two new tests
+in `tests/test_extract_worker.py` using the *real* exception types each
+call site would actually raise (`requests.exceptions.Timeout` for the
+scoring/embedding path, `openai.APITimeoutError` for the extraction
+path -- not a generic stand-in) --
+`test_embedding_timeout_retries_then_fails_with_reason_recorded` and
+`test_llm_timeout_retries_then_fails_with_reason_recorded`. Both
+confirm: 3 attempts (MAX_RETRIES), final status `failed`, and
+`last_error` contains both the real exception class name and which
+stage it happened in (`"scoring: ..."` / `"extraction: ..."`) --
+querying the frontier row directly (`frontier._conn`, no public
+accessor exists for a single row's `last_error` today, not worth adding
+one for a two-assertion test). No pipeline code needed to change for
+this to work -- `extract_worker`'s existing `except Exception as e:`
+branches around both call sites already routed any exception into
+`mark_extract_outcome(..., "failed", ...)`; the gap was purely that a
+hung connection never raised anything to catch in the first place.
+
+339 tests green (337 + 2 new). `ROADMAP.md` #40 marked resolved.
+
 <!-- Append new entries below this line, most recent last, dated. -->

@@ -53,6 +53,26 @@ EXTRACTION_STRATEGY = ExtractionStrategy.PER_CHUNK
 EXTRACTION_TOP_K = 3
 MAX_EXTRACT_CHARS = 4000  # same conservative bound as relevance.py's MAX_EMBED_CHARS -- one real per_chunk unit (2000 chars) is already well under this
 
+# Network timeouts for the two real HTTP call sites behind asyncio.to_thread
+# in llm_factory.py (LESSONS_LEARNED.md #56, ROADMAP.md #40) -- neither had
+# any timeout at all before this: LocalOllamaEmbeddings' requests.post()
+# calls had no timeout= argument, and ChatOpenAI ended up with
+# Timeout(timeout=None) on its real underlying httpx.Client (confirmed by
+# inspecting the live object, not the constructor signature -- see #56).
+# A hung connection at either site would otherwise wedge an
+# asyncio.to_thread slot forever. Values set well above real observed
+# maxima, not guessed low, so a genuinely slow-but-working call is never
+# mistaken for a dead one:
+# - LLM_EXTRACT_TIMEOUT_SECONDS: real extraction calls observed up to
+#   153.5s in a real run (#56); 600s matches the openai SDK's own default
+#   (the one langchain_openai's wrapper was silently dropping).
+# - OLLAMA_EMBED_TIMEOUT_SECONDS: local calls, observed 2-6s; 60s is
+#   generous headroom, not tight, since a local call taking anywhere near
+#   that long already indicates something is wrong with the local Ollama
+#   server, not just "slow."
+LLM_EXTRACT_TIMEOUT_SECONDS = 600
+OLLAMA_EMBED_TIMEOUT_SECONDS = 60
+
 # Section granularity for canonical records / export-time filenames
 # (sectioning.py) -- how many leading URL path segments count as one
 # "section". A deep site with depth=full-path would produce hundreds of

@@ -791,27 +791,55 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     structural page regions rather than trying to detect them by
     content).
 
-40. **No timeout configured on either real network `asyncio.to_thread`
-    call site -- a hung connection would wedge a thread-pool slot
-    forever.** Found investigating the extract_workers throughput/stall
-    tests (`LESSONS_LEARNED.md` #56): confirmed by inspecting the live
-    client objects, not the constructor signatures.
+40. **[RESOLVED] No timeout configured on either real network
+    `asyncio.to_thread` call site -- a hung connection would wedge a
+    thread-pool slot forever.** Found investigating the extract_workers
+    throughput/stall tests (`LESSONS_LEARNED.md` #56): confirmed by
+    inspecting the live client objects, not the constructor signatures.
     `LocalOllamaEmbeddings.embed_query`/`embed_documents`
-    (`llm_factory.py`) call `requests.post(...)` with no `timeout=` at
+    (`llm_factory.py`) called `requests.post(...)` with no `timeout=` at
     all. `ChatOpenAI` (also `llm_factory.py::get_llm`, used for
-    extraction) ends up with `Timeout(timeout=None)` on its real
+    extraction) ended up with `Timeout(timeout=None)` on its real
     underlying `httpx.Client` -- `langchain_openai`'s own wrapper
     bypasses the `openai` SDK's normal 600s default when no explicit
-    timeout is passed, which this project never does. Never directly
-    observed causing a hang in a 71-minute instrumented test run (see
-    #56 -- the "stuck" items in two earlier, externally-truncated runs
-    turned out to be ordinary backlog, not wedges), so this is a real
-    gap without a confirmed live incident yet, not a proven-active bug.
-    *Not fixed*: no timeout added. **Size: S** (a `timeout=`/`request_timeout=`
-    argument at two call sites) but pick real values deliberately --
-    LLM calls were observed taking up to 153.5s legitimately, so a
-    naive short timeout would misfire on real, correct, just-slow calls
-    rather than only on genuinely dead connections.
+    timeout is passed, which this project never did. Never directly
+    observed causing a hang in a 71-minute instrumented test run (#56 --
+    the "stuck" items in two earlier, externally-truncated runs turned
+    out to be ordinary backlog, not wedges), so this was a real gap
+    without a confirmed live incident, not a proven-active bug.
+    **Fixed** (`LESSONS_LEARNED.md` #57): `config.LLM_EXTRACT_TIMEOUT_SECONDS`
+    (600s, matching the SDK default that was being silently dropped) and
+    `config.OLLAMA_EMBED_TIMEOUT_SECONDS` (60s, generous headroom over a
+    local call's real 2-6s range), wired through both call sites.
+    Confirmed (not assumed) that a fired timeout actually reaches the
+    existing retry-then-fail path with the reason recorded, via two new
+    tests using the real exception types (`requests.exceptions.Timeout`,
+    `openai.APITimeoutError`) each site would actually raise.
+
+41. **Worker count doesn't move extraction throughput; per-call LLM
+    latency under `PER_CHUNK` does.** Measured directly, not assumed
+    (`LESSONS_LEARNED.md` #56): `extract_workers` 2/6/12 all landed at
+    ~0.76-0.79 done/min once measured to natural completion instead of a
+    truncated window. `PER_CHUNK` makes a page's N chunks cost N
+    *sequential* LLM calls (median 12.8s, observed range 1.98s-153.5s) --
+    one page occupies one extract_worker for the sum of all its chunks'
+    call times, not just the slowest one, so adding workers only helps
+    pages *between* each other, never within one. This is the only lever
+    that would actually move the number: **batch multiple chunks into
+    one LLM call** (fewer, larger calls per page -- prompt engineering +
+    output-parsing work to keep per-chunk provenance, since
+    `source_chunk` is a non-negotiable per-pair field per CLAUDE.md), or
+    **extract a page's chunks concurrently** (`asyncio.gather` over the
+    per-chunk loop in `crawl/pipeline.py::extract_worker` instead of the
+    current sequential `for` loop -- straightforward given `extract_fn`
+    is already async/threaded per call, but changes the page-level
+    failure semantics: today one malformed unit doesn't fail the page,
+    partial-completion bookkeeping under concurrent chunk calls needs
+    the same care). *Not fixed, not attempted*: noted per an explicit
+    ask while measuring the ew=2/6/12 comparison, deliberately not
+    changed for that comparison's own consistency. **Size: M for either
+    direction** -- both are real design changes to the extraction loop,
+    not a config tweak.
 
 ---
 
