@@ -527,30 +527,47 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     visible text was also dropped was confirmed navigational boilerplate
     (skip-links, back-to-top, heading pilcrows, empty logo links).
 
-32. **The extraction prompt under-covers tabular/terse facts relative to
-    prose facts, once padding is no longer padding it out to compensate.**
-    Found diagnosing three facts that vanished from a real VGroup.html
-    re-extraction (base class, non-mutating `+`/`-` operator semantics,
-    9 of 12 listed attributes) -- confirmed by direct keyword search
-    against the actual stored `source_chunk` text that **all three were
-    fully present, cleanly formatted, in the chunk the LLM was given**
-    (`Bases: \`VMobject\``, the full `+`/`+=` doctest contrast, and the
-    complete attribute table including blank-description rows) --
-    see `LESSONS_LEARNED.md` #43. This rules out the content pipeline
-    (chrome-strip, link normalization, chunking) as the cause -- the
-    text was there and the model chose not to write pairs about it.
-    Working hypothesis, not confirmed: the Step 3 prompt's anti-padding
-    instruction ("one pair per genuinely distinct fact... do not pad")
-    may bias the model toward richer prose facts and away from short
-    one-line facts or repetitive table rows when it's self-selecting
-    what counts as "genuinely distinct," precisely because those
-    generate less to say per pair. Only one page examined in this depth
-    -- not yet checked whether this generalizes past attribute/parameter
-    tables specifically, or past this one page. **Size: unknown --
-    needs the same kind of chunk-vs-pairs diff done here repeated across
-    a few more tabular reference pages before a real fix (e.g. a
-    dedicated pass over table-shaped content, or an explicit "cover
-    every row of any table present" prompt rule) is worth choosing.**
+32. **[CONFIRMED on a second, unrelated generator] The extraction prompt
+    under-covers tabular/terse facts relative to prose facts, once
+    padding is no longer padding it out to compensate.** Found
+    diagnosing three facts that vanished from a real VGroup.html
+    re-extraction (manim/Sphinx/Furo) -- confirmed by direct keyword
+    search against the actual stored `source_chunk` text that all three
+    were fully present, cleanly formatted, in the chunk the LLM was
+    given (`LESSONS_LEARNED.md` #43). Rules out the content pipeline as
+    the cause -- the text was there and the model chose not to write
+    pairs about it. **Repeated against fastapi.tiangolo.com
+    (MkDocs Material + mkdocstrings, no shared code or theme with
+    manim's stack) and the same pattern showed up**: `reference/parameters`
+    chunk 1's raw table has 10 distinct parameter rows
+    (`default`, `default_factory`, `alias`, `alias_priority`,
+    `validation_alias`, `serialization_alias`, `title`, `description`,
+    `gt`, ...); the 5 pairs generated from that exact chunk cover 6 of
+    them (one pair doing double duty for `validation_alias`/
+    `serialization_alias`) and **never mention `alias_priority`,
+    `title`, or `description` in either question or answer** -- checked
+    against the full answer text, not just question titles. Aggregate
+    pairs/chunk stayed statistically identical between the tabular
+    `reference/*` branch (4.30 mean) and the prose `tutorial/*` branch
+    (4.13 mean) on this same corpus -- the bias is invisible at the
+    aggregate chunk-count level on *both* generators, only visible in a
+    row-level audit against the actual chunk text, which is exactly why
+    it took this specific kind of check to surface at all rather than
+    showing up in any of this project's other measurements. See
+    `LESSONS_LEARNED.md` #45.
+    **No longer a one-page anecdote -- two independent generators, same
+    failure shape, strengthens this as a genuine prompt-behavior issue**
+    (Step 3's anti-padding instruction: "one pair per genuinely distinct
+    fact... do not pad" may bias the model toward richer prose facts and
+    away from short/self-evident table rows when self-selecting what
+    counts as "genuinely distinct," since those generate less to say per
+    pair) rather than a manim-specific or FastAPI-specific artifact.
+    *Fix, not yet chosen*: a dedicated pass over table-shaped content
+    (detect a markdown table in a chunk, prompt for one pair per row
+    unconditionally), or an explicit prompt rule ("if the text contains
+    a table, cover every row" as an exception to the anti-padding
+    instruction). **Size: S-M -- the diagnosis is now solid enough across
+    two generators to justify picking one, not measuring further first.**
 
 ---
 

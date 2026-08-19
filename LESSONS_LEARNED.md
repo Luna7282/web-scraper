@@ -2146,6 +2146,113 @@ already covered this at the unit level and was passing throughout --
 this was the same mechanism confirmed against this run's real data, not
 a new finding.)
 
+## 2026-08-19 — Second-site crawl: fastapi.tiangolo.com (MkDocs Material + mkdocstrings)
+
+### 45. Full metrics on a second, unrelated generator -- and ROADMAP #32 confirmed, not just replicated by coincidence
+Every number this project had before this run came from one site
+(docs.manim.community, Sphinx + Furo). Crawled fastapi.tiangolo.com
+(MkDocs Material theme, mkdocstrings-generated reference pages --
+shares no code or theme with manim's stack) with parameters identical
+to the manim runs except branch selection: `reference` + `tutorial`
+specifically, not `all` -- FastAPI's landing page links to ~50 extra
+single-page branches (13 translated-homepage variants, ~38 external
+sponsor/social domains) that manim's docs root doesn't have, which
+would have diluted representation of the two content shapes #32 needed
+compared on the same site. Confirmed via `--dry-run` before firing that
+both branches are depth-1 reachable (24 and 51 URLs respectively),
+so `max_depth=2` needed no change. **This is a deliberate deviation
+from strict branch-selection parity with the manim protocol, flagged
+per the explicit ask** -- max_pages/max_depth/thresholds/intent/
+outputs/model/workers are all identical.
+
+| Metric | manim (Step 6) | FastAPI | Note |
+|---|---|---|---|
+| Pages | 41 | 35 | |
+| Pairs | 320 | 2,570 | |
+| **Pairs/page (mean)** | 7.8 | 73.4 (max 643 on one page) | content shape, see below |
+| Vectors | 402 | 2,032 | |
+| **Vectors/page** | 9.8 | 58.1 | tracks pairs/page |
+| Chunks | 78 | 600 | |
+| Chunks/page | 1.9 | 17.1 | tracks pairs/page |
+| **Pairs/chunk (mean)** | 4.1 | 4.28 | consistent -- see below |
+| Near-dup answer pairs (raw) | 65 | 13,681 | scaling artifact, see below |
+| **Near-dup rate, normalized (% of possible same-page pairs)** | 3.40% | 3.03% | near-identical |
+| Mean link-syntax % of chunk chars | 0.95% | 0.09% | FastAPI is cleaner |
+| Chrome phrases found in `source_chunk` | 0 | 0 | zero MkDocs-specific tuning needed |
+| Sections at depth 1 | 5 | 32 | naming-convention shape, see below |
+| Sections at depth 2/3 | 41 / 41 | 35 / 35 | both flatten past depth 1-2 |
+| Filename collisions (any depth) | 0 | 0 | |
+| Hash-capped filenames (60-char) | 7 of 41 | 0 of 35 | naming-convention shape |
+
+**Every substantial difference traced to content shape, not a pipeline
+problem** -- checked each one, not assumed:
+- **Pairs/page, vectors/page, chunks/page (~7-9x higher)**: mkdocstrings
+  auto-generates one page per class/module documenting *every* method
+  with full signatures -- `reference/fastapi` (the `FastAPI` class
+  itself: `.get()`, `.post()`, `.websocket()`, `.middleware()`, dozens
+  of decorator methods, each with several parameters) is 150 chunks
+  alone. Confirmed genuine page size, not an extraction anomaly, by
+  checking **pairs/chunk stays constant** (4.3 for `reference/fastapi`,
+  4.4 for `reference/apirouter` and `reference/parameters`, 5.0 for a
+  small tutorial page) -- the page is just structurally larger, chunk
+  count scales with it, pairs/chunk doesn't move.
+- **Raw near-dup pair count (65 -> 13,681) looks alarming, isn't**: raw
+  near-dup pair count scales roughly with C(n,2) per page, so a site
+  with much larger pages produces a much larger raw count at an
+  *unchanged* per-item duplication rate. Normalized against the actual
+  number of possible same-page pairs (`sum(n*(n-1)/2)` per page), the
+  two sites are within half a point of each other (3.40% vs. 3.03%) --
+  the raw counts alone would have been a misleading comparison.
+- **Link-syntax overhead lower on FastAPI (0.09% vs. 0.95%)**: hand-
+  written MkDocs prose uses fewer inline cross-reference links than
+  Sphinx's heavily-cross-referenced autodoc output. The 3 chunks with
+  >5% remaining are all confirmed `![image](url)` markdown (screenshots
+  in the tutorial), same pattern as manim, correctly left alone by
+  design.
+- **Zero chrome leaks, with zero MkDocs-Material-specific patterns ever
+  added** to `DEFAULT_TEXT_PATTERNS`/`DEFAULT_EXCLUDED_SELECTOR`/
+  `DEFAULT_GENERIC_LINK_TEXT` -- every one of those lists was tuned
+  entirely against Furo. One coincidental substring match (`"navigation"`
+  in a sentence about VS Code's CodeLens navigation feature) checked by
+  hand and confirmed real content, not chrome.
+- **Sections much more granular at depth 1 (32 vs. 5)**: naming
+  convention, not depth. Most FastAPI reference/tutorial pages are a
+  single path segment past the branch prefix (`/reference/fastapi`,
+  `/tutorial/first-steps`) where manim's Sphinx module paths nest
+  several dotted segments deep, so depth 1 already gives near-per-page
+  granularity here versus needing depth 2 on manim.
+- **Zero filenames hit the 60-char cap**: FastAPI's section names are
+  short single/hyphenated words (`apirouter`, `parameters`); manim's are
+  full dotted Python module paths
+  (`manim.mobject.geometry.arc.AnnularSector.html`). Same disambiguation
+  mechanism, different naming convention feeding it.
+
+**ROADMAP #32, folded in as asked**: split pairs/chunk by branch
+(`reference/*` = tabular/mkdocstrings-generated, `tutorial/*` = prose)
+-- 4.30 mean vs. 4.13 mean, no systematic aggregate difference, matching
+manim's own pairs-per-chunk consistency across content types. But a
+row-level audit of `reference/parameters` chunk 1 (a real parameter
+table, 10 distinct rows: `default`, `default_factory`, `alias`,
+`alias_priority`, `validation_alias`, `serialization_alias`, `title`,
+`description`, `gt`, plus one row split across the chunk boundary)
+against its 5 generated pairs found **3 rows -- `alias_priority`,
+`title`, `description` -- mentioned in neither the question nor the
+answer of any pair**, checked against full answer text, not just
+question titles. `alias_priority` has a real, substantive description
+in the source ("Priority of the alias. This affects whether an alias
+generator is used") -- a genuine loss, not a thin/self-evident one.
+This is the same shape as VGroup's loss on manim, on a generator that
+shares no code or theme with Sphinx/Furo. **Confirms #32 as a real
+prompt-behavior issue, not a one-page manim artifact** -- upgraded from
+working hypothesis to confirmed in ROADMAP.md, with a fix now worth
+choosing rather than measuring further first.
+
+**Verbatim samples read clean on both content shapes**, no chrome, no
+link-syntax leakage, in every pair sampled (18 from `reference/parameters`,
+18 from `tutorial/first-steps`) -- the #32 gap is a coverage question
+(which facts get a pair), not a quality question (whether the pairs
+that do get generated are accurate).
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->
