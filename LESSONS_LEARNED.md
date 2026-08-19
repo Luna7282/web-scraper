@@ -2622,6 +2622,122 @@ needed before their own gaps surfaced -- worth remembering as a general
 pattern for any component that's only ever been exercised by its own
 unit tests plus one demo run.
 
+## 2026-08-19 — Framework coverage mapped and audited; mlx validation fixed
+
+### 50. Two of five packagers validated their schema restriction, one didn't -- and only running the full matrix against real data surfaced it
+Broadened entry #49's `mlx`-only finding into a real coverage map:
+fetched *current* real docs (not memory) for every framework named --
+Unsloth, TRL (SFTTrainer/DPOTrainer/KTOTrainer), Axolotl,
+LLaMA-Factory, mlx-lm, torchtune, llama.cpp/GGUF, OpenAI, Vertex AI,
+AWS Bedrock -- and mapped each to this project's schemas.
+
+**Already correctly covered, no new code:**
+- **TRL SFTTrainer** -- consumes a `datasets.Dataset`, so anything
+  loadable via this project's `huggingface` packaging works. Verified
+  current TRL docs list exactly the shapes already produced: `"text"`
+  (-> `raw_text`), `"messages"` (-> `conversational`/`openai_finetune`),
+  `"prompt"`/`"completion"` (-> `prompt_completion`). No gap.
+- **Unsloth** -- more permissive than TRL/mlx-lm, not less: current
+  docs confirm built-in support for ChatML (`messages`), ShareGPT
+  (`conversations`), *and* ("Alpaca Format: Includes separate
+  Instruction, Input, and Output fields") Alpaca natively. Both
+  `alpaca` and `conversational`/`openai_finetune` are directly usable
+  via `huggingface` output with no transformation.
+- **Axolotl, LLaMA-Factory** -- already verified in entry #49, still
+  correct: `alpaca` and `chat_template`/sharegpt mappings both confirmed
+  against current real docs, byte-for-byte match.
+- **OpenAI fine-tuning API** -- re-verified against current docs, still
+  exactly `{"messages": [...]}` with role/content -- `openai_finetune`
+  unchanged, no drift since this project's original build.
+- **Vertex AI supervised tuning** -- confirmed *still active* (this
+  matters: the plain consumer Gemini API's own fine-tuning support was
+  deprecated in May 2025 per Google's current docs, a real and
+  reasonable thing to have worried was true of Vertex too -- it isn't;
+  Vertex's enterprise tuning service is a separate, still-live product).
+  Format description in the available doc excerpts is consistent with
+  `to_vertex()`'s `contents`/`role`/`parts`/`text` shape, though this
+  session's fetches couldn't pull the single page with the byte-exact
+  schema (doc rendering limitation, not a contradiction found) -- noted
+  as slightly lower-confidence than the OpenAI/Axolotl/LLaMA-Factory
+  re-verifications, not re-stated as fully re-confirmed.
+
+**Confirmed unsupported, correctly:**
+- **TRL DPOTrainer/ORPOTrainer** (`prompt`/`chosen`/`rejected`) and
+  **KTOTrainer** (`prompt`/`completion`/`label`) -- current docs match
+  this project's existing `dpo`/`orpo`/`kto` refusal reasons exactly,
+  word for word in spirit. Nothing to change.
+- **llama.cpp / GGUF** -- confirmed this isn't a real gap at all, not
+  just unverified: llama.cpp is inference-focused; its only training-
+  adjacent tool, `convert_lora_to_gguf.py`, converts an *already-
+  trained* LoRA adapter (trained via one of the tools above) to GGUF
+  for inference. It doesn't consume Q&A training data, so there's
+  nothing for an export packager to target here.
+
+**Found not covered, would need new work (reported, not built, per the
+explicit instruction)** -- see ROADMAP #35 (torchtune) and #36
+(Bedrock) for the full writeups:
+- **torchtune**: its own `alpaca_dataset`/`chat_dataset` builders
+  already expect shapes this project produces, but torchtune needs a
+  YAML *recipe config* (dataset source + column mapping) that nothing
+  here generates -- no `--framework torchtune` exists. Estimated low
+  effort (mirrors `package_axolotl()`'s shape).
+- **AWS Bedrock**: `prompt_completion` already matches Bedrock's non-
+  conversational format exactly, no new code needed for that path. But
+  the general Converse API format (most conversational models) needs
+  `content` as a list of `{"text": ...}` parts plus a `schemaVersion`/
+  `system` wrapper -- genuinely different from `conversational`'s flat-
+  string `content`, so this needs an actual new projection function,
+  not just new packaging.
+
+**Fixed `package_mlx()`'s missing validation** (the specific ask):
+added `_MLX_KNOWN_SCHEMAS = {conversational, openai_finetune,
+prompt_completion}`, refuses everything else with the same `ValueError`
+pattern `package_llama_factory()`/`package_axolotl()` already use.
+Considered but **not built**: remapping `alpaca` onto mlx-lm's `text`
+format (mlx-lm's own docs suggest this for unsupported shapes) -- that's
+new capability, not the validation fix asked for, and the coverage map
+above shows Alpaca is already reachable via TRL/Unsloth regardless, so
+mlx-lm isn't the only path to it.
+
+**Audited the other four packagers for the same blind spot, as asked**:
+- `package_llama_factory()`/`package_axolotl()` already validate
+  (confirmed by re-reading their code, not re-verified from scratch --
+  their correctness was already independently confirmed in entry #49).
+- `package_huggingface()`/`package_plain_jsonl()` are **genuinely
+  schema-agnostic, not silently unvalidated** -- confirmed by reading
+  both functions: neither imposes any structural requirement beyond
+  "valid JSONL," which is true for every schema's projected output
+  regardless of shape. A generic JSONL split layout doesn't need schema
+  validation the way a specific trainer's auto-detecting loader does --
+  there's no "correct shape" for `datasets.load_dataset("json", ...)`
+  to fail to detect, unlike mlx-lm's four-shape auto-detection or
+  LLaMA-Factory/Axolotl's `type:`-driven parsing. Nothing to fix.
+
+**Tested the refusals, not just the successes, per the explicit ask**:
+the bug was a bad combination silently *succeeding* -- a test suite that
+only checked successful combinations would never have caught it, and
+wouldn't catch a regression either. Added `test_mlx_framework_refuses_alpaca`/
+`_embedding_pairs`/`_rag_eval`/`_vertex` (each asserts `run_export(...)`
+raises `ValueError`) plus `test_mlx_framework_accepts_conversational_and_openai_finetune`
+(the fix could have been over-broad and silently broken combinations
+that were already correct -- this proves it wasn't). Re-ran the full
+114-combination audit against both archived corpora after the fix:
+50 succeed / 64 correctly refuse (was 58/56 before -- exactly the 8
+newly-refused combinations, 4 schemas x 2 sites), zero unexpected
+errors either before or after.
+
+**The general lesson, stated for next time**: two of the five packagers
+(`llama-factory`, `axolotl`) validated their schema restriction from
+the start; one (`mlx`) didn't, and two (`huggingface`, `plain-jsonl`)
+correctly need no restriction at all. Unit tests covered each
+packager's own happy path in isolation -- passing every one of those
+tests said nothing about whether a specific (schema, framework)
+*combination* was valid, because nothing exercised the combinations
+themselves until this audit ran the full matrix against real data. Same
+shape as the chrome_strip and robots.txt gaps before it (entries #28,
+#27): a component's own tests passing is not evidence that it's wired
+correctly into the paths that actually get exercised.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->

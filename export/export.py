@@ -81,7 +81,25 @@ def build_dataset_card(
     }
 
 
-def package_mlx(splits: dict[str, list[dict]], out_dir: str, project) -> None:
+# Verified against mlx-lm's own mlx_lm/LORA.md (github.com/ml-explore/
+# mlx-lm), not guessed: the LoRA trainer auto-detects exactly four record
+# shapes -- chat ("messages"), tool-calling ("messages" + "tools"),
+# completions ("prompt"/"completion"), and plain "text" -- and explicitly
+# has no built-in Alpaca support ("a dataset using only Alpaca-style keys
+# would... fail automatic detection"). Only the schemas that produce one
+# of those four shapes are accepted; found via a real export audit that
+# package_mlx previously had no restriction at all and silently wrote
+# files for alpaca/embedding_pairs/rag_eval/vertex that mlx-lm's loader
+# can't read (LESSONS_LEARNED.md #49-#50, ROADMAP #34).
+_MLX_KNOWN_SCHEMAS = {"conversational", "openai_finetune", "prompt_completion"}
+
+
+def package_mlx(splits: dict[str, list[dict]], out_dir: str, project, schema: str) -> None:
+    if schema not in _MLX_KNOWN_SCHEMAS:
+        raise ValueError(
+            f"mlx packaging has no verified mlx-lm-loadable shape for schema {schema!r} yet -- "
+            f"known: {sorted(_MLX_KNOWN_SCHEMAS)}"
+        )
     name_map = {"train": "train.jsonl", "validation": "valid.jsonl", "test": "test.jsonl"}
     for split_name, filename in name_map.items():
         _write_jsonl(os.path.join(out_dir, filename), [project(r) for r in splits.get(split_name, [])])
@@ -268,7 +286,7 @@ def run_export(
     splits = split_records(deduped, by=split_by, seed=seed)
 
     if framework == "mlx":
-        package_mlx(splits, out_dir, project)
+        package_mlx(splits, out_dir, project, schema)
     elif framework == "huggingface":
         package_huggingface(splits, out_dir, project, card)
     elif framework == "llama-factory":

@@ -46,12 +46,43 @@ class TestRunExport(unittest.TestCase):
         self._tmpdir.cleanup()
 
     def test_mlx_framework_produces_three_split_files(self):
+        # prompt_completion, not alpaca -- alpaca isn't one of mlx-lm's
+        # four auto-detected shapes (see _MLX_KNOWN_SCHEMAS).
         out = str(Path(self._tmpdir.name) / "mlx_out")
-        run_export(self.canonical_path, out, schema="alpaca", framework="mlx")
+        run_export(self.canonical_path, out, schema="prompt_completion", framework="mlx")
         for name in ("train.jsonl", "valid.jsonl", "test.jsonl"):
             self.assertTrue(Path(out, name).exists())
         train = _read_jsonl(Path(out, "train.jsonl"))
-        self.assertTrue(all("instruction" in r for r in train))
+        self.assertTrue(all("prompt" in r and "completion" in r for r in train))
+
+    def test_mlx_framework_refuses_alpaca(self):
+        out = str(Path(self._tmpdir.name) / "mlx_alpaca_out")
+        with self.assertRaises(ValueError):
+            run_export(self.canonical_path, out, schema="alpaca", framework="mlx")
+
+    def test_mlx_framework_refuses_embedding_pairs(self):
+        out = str(Path(self._tmpdir.name) / "mlx_embed_out")
+        with self.assertRaises(ValueError):
+            run_export(self.canonical_path, out, schema="embedding_pairs", framework="mlx")
+
+    def test_mlx_framework_refuses_rag_eval(self):
+        out = str(Path(self._tmpdir.name) / "mlx_rag_out")
+        with self.assertRaises(ValueError):
+            run_export(self.canonical_path, out, schema="rag_eval", framework="mlx")
+
+    def test_mlx_framework_refuses_vertex(self):
+        out = str(Path(self._tmpdir.name) / "mlx_vertex_out")
+        with self.assertRaises(ValueError):
+            run_export(self.canonical_path, out, schema="vertex", framework="mlx")
+
+    def test_mlx_framework_accepts_conversational_and_openai_finetune(self):
+        # The two chat-shaped schemas that DO match an mlx-lm-recognized
+        # format ("messages") -- confirms the restriction isn't blanket.
+        for schema in ("conversational", "openai_finetune"):
+            out = str(Path(self._tmpdir.name) / f"mlx_{schema}_out")
+            run_export(self.canonical_path, out, schema=schema, framework="mlx")
+            train = _read_jsonl(Path(out, "train.jsonl"))
+            self.assertTrue(all("messages" in r for r in train))
 
     def test_huggingface_framework_produces_dataset_card(self):
         out = str(Path(self._tmpdir.name) / "hf_out")
@@ -176,7 +207,7 @@ class TestRunExport(unittest.TestCase):
             for r in records:
                 f.write(json.dumps(r) + "\n")
         out = str(Path(self._tmpdir.name) / "counts_out")
-        card = run_export(path, out, schema="alpaca", framework="mlx")
+        card = run_export(path, out, schema="alpaca", framework="huggingface")
         self.assertEqual(card["row_counts"]["raw_canonical_records"], 3)
         self.assertEqual(card["row_counts"]["rejected_by_validation"], 1)
         self.assertEqual(card["row_counts"]["removed_by_dedup"], 1)
@@ -208,7 +239,7 @@ class TestRunExport(unittest.TestCase):
         path = self._write_near_duplicate_pair()
         out = str(Path(self._tmpdir.name) / "report_out")
         card = run_export(
-            path, out, schema="alpaca", framework="mlx",
+            path, out, schema="alpaca", framework="huggingface",
             semantic_dedup_report=True, semantic_dedup_threshold=0.5,
         )
         self.assertEqual(card["row_counts"]["final"], 2)  # report-only: nothing actually dropped
@@ -220,7 +251,7 @@ class TestRunExport(unittest.TestCase):
         path = self._write_near_duplicate_pair()
         out = str(Path(self._tmpdir.name) / "applied_out")
         card = run_export(
-            path, out, schema="alpaca", framework="mlx",
+            path, out, schema="alpaca", framework="huggingface",
             semantic_dedup=True, semantic_dedup_threshold=0.5,
         )
         self.assertEqual(card["row_counts"]["removed_by_semantic_dedup"], 1)
@@ -231,7 +262,7 @@ class TestRunExport(unittest.TestCase):
     def test_semantic_dedup_off_by_default(self):
         path = self._write_near_duplicate_pair()
         out = str(Path(self._tmpdir.name) / "default_out")
-        card = run_export(path, out, schema="alpaca", framework="mlx")
+        card = run_export(path, out, schema="alpaca", framework="huggingface")
         self.assertEqual(card["row_counts"]["removed_by_semantic_dedup"], 0)
         self.assertEqual(card["row_counts"]["final"], 2)
         self.assertFalse(Path(out, "semantic_dedup_report.json").exists())

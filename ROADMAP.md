@@ -658,14 +658,73 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     surprising even though `package_mlx()` doesn't say so.
     `package_llama_factory()`/`package_axolotl()` already refuse
     schemas with no verified mapping instead of emitting one -- `mlx`
-    should follow the same pattern. *Fix, not yet chosen*: either
-    restrict `--framework mlx` to `{conversational, openai_finetune,
-    prompt_completion}` the same way llama-factory/axolotl are
-    restricted, or (better, since Alpaca is common enough to be worth
-    keeping) map `alpaca` onto mlx-lm's `text` format by assembling
-    `f"{instruction}\n{input}\n{output}"` the way mlx-lm's own docs
-    suggest for unsupported shapes ("use the `text` format to assemble
-    the content yourself"). **Size: S.**
+    should follow the same pattern.
+    ***RESOLVED***: `package_mlx()` now takes `schema` and refuses
+    (`ValueError`) anything outside `_MLX_KNOWN_SCHEMAS =
+    {conversational, openai_finetune, prompt_completion}`, same pattern
+    as llama-factory/axolotl. Alpaca-to-`text` remapping (the "better"
+    alternative considered) was **not** built -- that's new capability,
+    not the validation fix this item asked for; left as a real,
+    separate option if Alpaca-via-mlx turns out to matter enough to
+    build (see `LESSONS_LEARNED.md` #50's framework coverage map: TRL
+    and Unsloth already cover Alpaca fine, so mlx-lm is not the only
+    path to it). Tested both directions, not just the successes: 4 new
+    refusal tests (`mlx`+alpaca/embedding_pairs/rag_eval/vertex all
+    raise) plus a positive test that `conversational`/`openai_finetune`
+    still succeed under `mlx` -- the fix could otherwise have been
+    over-broad and silently broken the combinations that were already
+    correct.
+
+35. **No `torchtune` packager exists.** Verified against torchtune's
+    real current docs (`meta-pytorch.org/torchtune`, not guessed;
+    project moved from `pytorch.org` -- old links redirect):
+    `alpaca_dataset` is a built-in instruct-dataset builder expecting
+    exactly the `instruction`/`input`/`output` shape our `alpaca`
+    schema already produces; `chat_dataset` handles conversational
+    data. Unlike Axolotl, torchtune isn't driven by a Python-API
+    dataset object alone -- it needs a YAML *recipe config* naming the
+    dataset source and any column remapping, e.g.:
+    ```yaml
+    dataset:
+      source: json
+      data_files: data/my_data.json
+      split: train
+      column_map: {input: your_prompt_field, output: your_response_field}
+    ```
+    This project doesn't generate that config for any schema, so
+    there's no `--framework torchtune` today -- a user would have to
+    hand-write the YAML pointing at our `plain-jsonl`/`huggingface`
+    output themselves. *What it would take*: a `package_torchtune()`
+    mirroring `package_axolotl()`'s shape almost exactly -- write the
+    dataset JSONL, then a YAML stanza with `source: json`,
+    `data_files:`, and (only if our field names ever diverge from
+    torchtune's `input`/`output` defaults) a `column_map`. Genuinely
+    low effort given `alpaca` already matches out of the box. **Size:
+    S, not built -- reported per the explicit ask, not built without
+    being asked.**
+
+36. **AWS Bedrock: `prompt_completion` already matches one of its three
+    real formats; the more general one doesn't have a projection.**
+    Verified against Bedrock's real current docs
+    (`docs.aws.amazon.com/bedrock`, not guessed). Bedrock's
+    non-conversational fine-tuning format is exactly `{"prompt": ...,
+    "completion": ...}` -- our existing `prompt_completion` schema
+    already produces this, no new code needed for that path. But most
+    conversational models (everything using Bedrock's Converse API,
+    which is most of the catalog) need a different, more specific
+    shape: `{"schemaVersion": "bedrock-conversation-2024", "system":
+    [{"text": ...}], "messages": [{"role": "user", "content":
+    [{"text": ...}]}, ...]}` -- note `content` is a list of `{"text":
+    ...}` parts, not a plain string the way our `conversational`
+    schema's `content` field is. One Bedrock-specific model (Claude 3
+    Haiku) uses a closer, flat-string `content` format, but that's a
+    single model, not the general case. *What it would take*: a new
+    schema projection (`to_bedrock_converse`, alongside the existing
+    `to_conversational`/`to_vertex` in `export_formats.py`) producing
+    the nested-parts shape with the `schemaVersion` wrapper -- genuinely
+    new code, not a packaging-layer fix, since no existing schema
+    produces this record shape. **Size: S, not built -- reported per
+    the explicit ask.**
 
 ---
 
