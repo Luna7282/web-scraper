@@ -297,12 +297,35 @@ class Frontier:
     # ------------------------------------------------------------------
 
     async def seed(self, urls: list[tuple[str, str | None]]) -> None:
+        """main.py always calls this right after recover_crashed(), even on
+        a brand-new frontier.db -- and recover_crashed() unconditionally
+        quiesces an empty frontier (see its docstring / LESSONS_LEARNED
+        #44), since "empty because nothing seeded yet" and "empty because
+        a prior process finished" are indistinguishable at that point.
+        seed() is what tells them apart: if it inserts rows that didn't
+        already exist, whatever quiescence recover_crashed() concluded is
+        now stale and must be un-latched -- otherwise every worker's
+        `await frontier.quiescent.wait()` returns immediately and the run
+        exits having fetched nothing (found running a real first-time
+        crawl; no prior test seeded *after* recover_crashed() on a fresh
+        db in the same process, only checked recover_crashed()'s own
+        result in isolation).
+
+        Detected via total_changes before/after, not INSERT OR IGNORE's
+        executemany rowcount (unreliable across sqlite3/aiosqlite
+        versions) -- total_changes only increments for rows actually
+        inserted, never for ignored duplicates, so a re-seed of a
+        genuinely completed run's original URLs (all already terminal)
+        correctly sees inserted=0 and leaves quiescent alone, rather than
+        reintroducing the #44 hang by un-latching a run with no new work
+        to ever re-trigger the check."""
         now = _now()
         rows = [
             (url, self._host_of(url), 0, label, None, "queued", now, now)
             for url, label in urls
         ]
         async with self._lock:
+            before = self._conn.total_changes
             await self._conn.executemany(
                 """
                 INSERT OR IGNORE INTO frontier
@@ -312,6 +335,10 @@ class Frontier:
                 rows,
             )
             await self._conn.commit()
+            inserted = self._conn.total_changes - before
+            if inserted > 0 and self._shutdown_triggered:
+                self._shutdown_triggered = False
+                self.quiescent.clear()
 
     async def claim(self) -> FrontierRow | None:
         async with self._lock:

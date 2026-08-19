@@ -2929,4 +2929,71 @@ finding is about the tool's blind spot, not a blocker for this site.
 
 ---
 
+### 53. Every first-ever crawl against a brand-new frontier.db did nothing at all -- found on the very first real Phase 1 attempt
+Fired the relevance-gate Phase 1 crawl (blog.cloudflare.com, 146 seeded
+URLs, `data/run/` freshly moved aside so this was a genuinely empty
+`frontier.db`). It "completed" in ~8 seconds: `Done. {'queued': 146}` --
+every seeded URL still `queued`, zero fetched, zero scored, no error, no
+crash. Not a stdin-piping mistake: verified the interactive answer
+sequence mapped to the right prompts in isolation before looking
+further.
+
+**Root cause**: `main.py`'s startup sequence is `frontier.open()` ->
+`await frontier.recover_crashed()` -> `await frontier.seed(seeds)`, every
+single run, first-time or resumed. `recover_crashed()` unconditionally
+calls the quiescence check at its end (`LESSONS_LEARNED.md` #44's fix,
+`crawl/frontier.py` lines ~432-444, with a comment explaining exactly
+why) -- correct and load-bearing for its own intended cases (resuming a
+completed run, or a process that died before ever seeding). But on a
+literally empty table, "nothing seeded yet" and "everything already
+finished" look identical: `in_flight=0`, `queued_n=0` either way. So
+`recover_crashed()` sets `quiescent` on a brand-new db too. `seed()`
+never cleared it. `main()`'s `await frontier.quiescent.wait()` then
+returns immediately -- the event was already set before a single crawl
+worker got a real chance to claim anything.
+
+**Why the existing test suite didn't catch it**:
+`tests/test_frontier_startup_quiescence.py`'s
+`test_empty_frontier_quiescent_immediately` asserts the empty-db ->
+quiescent behavior in isolation and stops there -- correct as far as it
+goes, but no test carried the sequence one step further into `seed()` in
+the same process, which is what `main.py` always does next. Every other
+test either seeds *before* `recover_crashed()` (normal mid-run shape) or
+checks `recover_crashed()`'s result without a follow-up `seed()` call.
+The exact real-world startup order was untested end-to-end.
+
+**Fix** (`crawl/frontier.py::seed()`): track `self._conn.total_changes`
+before/after the `INSERT OR IGNORE`, and if it actually inserted new
+rows *and* `self._shutdown_triggered` is set, clear both
+`self.quiescent` and `self._shutdown_triggered`. `total_changes`, not
+`executemany`'s rowcount (unreliable across sqlite3/aiosqlite versions,
+confirmed by a quick isolated check before trusting it) -- it only
+increments for rows actually inserted, never ignored duplicates. This
+matters because a naive "clear whenever queued_n > 0 after seeding"
+would have been wrong in a different way: re-seeding a *resumed* run
+with its original (now-duplicate) URLs must NOT un-latch quiescence, or
+it reintroduces #44's exact hang (a run with leftover `queued` rows past
+a met `max_pages` cap, where nothing left can ever decrement `in_flight`
+again to re-trigger the check). Verified both directions in isolation
+before touching the real test suite: fresh-db-then-seed now un-latches
+and a worker loop actually claims and processes the new rows; resumed-
+run-reseeded-with-same-urls stays latched and a worker loop still exits
+cleanly within timeout rather than hanging.
+
+Added two regression tests to `tests/test_frontier_startup_quiescence.py`
+covering exactly these two sequences end-to-end (not just the
+`recover_crashed()` half) -- `test_seed_after_recover_crashed_on_fresh_db_unlatches_quiescence`
+and `test_reseeding_a_completed_run_with_the_same_urls_does_not_unlatch`.
+335 tests green after the fix (333 + 2 new).
+
+**Why this matters going forward**: this is not an edge case -- it's the
+single most common startup path (anyone's very first crawl against a new
+target). It went unnoticed until now because every previous "real crawl"
+milestone in this project's history (step 8 Part D, the leftover
+incomplete FastAPI run found and moved aside earlier in this same
+session) happened to run against a `frontier.db` that had already been
+seeded at least once by an earlier process -- so `recover_crashed()`
+never saw a truly empty table at the moment that mattered. A clean-room
+first run was never actually exercised end-to-end before this session.
+
 <!-- Append new entries below this line, most recent last, dated. -->

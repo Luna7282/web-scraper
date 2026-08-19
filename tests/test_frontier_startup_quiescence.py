@@ -110,6 +110,83 @@ class TestStartupQuiescence(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(worker_loop(), timeout=2)  # would hang forever pre-fix
         await frontier.close()
 
+    async def test_seed_after_recover_crashed_on_fresh_db_unlatches_quiescence(self):
+        """The real main.py startup sequence -- recover_crashed() then
+        seed() in the same process, on a frontier.db that has never been
+        seeded before. recover_crashed() correctly (if misleadingly)
+        concludes an empty frontier is quiescent (see
+        test_empty_frontier_quiescent_immediately); seed() then inserts
+        the first real work. Found live running the first real crawl
+        attempt: without this, quiescent stays latched from the earlier
+        check and every crawl_worker exits before claiming anything --
+        `main.py` prints `Done. {'queued': N}` with zero pages ever
+        fetched, no error, no hang. Same worker-loop shape as
+        test_workers_actually_exit_on_an_already_quiescent_resume, but
+        proving the opposite: this one must actually do the claimed work,
+        not just exit cleanly."""
+        frontier = Frontier(self.db_path)
+        await frontier.open()
+        await frontier.recover_crashed()
+        self.assertTrue(frontier.quiescent.is_set())  # the misleading-but-correct interim state
+
+        await frontier.seed([(f"{HOST}/a", None), (f"{HOST}/b", None)])
+        self.assertFalse(frontier.quiescent.is_set(), "seed() must un-latch quiescence when it adds real new work")
+
+        claimed = []
+
+        async def worker_loop():
+            while True:
+                row = await frontier.claim()
+                if row is None:
+                    if frontier.quiescent.is_set():
+                        return
+                    await asyncio.sleep(0.01)
+                    continue
+                claimed.append(row.url)
+                await frontier.mark_written(row.url)
+
+        await asyncio.wait_for(worker_loop(), timeout=2)
+        self.assertEqual(sorted(claimed), [f"{HOST}/a", f"{HOST}/b"])
+        await frontier.close()
+
+    async def test_reseeding_a_completed_run_with_the_same_urls_does_not_unlatch(self):
+        """The other real main.py sequence: resuming a run whose db
+        already holds every original seed url in a terminal state, where
+        main.py calls seed() again unconditionally with that same list.
+        INSERT OR IGNORE makes this a no-op -- must NOT un-latch
+        quiescence, or this regresses straight back into LESSONS_LEARNED
+        #44's hang (nothing left to ever decrement in_flight and
+        re-trigger the check)."""
+        seeds = [(f"{HOST}/a", None), (f"{HOST}/b", None)]
+        setup = Frontier(self.db_path)
+        await setup.open()
+        await setup.seed(seeds)
+        row_a = await setup.claim()
+        row_b = await setup.claim()
+        await setup.mark_written(row_a.url)
+        await setup.mark_permanently_failed(row_b.url, "simulated")
+        await setup.close()
+
+        frontier = Frontier(self.db_path)
+        await frontier.open()
+        await frontier.recover_crashed()
+        self.assertTrue(frontier.quiescent.is_set())
+
+        await frontier.seed(seeds)  # same urls, already terminal -- no new rows
+        self.assertTrue(frontier.quiescent.is_set(), "re-seeding with no genuinely new urls must not un-latch quiescence")
+
+        async def worker_loop():
+            while True:
+                row = await frontier.claim()
+                if row is None:
+                    if frontier.quiescent.is_set():
+                        return
+                    await asyncio.sleep(0.01)
+                    continue
+
+        await asyncio.wait_for(worker_loop(), timeout=2)  # would hang if incorrectly un-latched
+        await frontier.close()
+
 
 if __name__ == "__main__":
     unittest.main()
