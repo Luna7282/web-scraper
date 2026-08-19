@@ -791,6 +791,28 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     structural page regions rather than trying to detect them by
     content).
 
+40. **No timeout configured on either real network `asyncio.to_thread`
+    call site -- a hung connection would wedge a thread-pool slot
+    forever.** Found investigating the extract_workers throughput/stall
+    tests (`LESSONS_LEARNED.md` #56): confirmed by inspecting the live
+    client objects, not the constructor signatures.
+    `LocalOllamaEmbeddings.embed_query`/`embed_documents`
+    (`llm_factory.py`) call `requests.post(...)` with no `timeout=` at
+    all. `ChatOpenAI` (also `llm_factory.py::get_llm`, used for
+    extraction) ends up with `Timeout(timeout=None)` on its real
+    underlying `httpx.Client` -- `langchain_openai`'s own wrapper
+    bypasses the `openai` SDK's normal 600s default when no explicit
+    timeout is passed, which this project never does. Never directly
+    observed causing a hang in a 71-minute instrumented test run (see
+    #56 -- the "stuck" items in two earlier, externally-truncated runs
+    turned out to be ordinary backlog, not wedges), so this is a real
+    gap without a confirmed live incident yet, not a proven-active bug.
+    *Not fixed*: no timeout added. **Size: S** (a `timeout=`/`request_timeout=`
+    argument at two call sites) but pick real values deliberately --
+    LLM calls were observed taking up to 153.5s legitimately, so a
+    naive short timeout would misfire on real, correct, just-slow calls
+    rather than only on genuinely dead connections.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

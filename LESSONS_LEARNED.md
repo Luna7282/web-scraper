@@ -3242,4 +3242,105 @@ Verified with a real small run (extraction on, RAG on, `crawl_workers=5`,
 Phase 2 attempt -- see the entry immediately following this one for the
 result.
 
+---
+
+## 2026-08-19/20 — extract_workers throughput/stall investigation: no scaling benefit, no permanent wedge, but a real missing-timeout gap
+
+### 56. Three extract_workers settings measured properly (to natural completion, not a truncated window) show flat throughput -- and a scarier-looking "23 stuck items" turned out to be ordinary backlog, not a wedge
+Before committing to a Phase 2 `extract_workers` setting, ran three
+20-page throughput tests holding everything else constant (`crawl_workers=5`,
+same site/intent/thresholds, RAG on) at `extract_workers` 2, 6, and 12:
+
+| extract_workers | pages reaching a terminal outcome | done/min | stuck items observed | 429s |
+|---|---|---|---|---|
+| 2 | 41 (32 done + 9 skipped_extract) | 0.79 | 0 | 0 |
+| 6 | 51 (38 done + 13 skipped_extract) | 0.78 | 2 | 0 |
+| 12 (first attempt) | 34 (21 done + 13 skipped_extract) | 1.27 (misleading, see below) | 23 | 0 |
+
+The ew=6 and ew=12 runs were both terminated by something external to
+this session (not a manual stop, not a crash, not a driver error) before
+reaching natural completion -- both times mid-backlog, which is exactly
+the ambiguity the two establishing questions below were meant to
+resolve, not skip past: a permanent wedge and a run truncated mid-slow-
+patch look identical from a single snapshot.
+
+**Question 1: are the stalls permanent, or just slow?** Re-ran ew=12
+with every `asyncio.to_thread` call site instrumented (entry/exit
+logging with timestamps, temporarily -- reverted after, never committed)
+covering all five call types: `EMBED` (scoring + chunk embedding),
+`LLM` (extraction), `CHROMA_GET`/`CHROMA_ADD`/`CHROMA_UPDATE`. Let it run
+under a self-controlled budget instead of trusting external termination
+again. Result: it completed **naturally** this time (`Done.`, exit code
+0) after 71.5 minutes, and the log showed **zero permanently-unmatched
+calls at any point** across the whole run -- every `enter` eventually
+got a matching `exit`. The apparent "23 stuck items" in the earlier
+truncated run were not wedged; they were ordinary backlog that would
+have cleared given enough wall-clock time, same as the "2 stuck items"
+at ew=6 almost certainly were too. Confirmed, not inferred: this is the
+kind of claim that needed a run allowed to actually finish, not a
+snapshot.
+
+Corrected throughput reading from the completed run: 69 terminal pages
+(54 done + 15 skipped_extract) in 71.5 minutes = **0.755 done/min** --
+statistically indistinguishable from ew=2's 0.79 and ew=6's 0.78. The
+ew=12 first attempt's apparent 1.27 done/min was a real but misleading
+number: measured over a truncated window before the backlog caught up,
+not a sustainable rate. **Net finding: extract_workers concurrency
+beyond 2 buys no measured throughput improvement on this workload** --
+the real bottleneck is per-call LLM latency itself (from the completed
+instrumented run's own stats: LLM calls ranged 1.98s-153.5s, median
+12.8s, p90 19.8s, n=332 -- and `PER_CHUNK` strategy makes these
+*sequential per page*, not parallelized within a page), not anything
+this pipeline's own concurrency knobs control. Zero rate-limit errors
+across all four real test runs at any concurrency level -- rules out an
+Ollama-side hard rate-limit ceiling as the explanation for anything
+observed here; the 429-backoff path (`RateLimitError` ->
+`mark_extract_outcome(..., backoff_seconds=...)`) still has never been
+exercised against a real 429, only the stub from its original test.
+
+**Question 2: is there a timeout on the to_thread calls at all?**
+Checked by inspecting the real client objects, not assumed:
+- `storage/chunk_store.py`'s three chromadb calls (`get`/`add`/`update`)
+  and `storage/query.py`'s `query()`: local disk I/O, not network --
+  "timeout" isn't really the applicable concept here the way it is for
+  the two below, and durations observed were consistently sub-100ms.
+- `LocalOllamaEmbeddings.embed_query`/`embed_documents`
+  (`llm_factory.py`): `requests.post(...)` called with **no `timeout=`
+  argument at all**. Python's `requests` has no default timeout unless
+  one is passed -- a hung connection here blocks forever, not until some
+  library default kicks in.
+- The `ChatOpenAI` client used for extraction
+  (`main.py::_make_extract_fn` via `llm_factory.py::get_llm`): inspected
+  the actual live object graph (`llm.client._client._client.timeout`),
+  not the constructor signature -- `langchain_openai` wraps the
+  underlying `httpx.Client` in its own `_SyncHttpxClientWrapper` and,
+  when no `timeout`/`request_timeout` is passed to `ChatOpenAI(...)`
+  (this project never does), that wrapper is built with
+  `Timeout(timeout=None)` -- **not** the `openai` SDK's own sane
+  default (600s), which this wrapping bypasses. Confirmed by direct
+  object inspection, not by reading `langchain_openai`'s source and
+  guessing.
+
+So: **the answer to "is there a timeout" is no, on both real network call
+sites** -- but the instrumented run's zero-unmatched-calls result means
+this gap was never directly observed causing a hang in these tests. It
+remains a real, independent risk: a single genuinely dropped/hung
+connection (a real possibility over a multi-hour 400-page run, even if
+it didn't happen in a 71-minute window) would permanently occupy one
+slot in this machine's default `ThreadPoolExecutor` (capped at
+`min(32, cpu_count+4)` = 16 here, `os.cpu_count()`=12) forever -- and
+each such wedge would make the next one likelier by shrinking the
+pool's effective capacity, which is exactly the failure shape that
+would produce frontier rows stuck `in_progress` forever, the same shape
+as the pre-`#53` resume-hang bug, just via a different mechanism (a
+truly stuck thread rather than a mis-latched `asyncio.Event`).
+
+**Not fixed here** -- reported per the explicit ask to establish the
+mechanism before proposing anything. Diagnostic instrumentation was
+temporary (added, used, `git checkout`'d back out, never committed);
+337 tests still green afterward, unaffected since nothing production
+changed. `ROADMAP.md` #40 tracks adding explicit timeouts to both
+`requests.post` calls in `LocalOllamaEmbeddings` and to `ChatOpenAI`'s
+construction in `llm_factory.py::get_llm`.
+
 <!-- Append new entries below this line, most recent last, dated. -->
