@@ -7,6 +7,7 @@ nearest-neighbor results.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -32,7 +33,13 @@ async def query_chunks(
     verify_embedding_identity(collection, embedding_model, embedding_dim)
 
     query_embedding = await embed_fn(question)
-    results = collection.query(query_embeddings=[query_embedding], n_results=k)
+    # Same defect class as storage/chunk_store.py::add_or_merge_chunk (see
+    # its comment) -- chromadb's collection.query() is synchronous. Lower
+    # blast radius here since --query never runs alongside the concurrent
+    # crawl pipeline, but the invariant is unconditional (CLAUDE.md): no
+    # blocking I/O on the event loop, in any async def, regardless of
+    # whether this particular call site currently has company to starve.
+    results = await asyncio.to_thread(collection.query, query_embeddings=[query_embedding], n_results=k)
 
     out = []
     ids = results["ids"][0] if results["ids"] else []

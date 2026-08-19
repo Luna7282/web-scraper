@@ -16,7 +16,7 @@ from llm_factory import get_llm
 from crawl.discovery import discover_branches, fetch_page_links
 from crawl.scope import normalize_url, derive_prefix, is_in_scope
 from crawl.frontier import Frontier
-from crawl.pipeline import crawl_worker, extract_worker, writer_worker, FetchTimeout, FetchHTTPError, RateLimitError
+from crawl.pipeline import crawl_worker, extract_worker, writer_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError
 from crawl.politeness import HostPoliteness
 from content.extraction import QA_EXTRACTION_SYSTEM_PROMPT
 from content.relevance import make_score_fn
@@ -213,7 +213,19 @@ def _make_fetch_fn(crawler: AsyncWebCrawler):
             status = result.redirected_status_code or result.status_code
             if status and status != 200:
                 raise FetchHTTPError(status)
-            raise FetchTimeout(result.error_message or "fetch failed")
+            error_message = result.error_message or "fetch failed"
+            # crawl4ai catches Playwright's own exceptions internally and
+            # returns them as result.error_message rather than raising --
+            # this substring is the one shared-browser-is-dead signature
+            # found causing 90 identical failures in a real run (see
+            # LESSONS_LEARNED.md). Distinguished from an ordinary
+            # FetchTimeout because retrying THIS specific failure against
+            # the same shared browser is a guaranteed repeat, not a
+            # transient one -- crawl_worker fails the whole run fast on it
+            # instead of retrying into a browser that's already dead.
+            if "Connection closed while reading from the driver" in error_message:
+                raise BrowserDriverError(error_message)
+            raise FetchTimeout(error_message)
         links = result.links.get("internal", []) + result.links.get("external", [])
         raw_hrefs = [l.get("href", "") for l in links if l.get("href")]
         markdown = strip_text_patterns(normalize_link_text(result.markdown))
@@ -418,9 +430,11 @@ async def main():
             default_delay_seconds=config.DEFAULT_POLITENESS_DELAY_SECONDS,
         )
 
+        fatal_errors: list[str] = []
         tasks = [
             asyncio.create_task(
-                crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness)
+                crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness,
+                             fatal_error_sink=fatal_errors)
             )
             for _ in range(crawl_workers_n)
         ] + [
@@ -446,6 +460,15 @@ async def main():
 
     counts = await frontier.counts_by_status()
     await frontier.close()
+    if fatal_errors:
+        console.print(f"\n[bold red]Stopped early: {fatal_errors[0]}[/bold red]")
+        console.print(f"[bold red]{counts}[/bold red]")
+        console.print(
+            "[dim]The frontier DB reflects a partial run -- resuming it will "
+            "retry the URLs left in_progress/queued, but won't undo the "
+            "underlying cause. Check LESSONS_LEARNED.md before resuming.[/dim]"
+        )
+        sys.exit(1)
     console.print(f"\n[bold blue]Done.[/bold blue] {counts}")
     console.print(f"[dim]Run `python main.py --score-report {FRONTIER_DB_PATH}` to see the relevance score distribution.[/dim]")
 

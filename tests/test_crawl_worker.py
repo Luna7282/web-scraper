@@ -17,7 +17,7 @@ import time
 import unittest
 
 from crawl.frontier import Frontier
-from crawl.pipeline import crawl_worker, FetchTimeout, FetchHTTPError
+from crawl.pipeline import crawl_worker, FetchTimeout, FetchHTTPError, BrowserDriverError
 from crawl.politeness import HostPoliteness
 
 
@@ -72,6 +72,50 @@ class TestCrawlWorkerFailureModes(unittest.IsolatedAsyncioTestCase):
 
         counts = await self.frontier.counts_by_status()
         self.assertEqual(counts.get("failed"), 1)
+
+    async def test_browser_driver_error_fails_fast_no_retry_and_stops_the_run(self):
+        """A shared-browser death must not go through the normal
+        retry-then-fail path -- retrying against the same dead browser is
+        a guaranteed repeat failure, not a transient one (see
+        BrowserDriverError's docstring, found from a real crawl)."""
+        attempts = []
+        fatal_errors: list[str] = []
+
+        async def always_driver_dead(url):
+            attempts.append(url)
+            raise BrowserDriverError("Connection closed while reading from the driver")
+
+        task = asyncio.create_task(
+            crawl_worker(self.frontier, always_driver_dead, self.content_queue, lambda u: True,
+                         poll_interval=0.01, fatal_error_sink=fatal_errors)
+        )
+        await run_to_quiescence(task, self.frontier)
+
+        self.assertEqual(len(attempts), 1, "must not retry -- a dead shared browser fails identically every time")
+        self.assertTrue(self.frontier.quiescent.is_set())
+        self.assertEqual(len(fatal_errors), 1)
+        counts = await self.frontier.counts_by_status()
+        self.assertEqual(counts.get("failed"), 1)
+
+    async def test_worker_stops_immediately_if_quiescent_already_set_by_a_sibling(self):
+        """The propagation half of the fail-fast behavior: a worker must
+        notice a sibling's fatal quiescent.set() before its own next
+        claim(), not just in the row-is-None branch -- otherwise it burns
+        one more row into the same dead browser before stopping. Tests
+        this deterministically (no two-worker race) by setting quiescent
+        first, then confirming a fresh worker returns without ever
+        calling claim()/fetch_fn at all."""
+        async def must_not_be_called(url):
+            raise AssertionError("fetch_fn must not be called once quiescent is already set")
+
+        self.frontier.quiescent.set()
+        task = asyncio.create_task(
+            crawl_worker(self.frontier, must_not_be_called, self.content_queue, lambda u: True, poll_interval=0.01)
+        )
+        await asyncio.wait_for(task, timeout=2)  # returns immediately, or the assertion above fails it
+
+        counts = await self.frontier.counts_by_status()
+        self.assertEqual(counts.get("queued"), 1)  # the seeded row was never claimed
 
     async def test_transient_failure_then_success_does_not_fail_permanently(self):
         calls = {"n": 0}

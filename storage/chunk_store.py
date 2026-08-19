@@ -18,6 +18,7 @@ mistakes documented in ROADMAP.md/LESSONS_LEARNED.md:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from typing import Awaitable, Callable
 
@@ -114,19 +115,39 @@ class ChunkStore:
         updated via a metadata-only update() call -- no embedding call
         made, since content-identical chunks have identical embeddings by
         construction (same model, same normalized text -> same vector),
-        so recomputing would be pure waste."""
+        so recomputing would be pure waste.
+
+        Every chromadb collection call here goes through asyncio.to_thread
+        -- chromadb's client is synchronous (real disk I/O + HNSW index
+        writes), and calling it directly on the event loop starves every
+        other coroutine scheduled on it for however long that I/O takes,
+        including crawl4ai's own async communication with its Playwright
+        browser driver. Found the hard way: this was the actual cause of a
+        real crawl's browser-driver crashes (see LESSONS_LEARNED.md and
+        CLAUDE.md's event-loop-blocking-I/O invariant) -- confirmed by an
+        isolation test where RAG-only load (this method, extraction
+        stubbed out) froze the whole pipeline solid within ~20 seconds,
+        while extraction-only load with this method never touched ran
+        clean for 5+ minutes. Thread-safety note: this is safe without
+        additional locking only because `Writer.write()` is this
+        collection's sole caller and already enforces single-caller-at-a-
+        time via its own guard (see storage/writer.py) -- calls here are
+        sequential from one task, never concurrent with each other, so
+        to_thread's use of a fresh worker thread per call never overlaps
+        two Chroma calls against the same collection."""
         cid = chunk_id(text)
-        existing = self._collection.get(ids=[cid])
+        existing = await asyncio.to_thread(self._collection.get, ids=[cid])
         if existing["ids"]:
             sources = existing["metadatas"][0].get("sources", [])
             if source_url not in sources:
                 merged_meta = dict(existing["metadatas"][0])
                 merged_meta["sources"] = sources + [source_url]
-                self._collection.update(ids=[cid], metadatas=[merged_meta])
+                await asyncio.to_thread(self._collection.update, ids=[cid], metadatas=[merged_meta])
             return cid, False
 
         embedding = await self._embed_fn(text)
-        self._collection.add(
+        await asyncio.to_thread(
+            self._collection.add,
             ids=[cid],
             embeddings=[embedding],
             documents=[text],

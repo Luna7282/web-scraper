@@ -3085,4 +3085,161 @@ the cutoff -- mostly author/tag pages plus a couple of adjacent-domain
 "security" posts -- is real and not something this mechanism alone
 resolves.
 
+## 2026-08-19 — Phase 2's browser-driver crash root-caused: an unthreaded Chroma call starving the shared event loop
+
+### 55. Chroma client calls inside `async def` blocked the event loop long enough to kill the shared Playwright browser -- found by isolation, not by reading code alone
+Phase 2 of the relevance-gate test (real gated crawl, extraction +
+RAG both on, `crawl_workers=5`) crashed almost immediately: 90 of 92
+processed pages failed with the identical error
+`BrowserContext.new_page: Connection closed while reading from the
+driver`, all at `retry_count=3` (max retries exhausted). Phase 1 (same
+site, same 5 crawl workers, zero extraction/RAG load) had run 100+
+pages clean. Stopped the run rather than let it burn the frontier on
+guaranteed-identical failures.
+
+**Two things checked before proposing anything, per the explicit ask**:
+1. Which calls in the pipeline are threaded? `_make_extract_fn`'s LLM
+   call and `_make_embed_fn`'s embedding call were both already
+   correctly wrapped in `asyncio.to_thread`. `storage/chunk_store.py::
+   ChunkStore.add_or_merge_chunk()` was not -- despite being `async
+   def`, it called chromadb's `collection.get()`/`update()`/`add()`
+   directly on the event loop. chromadb's client is synchronous (real
+   disk I/O + HNSW index writes); calling it undecorated blocks the
+   *one* event loop every worker shares.
+2. Does crawl4ai share one browser across workers? Confirmed via its
+   own source (`async_crawler_strategy.py`): `AsyncPlaywrightCrawlerStrategy`
+   holds one `BrowserManager`, and every `arun()` call from every
+   `crawl_worker` task routes through `browser_manager.get_page()`. One
+   broken/starved connection therefore fails every concurrent and
+   subsequent caller identically -- exactly the 90-identical-errors
+   shape observed, and exactly why 3 retries against a dead shared
+   browser were 3 guaranteed failures, never a chance at recovery.
+
+**Isolation, not just code-reading, per the explicit ask for empirical
+confirmation**: built two variants holding `crawl_workers=5` constant
+(the real Phase 2 config) --
+- **A: real LLM extraction on, RAG off.** Ran 5+ minutes clean, zero
+  driver errors, real forward progress (embedding + cloud LLM thread-
+  pool load present the whole time).
+- **B: extraction replaced with a zero-cost stub (`return "[]"`
+  immediately, no thread-pool work at all), RAG on** (same real
+  `chunk_fn`/`ChunkStore.add_or_merge_chunk` path as production, via a
+  standalone harness reusing the real `crawl_worker`/`extract_worker`/
+  `writer_worker`, not a reimplementation). Froze **completely** within
+  ~20 seconds: all `in_progress` rows share `updated_at` timestamps in
+  a 13-second window, then zero further motion of any kind for 5+
+  minutes -- no errors, no crash, no progress, just silence. An even
+  more direct confirmation than a crash would have been: the loop
+  itself stopped scheduling entirely, consistent with a single
+  synchronous call blocking it indefinitely (Chroma's SQLite-backed
+  I/O growing slower as `add()` accumulates HNSW index entries, or
+  simple lock/queue contention -- the exact internal reason wasn't
+  isolated further, since the fix doesn't depend on knowing which).
+
+Variant A clean for 5+ minutes vs. Variant B frozen within 20 seconds,
+both holding crawl concurrency constant, is the isolation result: the
+RAG/Chroma path is the cause, not LLM extraction.
+
+**Fix** (`storage/chunk_store.py`): wrapped all three chromadb calls in
+`asyncio.to_thread`. **Thread-safety checked, not assumed**: confirmed
+via the actual call graph (`grep` for every caller of
+`add_or_merge_chunk`/`chroma_upsert_fn`) that `storage/writer.py::
+Writer.write()` is `ChunkStore`'s sole caller, and `Writer.write()`
+already refuses concurrent calls via its own `_guard` (raises
+`RuntimeError`, see that file's docstring) -- so calls into `ChunkStore`
+are sequential from exactly one task, never concurrent with themselves,
+which is what makes `asyncio.to_thread` alone sufficient here (a fresh
+thread per call, but never two in flight against the same collection).
+This would NOT be safe as-is if anything else ever called
+`add_or_merge_chunk` directly.
+
+**Repo-wide audit for the same defect class, every `async def` in
+production code checked** (not just the one that broke) -- reported in
+full, clean sites included, per the explicit ask:
+- **Fixed, real bug, in the concurrent pipeline's path**:
+  `storage/chunk_store.py::add_or_merge_chunk()` (this entry).
+- **Fixed, same defect class, lower blast radius**: `storage/query.py::
+  query_chunks()`'s `collection.query()` -- also unthreaded chromadb,
+  but `--query` never runs alongside the concurrent crawl pipeline (a
+  separate CLI invocation), so it never had anything to starve. Fixed
+  anyway -- the invariant is unconditional, not "only where it
+  currently has company" (see CLAUDE.md).
+- **Clean, correctly threaded already**: `main.py::_make_extract_fn`
+  (LLM call), `main.py::_make_embed_fn` (embedding call), both via
+  `asyncio.to_thread`; `main.py::_http_get_text` (robots.txt/sitemap/
+  llms.txt fetches), same.
+- **Clean, no blocking I/O at all**: `crawl/frontier.py` (all DB access
+  via `aiosqlite`, which threads its own blocking calls internally --
+  the working precedent this invariant is partly modeled on;
+  `self._conn.total_changes` is a synchronous property read, not real
+  I/O, negligible); `crawl/politeness.py::hold()` (only `time.monotonic()`
+  and `asyncio.sleep()`); `crawl/robots_cache.py::get_policy()` (only
+  the already-threaded injected fetch function); `crawl/pipeline.py`'s
+  three workers themselves (delegate everything to injected
+  fns/`Writer`/`Frontier`, no direct I/O); `crawl/discovery.py` (native
+  `crawl4ai` async calls only); `content/extraction_units.py` and
+  `content/relevance.py` (embed_fn + pure CPU text/math work only);
+  `progress_display.py` (`Frontier`'s async methods + `Live.update()`,
+  which is CPU-bound rendering, not I/O).
+- **Technically synchronous, zero functional risk (checked, not just
+  excused)**: `main.py::score_report_command`/`dataset_report_command`
+  (`os.path.exists`, `load_canonical_records`'s plain `open()`) and
+  `main.py::main()`'s one-time `Writer.__init__`'s `_preload_written_urls()`
+  and `chromadb.PersistentClient(...)`/`get_or_create_collection(...)`
+  construction. All either standalone one-shot CLI commands with no
+  concurrent event-loop activity to starve, or run during single-
+  threaded startup before any worker task exists -- same shape as the
+  real bug, but with nothing scheduled alongside them to block. Left as
+  plain sync code rather than wrapped, since wrapping would add
+  complexity with no behavioral difference.
+- **Explicitly out of scope**: `tests/*.py` -- the concurrency hazard
+  this audit is about only exists in the real worker pipeline sharing a
+  real event loop and a real shared browser; tests deliberately use
+  stubs instead of real I/O (CLAUDE.md's own testability architecture),
+  so they don't run under the condition that makes this bug possible.
+
+**Browser-death handling added as a second, independent layer**
+(`crawl/pipeline.py::BrowserDriverError`, raised from
+`main.py::_make_fetch_fn` on a message-substring match for "Connection
+closed while reading from the driver"): fixing the starvation doesn't
+prove nothing else can ever kill the shared driver again. Chose
+**fail-fast over reconnect**: `crawl_worker` does not retry a
+`BrowserDriverError` (retrying against a browser already confirmed dead
+is a guaranteed repeat, not a transient failure worth `mark_fetch_failed`'s
+normal backoff-and-retry treatment) -- it marks the row permanently
+failed, sets `frontier.quiescent` directly (reusing the exact mechanism
+every worker already polls, rather than inventing a second cross-task
+signal), and returns. Every `crawl_worker` now checks `quiescent` at the
+*top* of its loop too, not just in the row-is-None branch, so a sibling
+already mid-loop notices before claiming one more row into the same
+dead browser, not just on its next empty-claim poll. `main()` reports
+this distinctly (`Stopped early: ...`, `sys.exit(1)`) instead of
+printing `Done.` as if the run completed normally. Rejected rebuilding/
+reconnecting the shared browser mid-run: no evidence in this codebase or
+from crawl4ai's docs that a mid-run reconnect actually recovers cleanly
+(in-flight requests holding references to the old browser object, its
+context, etc.) -- a fast, loud, clearly-diagnosable stop is safer than a
+silent recovery attempt built on an unverified assumption.
+
+Two new tests in `tests/test_crawl_worker.py`:
+`test_browser_driver_error_fails_fast_no_retry_and_stops_the_run` (one
+attempt, not three; row permanently failed; quiescent set; fatal error
+recorded) and `test_worker_stops_immediately_if_quiescent_already_set_by_a_sibling`
+(deterministic propagation check -- quiescent pre-set, fresh worker
+must return without ever calling `claim()`/`fetch_fn`, proven via an
+assertion-raising stub rather than a race-prone two-worker timing test).
+337 tests green (335 + 2 new).
+
+Stated as a general invariant in CLAUDE.md (no `async def` may call
+blocking I/O without `asyncio.to_thread` -- DB, disk, HTTP, or embedding
+calls all go through it), citing both `aiosqlite` (handled correctly
+from the start, the working precedent) and `chromadb` (missed, now
+fixed in two places) as the two DB-layer instances of this rule in the
+codebase so far.
+
+Verified with a real small run (extraction on, RAG on, `crawl_workers=5`,
+~20 pages against `blog.cloudflare.com`) before returning to the full
+Phase 2 attempt -- see the entry immediately following this one for the
+result.
+
 <!-- Append new entries below this line, most recent last, dated. -->

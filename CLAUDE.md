@@ -329,6 +329,67 @@ existing instruction-text preload) is the actual source of truth for "was
 this URL's content already persisted" — it survives independently of
 whatever the frontier's status column says.
 
+## Event loop invariant: no blocking I/O, ever, in any `async def`
+
+Every worker shares one `asyncio` event loop, and the crawl side shares
+one `AsyncWebCrawler` (one Playwright `BrowserManager` underneath —
+confirmed by reading `crawl4ai`'s own source, not assumed). A single
+`async def` that calls a **synchronous** DB, disk, HTTP, or embedding
+call directly — no `asyncio.to_thread` — blocks that one shared loop for
+however long the call takes. Nothing else scheduled on it runs
+meanwhile, including crawl4ai's own async communication with its
+browser driver: a loop starved long enough breaks that connection, and
+because the browser is shared, it breaks it for *every* crawl worker at
+once, not just the caller. A real crawl hit this: `storage/chunk_store.py`'s
+`ChunkStore.add_or_merge_chunk()` called `collection.get()`/`add()`/
+`update()` (chromadb's client is synchronous) directly on the loop.
+Confirmed by isolation, not just by reading the code — extraction-only
+load ran 5+ minutes clean; the same load with extraction stubbed out and
+only this RAG/Chroma path active froze the whole pipeline solid within
+~20 seconds. See `LESSONS_LEARNED.md` for the full incident and fix.
+
+**The rule, stated generally**: no `async def` may call a blocking
+library function without wrapping it in `asyncio.to_thread`. Two
+precedents in this codebase, one on each side of the line —
+`aiosqlite` (frontier.py's DB layer) does this internally, transparently,
+which is why it was never a problem; `chromadb`'s client does not, which
+is why `storage/chunk_store.py::add_or_merge_chunk()` and
+`storage/query.py::query_chunks()` (same defect, lower blast radius —
+`--query` never runs alongside the concurrent pipeline, fixed anyway
+since the invariant is unconditional, not "only where it currently has
+company to starve") both needed an explicit `asyncio.to_thread` wrap.
+Before adding any new I/O call inside `async def`, confirm which side of
+that line the library is on — don't assume "it's a client library"
+means it's already safe.
+
+`asyncio.to_thread` is sufficient without extra locking **only** where
+the call site already has exactly one caller at a time — true for
+`ChunkStore` today because `storage/writer.py::Writer.write()` is its
+sole caller and already refuses concurrent calls (its own `_guard`, see
+that file). A blocking call reachable from more than one concurrent
+task would need actual serialization (a lock), not just a thread hop —
+check this before assuming `to_thread` alone is enough anywhere new.
+
+**Shared-browser death has its own fail-fast path, as a second,
+independent layer** — fixing the starvation doesn't guarantee nothing
+else ever kills the shared driver. `crawl/pipeline.py::BrowserDriverError`
+is raised (via a message-substring match in `main.py::_make_fetch_fn`)
+when crawl4ai reports the specific "connection closed while reading from
+the driver" failure; `crawl_worker` does not retry it (retrying against
+the same dead shared browser is a guaranteed repeat, not a transient
+failure) — it marks the row permanently failed, sets `frontier.quiescent`
+directly, and returns. Every worker (including siblings already mid-loop)
+picks this up via the *same* quiescent check they already poll, checked
+now at the top of the loop too, not just in the row-is-None branch, so a
+sibling doesn't burn one more row into the dead browser before noticing.
+`main()` reports this distinctly (`Stopped early: ...`, non-zero exit)
+rather than printing `Done.` as if the run completed normally. Chosen
+over attempting to rebuild/reconnect the shared browser mid-run: this
+project doesn't have evidence a reconnect would actually recover cleanly
+mid-flight, and a loud, fast, clearly-diagnosable stop is safer than a
+silent one that either recovers via unverified reconnect logic or keeps
+burning the frontier on a mechanism nobody's confirmed works.
+
 ## Scope predicate (`crawl/scope.py`)
 
 `normalize_url()`, `derive_prefix()`, and `is_in_scope()` are pure

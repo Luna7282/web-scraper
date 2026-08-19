@@ -37,6 +37,23 @@ class FetchHTTPError(Exception):
         super().__init__(f"HTTP {status_code}")
 
 
+class BrowserDriverError(Exception):
+    """crawl4ai's shared Playwright browser connection has died -- distinct
+    from FetchTimeout (which covers an individual page being slow) because
+    every crawl_worker shares ONE browser instance (crawl4ai's
+    AsyncPlaywrightCrawlerStrategy holds a single BrowserManager); once its
+    driver connection is gone, every worker's next new_page() call fails
+    identically, and retrying the same URL against the same dead browser
+    is a guaranteed failure, not a transient one. See CLAUDE.md and
+    LESSONS_LEARNED.md for the real incident this was found from (an
+    unthreaded blocking Chroma call starving the event loop long enough to
+    break the driver's connection, now fixed in storage/chunk_store.py --
+    this exception and crawl_worker's fail-fast handling of it are the
+    second, independent layer: don't keep burning the frontier retrying
+    into a dead shared browser even if some other cause kills it again)."""
+    pass
+
+
 class RateLimitError(Exception):
     def __init__(self, retry_after: float | None = None):
         self.retry_after = retry_after
@@ -64,8 +81,16 @@ async def crawl_worker(
     robots_cache: RobotsCache | None = None,
     politeness: HostPoliteness | None = None,
     poll_interval: float = POLL_INTERVAL,
+    fatal_error_sink: list[str] | None = None,
 ) -> None:
     while True:
+        # Checked before claim() too, not just in the row-is-None branch
+        # below -- lets a fatal BrowserDriverError (set by any worker,
+        # including this one on a prior iteration) stop this worker before
+        # it claims and burns another row into a browser that's already
+        # known dead, rather than waiting for its next empty-claim poll.
+        if frontier.quiescent.is_set():
+            return
         row: FrontierRow | None = await frontier.claim()
         if row is None:
             if frontier.quiescent.is_set():
@@ -99,6 +124,25 @@ async def crawl_worker(
         except FetchHTTPError as e:
             await frontier.mark_fetch_failed(row.url, f"http_{e.status_code}")
             continue
+        except BrowserDriverError as e:
+            # Fail fast, don't retry -- see the class docstring. Every
+            # crawl_worker shares one browser; this one is dead, so are
+            # the rest. Mark this row terminal (not retryable -- a retry
+            # would just be a fourth guaranteed failure against the same
+            # dead browser), stop the whole run via the same quiescent
+            # signal every worker already polls, and record why so
+            # main() can report failure instead of "Done." on exit.
+            await frontier.mark_permanently_failed(row.url, f"browser_driver_dead: {e}")
+            msg = (
+                f"[FATAL] Shared browser driver died ({e}). Stopping the "
+                f"run rather than retrying into a dead browser -- "
+                f"see LESSONS_LEARNED.md."
+            )
+            print(msg)
+            if fatal_error_sink is not None:
+                fatal_error_sink.append(msg)
+            frontier.quiescent.set()
+            return
         except Exception as e:
             await frontier.mark_fetch_failed(row.url, f"{type(e).__name__}: {e}")
             continue
