@@ -1769,6 +1769,113 @@ the mechanism is measured to work correctly in isolation and through the
 real call site, not proven against a real target's actual `Crawl-delay`
 value yet.
 
+## 2026-08-19 — Phase 3 Step 6: re-run against docs.manim.community, before/after all five fixes
+
+### 39. Full before/after: pre-rebuild audit -> Part D baseline -> Phase 3 applied
+Identical parameters to Part D (same site, `en/stable/`, blank intent,
+max_pages=20, max_depth=2, thresholds=0/0, JSONL+RAG both on, Ollama
+cloud deepseek-v4-flash + local nomic-embed-text, 5/2 workers) —
+identical is what makes the comparison controlled. Part D's corpus was
+archived to `archive/part-d-baseline/` (canonical.jsonl, frontier.db,
+chroma_db/, dataset_report.txt — verified byte-identical to the
+originals via md5sum before deleting `data/run/`'s contents) before
+firing, per the explicit requirement that it's irreplaceable without
+another paid run.
+
+Page counts differ (41 vs. 35) — `max_pages` is a fetch budget, not a
+hard ceiling (ROADMAP #28, ~confirmed again), and crawl order across
+concurrent workers isn't deterministic between runs, so this run
+happened to expand more `reference/` pages and never reached the
+`tutorials/` branch Part D sampled. Reported per-page, not per-run,
+as asked, for exactly this reason.
+
+| Metric | Pre-rebuild audit | Part D baseline | Phase 3 applied |
+|---|---|---|---|
+| Pages | 30 | 35 | 41 |
+| Vectors | 9,204 | 1,635 | 402 |
+| **Vectors/page** | **306.8** | **46.7** | **9.8** |
+| Q&A pairs | n/a (no per-pair accounting in that pipeline) | 1,144 | 320 |
+| **Pairs/page** | n/a | **32.7** | **7.8** |
+| Exact-duplicate questions | n/a | 1 | 0 |
+| Near-duplicate answer pairs | n/a | 2,396 | 65 |
+| Near-dup pairs per row | n/a | 2.09 | 0.20 (10.3x lower) |
+| &nbsp;&nbsp;same_chunk | n/a | 380 | 51 |
+| &nbsp;&nbsp;adjacent_chunk | n/a | 300 | 9 |
+| &nbsp;&nbsp;other | n/a | 1,716 | 5 |
+| Avg chunk chars | n/a | 1,527.5 | 1,256.7 |
+| Mean link-syntax % of chunk chars | n/a | 45.61% | 0.95% (real links: 0%; remainder is `![image](url)` markdown, deliberately untouched) |
+| Chrome phrases found in `source_chunk` | present (motivated the rebuild) | 0 (fixed step 8 Part D) | 0 (12-phrase re-check, real data) |
+| Pairs-per-chunk at 4-5 (the old padding band) | n/a | ~98.9% of chunks | 76.9% of chunks (23.1% now land at 1-3) |
+
+**Vectors/page fell 31x from the original pre-rebuild figure (306.8 ->
+9.8), 4.8x from the Part D baseline alone** — chrome-stripping (step 8)
+and link-syntax normalization (Phase 3 Step 1) account for most of the
+character-budget reduction that drives fewer/smaller chunks; the
+variable-count prompt (Step 3) and both drop in parallel. **Near-dup
+pairs per row fell 10.3x** (2.09 -> 0.20) — bigger than the pairs/page
+drop alone (4.2x) would explain by combinatorics, meaning the actual
+per-row duplication *rate* dropped, not just the row count. The `other`
+near-dup category (non-adjacent same-page pairs) fell hardest in
+absolute terms (1,716 -> 5) — consistent with same-chunk padding
+(step 3) and link boilerplate (step 1) both having inflated it
+indirectly, not just the two categories named after them directly.
+
+**Verified, not assumed**: re-checked all 12 chrome phrases from entry
+#32/#35's diagnosis (Light/Dark mode, Skip to content, Back to top, View/Edit
+this page, Expand, Menu, Toggle, Copy to clipboard, Copied!) against
+every `source_chunk` in the new corpus — zero matches. Re-measured the
+10 chunks with the highest remaining "link syntax" fraction (max 11.5%)
+and confirmed by inspection every one is `![image](url)` markdown, the
+one link form `normalize_link_text()` deliberately leaves alone (an
+image's `src` isn't redundant with its alt text the way a hyperlink's
+URL is with its visible text).
+
+**Sections/export filenames at depth 1/2/3**: re-derived `section`
+offline against the real corpus (matching Phase 2A's method) since
+`export.py --section-depth` doesn't actually re-derive anything —
+`package_plain_jsonl`'s `section_depth` param is still dead, grouping is
+still purely the already-baked `section` field (confirmed again, not
+just assumed from the earlier finding). Depth 1: 5 clean categories
+(changelog 71, faq 19, installation 29, reference 192, reference_index
+5) — this run's page mix didn't include `tutorials/`/`guides/`/`conduct.html`
+the way Part D's did, a direct consequence of the different crawl
+order noted above. Depth 2 and depth 3 produce **identical** section
+sets again (41 sections, same as page count) — this site's structure
+still never nests past 2 path segments past the seed prefix. 7 of 41
+slugs hit the 60-char cap and got a content-hash suffix at depth 2/3;
+**zero required a numeric disambiguation suffix at any depth** — same
+finding as Part D, real collisions remain unobserved on this site's
+actual URL shapes. `unified.jsonl` row count (316) equals the sum of
+`manifest.json`'s per-section `row_count` at all three depths — no row
+lost or double-counted by the split.
+
+**Verbatim sample, tutorial-shaped page** (`installation/uv.html`, a
+how-to page — this run didn't reach `tutorials/building_blocks.html`,
+see above): 20 consecutive pairs read clean end to end — accurate,
+grounded, no restatement padding, no chrome, no link-syntax leakage. A
+representative pair: *"What is the recommended tool for managing Python
+environments when installing Manim?"* -> full, accurate, self-contained
+answer citing `uv` and the `pip` fallback.
+
+**Verbatim sample, reference page**
+(`reference/manim.mobject.types.point_cloud_mobject.PMobject.html`, 16
+pairs, real API content): read clean too, with one real, honestly-noted
+observation -- pairs 5-9 (chunk 1, general `Mobject.add_points`/
+`reset_points`/`thin_out`/`sort_points` questions) and pairs 10-14
+(chunk 2, the same methods framed as `PMobject`-specific) cover
+overlapping ground. This is `dataset_report.py`'s `other` category (same
+page, non-adjacent chunks) and traces to the *source page itself*
+repeating method docs across a summary table and a full autodoc
+section, not an extraction artifact -- Sphinx's own structure, not
+something the fixes in this phase target or should be expected to
+catch. Reported as observed, not smoothed over.
+
+**Not yet applied**: `--semantic-dedup` (Step 4) stayed off for this
+export (as designed — off by default). A `--semantic-dedup-report` run
+against this real corpus, to see what the 0.4 threshold would flag on
+top of the near-dup counts already reported above, is the natural next
+check but wasn't run as part of this step's report.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->
