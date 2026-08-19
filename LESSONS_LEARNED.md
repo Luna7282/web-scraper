@@ -2738,6 +2738,160 @@ shape as the chrome_strip and robots.txt gaps before it (entries #28,
 #27): a component's own tests passing is not evidence that it's wired
 correctly into the paths that actually get exercised.
 
+## 2026-08-19 — RAG retrieval quality measured for the first time on real corpora
+
+### 51. Retrieval is mostly good, one real corpus-specific miss, no reliable score floor, and an automated-check false positive caught along the way
+Step 7 proved retrieval functional with a handful of queries; never
+evaluated for quality on a real corpus, and chunk contents have changed
+substantially since (link stripping, chrome fixes, the new prompt). Ran
+30 real queries (15 per corpus, both archived Chroma collections --
+manim 402 vectors, FastAPI 2,032 -- both `nomic-embed-text`/768-dim,
+confirmed before firing) across four categories: plain single-page fact,
+fact repeated across pages (tests the content-hash-merged chunk with
+multiple `sources`), fact in a table/parameter list (tests whether
+retrieval finds content the extraction pairs missed -- ROADMAP #32/#33),
+and genuinely absent. 30 embedding calls total, confirmed before firing,
+all local Ollama, zero cost.
+
+**A methodology catch worth recording on its own**: the first-pass
+automated judgment (does a ground-truth keyword appear in the top
+result's parent text) produced a real false positive.
+`f1` ("What is the simplest FastAPI application code?") was marked HIT
+because the string `"FastAPI()"` appeared in the top result -- but that
+occurrence was inside an unrelated `@app.websocket()` reference-page
+example, not the tutorial's actual Hello World example. Manually reading
+confirmed the true top-3 results never contain the tutorial's minimal
+app at all -- a genuine miss the automated check couldn't see. Same
+shape as this session's now-repeated lesson about automated similarity
+checks (entries #40, #46, #49): a cheap automated signal needs manual
+verification before being trusted, especially the first time a new one
+is built. Every "HIT" verdict below was re-checked by actually reading
+the parent text for the higher-risk cases (generic single-word keyword
+matches), not just trusted from the keyword pass.
+
+**Also found a flaw in the test set itself, not in retrieval**: query
+`m11` ("What is the biolinum TeX font template in Manim?") assumed
+`TexFontTemplates.html` (the page `biolinum` lives on) was in this
+corpus -- it isn't. That page was part of an earlier, larger crawl
+(Part D, 35 pages) used for a different measurement earlier this
+session; the current archived Step 6 corpus (41 pages, a different
+crawl with non-deterministic page selection) never reached it. Confirmed
+by checking `canonical.jsonl`'s URL set directly. Excluded from the
+"real hit" statistics below as an invalid test case -- but its result is
+kept and reported separately because it turned out to be genuinely
+informative (see finding 1).
+
+**Results, by category:**
+
+| Corpus | Clean hits | Content-gap-but-correct-location | Miss | Found-not-top-ranked | Correctly-absent | Invalid test |
+|---|---|---|---|---|---|---|
+| manim (15) | 6 | 4 | 0 | 0 | 3 | 1 (m11) |
+| FastAPI (15) | 9 | 0 | 2 | 1 | 3 | 0 |
+
+"Content-gap-but-correct-location" (manim `m7`/`m8`/`m9`/`m12`, all
+querying `run_time`/`path_arc`/`n_points_per_curve`/`sheen_factor`) is
+its own category, not a retrieval failure: the retrieved chunk is the
+right one -- it's the attribute-table row the query asked about -- but
+that row's description cell is blank in the source documentation itself
+(the exact rows ROADMAP #33's fabrication investigation already
+identified as having nothing to say). **This is actually the table-
+category test succeeding at what it was built to check**: the content
+reaches the index and gets found even where the extraction pairs missed
+it entirely, exactly as hoped. There's just nothing substantive to
+return for these specific attributes anywhere in the corpus -- a
+documentation-completeness fact about Manim's own theme, not a chunking
+or retrieval defect.
+
+**FastAPI's two genuine misses**: `f1` (above) and `f3` ("What command
+do I use to run FastAPI in production?" -- the answer, `fastapi run`,
+lives in `tutorial/first-steps.html`'s prose; all three retrieved
+results were FastAPI-class reference pages instead). Both misses are on
+`plain` -- supposedly the easiest category -- and both retrieved dense
+reference-documentation pages in preference to a shorter tutorial
+sentence. Worth further investigation (not done here) whether this
+reflects the tutorial content being embedded alongside much more
+verbose, keyword-dense reference pages that dominate the corpus (FastAPI
+reference pages are far larger, per entry #45).
+
+---
+
+**1. Score floor: not reliable, and the corpus mismatch above proves
+exactly why.** Comparing deliberately topic-remote absent queries only:
+
+| | Real-hit top-1 distance | Absent top-1 distance | Gap |
+|---|---|---|---|
+| manim | 162.8 -- 271.3 | 292.6 -- 305.0 | 21.4 |
+| FastAPI | 113.6 -- 202.0 | 230.1 -- 238.6 | 28.1 |
+
+A clean gap exists for topics semantically *remote* from the corpus
+(Kubernetes autoscaling, GraphQL resolvers, quantum circuits -- none of
+which are anywhere near "Manim animation" in embedding space). **But
+`m11`'s distance (170.1) falls squarely inside the real-hit range**,
+despite `biolinum` not existing anywhere in this corpus -- because the
+query is topically adjacent to real indexed content
+(`TexTemplateLibrary`, a genuinely related but different class in the
+same module). Chroma is L2 distance here (no `hnsw:space` override in
+`chunk_store.py`, so Chroma's default applies -- lower is more similar,
+unbounded above, not a normalized similarity score). **Conclusion: a
+fixed distance floor would catch queries about topics the corpus has
+nothing related to, but would not catch a plausible-sounding query about
+something adjacent-but-not-actually-present** -- which is arguably the
+more dangerous failure mode for a user-facing system, since it's the
+one that produces a confident-sounding wrong answer instead of an
+obvious non-answer. If a floor is added, it should be understood as
+catching the "wildly off-topic" case only, not general hallucination
+risk, and stated as such rather than presented as a general fix.
+
+**2. Parent size: appropriate for single-topic content, weak for
+cross-page merged chunks specifically.** Parent text at `PARENT_CHUNK_SIZE`
+(2000, `config.py`) is used close to fully in most results (median 1950
+manim / 1787 FastAPI). For `plain`/`table` category hits (`m2`, `f7`,
+`f11` read in full), the size is well-matched: even content well beyond
+the direct answer (e.g. `m2`'s VGroup docstring plus a full worked
+example) is genuinely about the queried topic, not filler -- more
+grounding, not noise. **But for the `cross_page` category specifically**
+(`m5`, read in full: 1996-char parent, only ~50-400 chars -- the one
+attribute-table row plus maybe its neighbors -- actually about the
+generic `always` attribute the query asked about; the rest is
+`TangentLine`-specific signature/parameters/example code the query
+never asked about) **relevance fraction drops sharply, to roughly
+5-20%.** This isn't a wrong *chunk size* so much as a structural mismatch:
+content-hash chunk merging correctly recognizes the *child* text is
+identical across many pages and merges the vector, but the *parent*
+text returned is still just one representative page's full surrounding
+context -- appropriate for a page-specific fact, oversized and mostly
+irrelevant for a fact that's genuinely page-independent. Not fixed
+here -- reported as the first real evidence PARENT_CHUNK_SIZE was ever
+checked against, per the explicit ask; whether cross-page merged chunks
+need a different (smaller, or query-relevance-trimmed) parent-return
+strategy is a real, separate design question this measurement surfaces
+but doesn't answer.
+
+**3. Link stripping: no regression found, but the test set fell one
+query short of the requested minimum for manim.** `f10` and `f12`
+(FastAPI) and `m4` (manim) all retrieved cleanly -- the visible text
+`normalize_link_text()` kept (a cross-referenced class name, "Read more
+about it in the FastAPI docs...") is still embedded and retrievable;
+`f12`'s answer was present but ranked 3rd, not 1st, worth noting but not
+a failure to retrieve it at all. `m11`, meant to be manim's second
+link-stripping check, turned out to test something not in the corpus
+instead (see above) -- so manim has only one valid link-check result,
+short of the "at least two per corpus" ask. **Flagging this rather than
+silently padding the count or firing an unconfirmed extra query**: a
+replacement manim link-check query (e.g. against a real cross-reference
+link confirmed present in this corpus, such as `CounterclockwiseTransform`'s
+"See also" -- already used for `m4`, so a genuinely different one would
+be needed) is one more local embedding call away if wanted.
+
+**Net assessment**: retrieval works well on real content (15 of 18
+non-absent, non-invalid manim+FastAPI queries were clean or acceptable
+hits), correctly finds table content pairs miss, and correctly
+distinguishes remote-absent queries by distance -- but two real, useful
+findings came out of the specific things asked to check: the score
+floor doesn't cover adjacent-but-absent queries, and cross-page merged
+chunks return oversized, low-relevance parent text relative to
+single-page facts. Neither fixed here -- this was the measurement.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->

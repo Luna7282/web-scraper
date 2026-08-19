@@ -726,6 +726,33 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     produces this record shape. **Size: S, not built -- reported per
     the explicit ask.**
 
+37. **RAG retrieval quality measured for real, two findings, neither
+    fixed.** 30-query evaluation against both archived Chroma
+    collections (`LESSONS_LEARNED.md` #51):
+    - **No reliable score floor for "no good answer."** A fixed L2
+      distance threshold catches queries about topics semantically
+      remote from the corpus (clean gap: manim real-hit max 271 vs.
+      absent min 293; FastAPI 202 vs. 230), but a query about something
+      topically *adjacent* to real content while not actually present
+      scored 170 -- inside the real-hit range on both sides. *Not
+      fixed*: no threshold value would separate this case from a
+      genuine hit; would need a different signal entirely (e.g. an
+      LLM-as-judge pass over the top result, or a learned/calibrated
+      confidence score) if "tell the user when there's no good answer"
+      needs to be reliable, not just "catch the wildly off-topic case."
+    - **Cross-page merged chunks return oversized, low-relevance parent
+      text.** Content-hash chunk merging correctly shares one vector
+      across pages with identical child text, but the returned *parent*
+      text is still one representative page's full ~2000-char context --
+      appropriate for a page-specific fact (measured ~90-100% relevant
+      for `plain`/`table` category hits), but only ~5-20% relevant when
+      the queried fact is generic/shared (measured on the `always`-
+      attribute case) since the rest of the parent is that one page's
+      unrelated specifics. *Not fixed*: whether merged chunks should
+      return a smaller or differently-scoped parent than page-specific
+      chunks is an open design question this measurement surfaces, not
+      answers. **Size: unclear until a direction is picked for either.**
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
