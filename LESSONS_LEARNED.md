@@ -2438,6 +2438,78 @@ different similarity signal underneath it. See ROADMAP #23's note
 cross-referencing this entry, so either one found first leads to the
 other.
 
+## 2026-08-19 — Variant A re-characterization: full 155-chunk re-run, post-change numbers
+
+### 48. Post-change coverage confirmed in the same units as the baseline -- real gain, bare-row coverage dropped rather than rose, fabrication not found at scale
+Re-ran Variant A against **every** table-shaped chunk from the original
+characterization (155 chunks: 30 manim + 125 FastAPI, all from the
+already-archived corpora, zero new fetches), not just the 2 spot-check
+chunks -- a like-for-like comparison to entry #46's 59.8%/87.8%
+baseline, per the explicit ask. Raw pair output saved
+(`recharacterize_results.json`, kept outside the repo) so this is
+re-analyzable without re-spending the 155 Ollama cloud calls.
+
+| | Baseline | Variant A |
+|---|---|---|
+| manim rich-row coverage | 59.8% | **92.6%** (175/189) |
+| FastAPI rich-row coverage | 87.8% | **97.7%** (689/705) |
+| manim bare-row coverage | 42.7% (pooled with FastAPI, which has 0 bare rows) | **12.6%** (13/103) |
+
+**Bare-row coverage dropped, not rose** -- 12.6% is well under the
+42.7% baseline, directly answering the specific check requested: this
+is not padding under a different name.
+
+**4 of 155 chunks (2.6%) failed to parse** -- truncated JSON on very
+large table pages (`PMobject.html` chunk1, and 3 FastAPI chunks
+including one from `fastapi/reference/fastapi` itself, the 150-chunk
+page). These contribute zero pairs and their rows show up as
+"uncovered" for a reason unrelated to coverage decisions -- flagged
+explicitly rather than silently baked into the aggregate: 9 of the 16
+remaining "still uncovered" manim rich rows belong to the single failed
+`PMobject.html` chunk alone, not a real miss.
+
+**Cross-page redundancy check, as asked**: of the 66 manim rich rows
+that flipped from uncovered (baseline) to covered (Variant A), 46 are
+distinct names. **26 of the 66 instances (39%) are the known repeated
+inherited attributes** (`always`, `depth`, `height`, `width`, `animate`,
+`fill_color`, each appearing newly-covered on 3-5 different subclass
+pages) -- this portion of the gain is cross-page redundancy, not a
+per-page coverage win, and would look identical in the aggregate either
+way, exactly the risk flagged before firing. **The remaining 40
+instances (61%) are genuinely page-specific** -- unique method
+parameters, class-specific attributes, submodule names in enumeration
+lists (`changing`/`fading`/`growing`/`rotation`, a color constant
+`APRICOT`). Majority of the gain is real; a real minority of it is the
+flagged effect.
+
+**Fabrication check across all 155 chunks, not just the 2 tested
+before**: 17 pairs mention a blank-cell row's name (down from 52 on the
+same 30 manim chunks under baseline -- also a real reduction, not just
+a coincidence of a smaller sample). Read every one. Same pattern as
+entry #47's archived-corpus check, not a new failure mode:
+- Most are false positives of word-matching -- `fill_color`'s own
+  explanation using the English phrase "fill color," or a `color=RED`
+  kwarg in example code, both matching the unrelated blank `color`
+  attribute row.
+- Several are genuinely grounded elsewhere in the same chunk --
+  `CounterclockwiseTransform`'s `path_arc` claim (`3.141592653589793`)
+  again matches its constructor signature exactly; `Restore`'s
+  `run_time` claim is backed by a literal `run_time=2` in that chunk's
+  own code example.
+- A few are vague, generic statements ("these attributes are inherited
+  from parent classes and control the animation's path, timing, and
+  movement") -- soft, not chunk-grounded, but not a specific invented
+  claim either.
+- **Zero instances as specific and unsupported as the controlled test's
+  `n_points_per_curve`/`color` example.** Not found at this scale
+  either.
+
+**Conclusion**: the post-change numbers hold up under the full,
+comparable re-run -- real coverage gain on both sites, bare-row
+coverage down not up, fabrication not reproduced at scale, and the one
+real caveat (39% of manim's gain being cross-page-repeated attributes)
+reported rather than hidden in the aggregate, as asked.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->
