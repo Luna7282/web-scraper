@@ -2076,6 +2076,76 @@ rather than a confirmed cause -- only one page examined at this depth,
 not yet checked against other tabular reference pages. Not fixed here,
 per the explicit ask to diagnose before proposing anything.
 
+## 2026-08-19 — Real hang found and fixed resuming a completed crawl
+
+### 44. Quiescence was only reachable from a decrement -- any already-final startup state hung forever
+Found live, not in a test: resuming the FastAPI crawl (reference+tutorial
+branches, max_pages=20) after it had already reached 34 done pages
+(past the cap) with nothing left `in_progress` -- the process never
+exited. Every crawl worker just looped `claim() -> None -> sleep ->
+repeat` forever, and had to be killed externally three times before the
+cause was found.
+
+**Root cause**: `Frontier._locked_claim()` returns `None` directly when
+the cap blocks a claim, with no call to `_locked_check_quiescence()`.
+That check is *only* ever invoked from the handful of methods that
+decrement `_in_flight` -- a successful `claim()`, `content_done()`,
+`results_done()`/`put_results` resolving. Every one of those requires
+something to still be in flight in *this process* (`_in_flight` is
+process-lifetime-only, starts at 0 on every fresh `Frontier()`
+regardless of what a prior process left behind). A process that starts
+in an already-final state -- an empty frontier, one where every row is
+already terminal, or one where `max_pages` was already met with nothing
+left `in_progress` to recover -- has no decrement to ever reach the
+check from, so `quiescent` never gets set. **Same shape as the
+cascade-termination bug this architecture's global-quiescence design
+was built to avoid** (`tests/test_frontier_quiescence.py`'s docstring):
+a completion-triggered check in a state where nothing completes. The
+cap-blocked `claim()` case is one instance of the general problem, not
+the whole problem -- fixing only that branch would have left the empty-
+and all-terminal-frontier cases still broken.
+
+**Fix**: `Frontier.recover_crashed()` -- the real startup call site,
+called by `main.py` right after `frontier.open()` and before any worker
+task exists -- now calls `_locked_check_quiescence()` unconditionally
+as its last step, inside the same lock it already holds. Safe in every
+case: if real work remains (queued rows, cap not met), the check is a
+no-op and normal reactive triggering takes over as before; if the
+frontier is already final, quiescent gets set immediately instead of
+never.
+
+**Confirmed as a real regression, not assumed**: `git stash`-reverted
+the fix and re-ran the new tests -- they hung and the run had to be
+killed after the 30s tool timeout (exit 143), the same symptom as the
+live crawl. `tests/test_frontier_startup_quiescence.py` covers all
+three already-final startup states named above, each against a real
+on-disk db file reopened by a fresh `Frontier` instance (not `:memory:`,
+which can't simulate "a prior process already wrote this state and
+exited" -- a fresh `:memory:` connection is always a blank database), plus
+one test running a real `crawl_worker`-shaped loop end to end to prove
+workers actually exit, not just that the `Event` gets set.
+
+**The one-row crash-window gap, checked for real rather than assumed
+handled**: the FastAPI run's own crash window left exactly one page
+(`tutorial/dependencies/classes-as-dependencies`) with 32 real,
+correctly-written Q&A pairs in `canonical.jsonl` but its frontier row
+never reached `done` -- `max_pages` being already exceeded means it will
+never be reclaimed even after the fix (correct: this is the pre-existing
+"queued rows left live by design" behavior applying uniformly to a
+crash-recovery requeue too, not a new gap). Since the cap prevented a
+live second extraction attempt for that URL in this run, the suppression
+path was verified directly instead: loaded the real `canonical.jsonl`
+into a fresh `Writer` (exactly what a resumed process's preload does),
+confirmed `already_written()` returns `True` for that exact URL, then
+called `write()` again with distinct synthetic content -- the file's
+line count didn't change (2570 before, 2570 after) and the synthetic
+content never appeared. `already_written()` genuinely suppresses a
+second append; it doesn't just happen to be present and unconsulted.
+(`tests/test_writer.py::test_already_written_url_skips_jsonl_append`
+already covered this at the unit level and was passing throughout --
+this was the same mechanism confirmed against this run's real data, not
+a new finding.)
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->

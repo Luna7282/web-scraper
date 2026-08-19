@@ -429,6 +429,19 @@ class Frontier:
                     )
                     requeued += 1
             await self._conn.commit()
+            # Unconditional, not just a cap-blocked claim() branch: the
+            # quiescence check is otherwise only reachable from a decrement
+            # (claim succeeding, put_content, put_results/content_done) --
+            # every one of those requires something to still be in flight.
+            # A process that starts in an already-final state (empty
+            # frontier, everything already terminal, or max_pages already
+            # met with nothing left in_progress to recover) has no such
+            # decrement to ever reach it from, so quiescent never gets set
+            # and every worker loops claim()->None forever. Same shape as
+            # the cascade-termination bug this architecture was built to
+            # avoid -- a completion-triggered check in a state where
+            # nothing completes. See LESSONS_LEARNED.md #44.
+            await self._locked_check_quiescence()
             return {"requeued": requeued, "failed": failed}
 
     async def counts_by_status(self) -> dict[str, int]:
