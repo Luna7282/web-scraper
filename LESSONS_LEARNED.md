@@ -2004,6 +2004,78 @@ floor, or explicitly prompting for attribute/enum tables to stay
 list-form rather than being split one-per-item) is a decision for
 whoever scopes the next round, not made in this measurement.
 
+## 2026-08-19 — VGroup loss diagnosis and a general cross-site link-text-loss check
+
+### 42. Zero real content lost alongside a dropped URL, across all 5 canonical fixture sites
+The general question, checked before assuming the manim-specific finding
+generalizes: when `normalize_link_text()` drops a link's visible text
+along with its URL (not just the URL), is any of that text ever real
+content rather than navigation? Ran the real pipeline (`clean_html` ->
+`DefaultMarkdownGenerator` -> `normalize_link_text`) against all 5 of
+this project's canonical fixture sites (`tests/fixtures/*.rendered.html`
+-- blog.cloudflare.com, docs.manim.community, fastapi.tiangolo.com,
+stackblitz.com, www.manim.community; the same 5 CLAUDE.md's scope-test
+claim refers to), and inspected every case where text was dropped, not
+just counted them.
+
+| Site | Total links | Text kept | Text+URL dropped | Dropped chars |
+|---|---|---|---|---|
+| blog.cloudflare.com | 63 | 60 | 3 | 15 |
+| docs.manim.community | 114 | 103 | 11 | 67 |
+| fastapi.tiangolo.com | 91 | 60 | 31 | 47 |
+| stackblitz.com | 3 | 3 | 0 | 0 |
+| www.manim.community | 22 | 22 | 0 | 0 |
+
+Every distinct dropped text across all 5 sites: `"Skip to content"`,
+`"Back to top"`, `"View this page"`, `"Edit this page"`, `"¶"` (heading
+anchors -- FastAPI's MkDocs Material theme puts one after every single
+heading, accounting for most of its 31), and one literal empty string
+on Cloudflare -- traced to `[](https://blog.cloudflare.com/)`, a bare
+logo/home link with no alt text, confirmed nothing to lose. **No
+genuine content -- no fact, no name, no data point -- was found dropped
+alongside a URL on any of the 5 sites.** The mechanism is safe as
+measured; not fixed because nothing here needed fixing. If a future
+site's theme phrases its skip-link/back-to-top copy differently and it
+turns out NOT generic (an edge case not observed on these 5), the fix is
+extending `DEFAULT_GENERIC_LINK_TEXT`, per its own docstring -- not
+reconsidering the drop-vs-keep decision itself.
+
+### 43. The VGroup losses are unextracted, not absent -- all three facts survive fully intact in the actual chunk sent to the LLM
+Diagnosed each of entry #41's three "lost" VGroup facts individually,
+per the explicit ask (present-but-unextracted and absent-from-chunk need
+opposite fixes). Checked the real, already-persisted `source_chunk`
+text from the Step 6 corpus directly -- no new fetch needed, this is
+exactly what extraction was given:
+
+- **Base class (`VMobject`)**: chunk 0 contains, verbatim, "Bases:
+  `VMobject`" -- a standalone, cleanly formatted line, immediately after
+  the class signature.
+- **Non-mutating `+`/`-` vs. mutating `+=`/`-=`**: chunk 0 contains the
+  full doctest session showing both, including the code comments
+  spelling out the exact contrast: `>>> vg + square  # a new VGroup is
+  constructed` immediately followed by `>>> vg  # not modified`, then
+  `>>> vg += square` followed by `>>> vg  # modifies vg`.
+- **The 9 "missing" attributes**: chunk 1 contains the complete
+  Markdown attribute table, all 12 rows, including the 7 rows whose
+  description cell is blank in the source page itself (`animation_overrides`,
+  `color`, `n_points_per_curve`, `sheen_factor`, `stroke_color`,
+  `target`, `original_id`) -- unmangled, not truncated, not merged into
+  another row.
+
+**All three facts were fully present, cleanly formatted, in the exact
+text the LLM was given -- this rules out the content pipeline (chrome-
+stripping, link normalization, chunking) as the cause.** Combined with
+entry #42's finding, this means Phase 3 Steps 1/2 did not cause any of
+this page's content loss. The cause is upstream of content prep,
+inside extraction itself: the model had everything and chose not to
+write pairs about the base-class fact, the non-mutating-operator half of
+the contrast, or 9 of the 12 attribute rows. Recorded as `ROADMAP.md`
+#32, a working hypothesis (Step 3's anti-padding instruction biasing
+pair selection away from terse/tabular facts toward richer prose facts)
+rather than a confirmed cause -- only one page examined at this depth,
+not yet checked against other tabular reference pages. Not fixed here,
+per the explicit ask to diagnose before proposing anything.
+
 ---
 
 <!-- Append new entries below this line, most recent last, dated. -->

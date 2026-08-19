@@ -485,7 +485,7 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     natural place to record seed prefixes if this fix is chosen. **Size:
     XS to remove the flag; S-M to make it real.**
 
-31. **[Ranked above #23 -- larger measured impact] Markdown link syntax
+31. **[RESOLVED -- Phase 3 Step 1] Markdown link syntax
     consumes ~44% of every chunk's character budget as pure URL/syntax
     overhead, not content.** Measured across all 264 real chunks in the
     Part D corpus (`LESSONS_LEARNED.md` #31): 46.7% of all chunk
@@ -517,6 +517,40 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     real measurement of what's lost, not an assumption that all link
     overhead is equally disposable. **Size: S-M once a direction is
     chosen; the direction itself needs the tradeoff measured first.**
+    *Resolved by*: `content/chrome_strip.py::normalize_link_text()`
+    (Phase 3 Step 1, `LESSONS_LEARNED.md` #34) -- chose drop-the-URL
+    after testing all three candidate shapes on real chunks; measured
+    46.7% -> 0.95% mean link-syntax share on the Step 6 re-run
+    (`LESSONS_LEARNED.md` #39), and a dedicated cross-site check
+    (`LESSONS_LEARNED.md` #42) found zero real content dropped alongside
+    a URL across all 5 canonical fixture sites -- every case where
+    visible text was also dropped was confirmed navigational boilerplate
+    (skip-links, back-to-top, heading pilcrows, empty logo links).
+
+32. **The extraction prompt under-covers tabular/terse facts relative to
+    prose facts, once padding is no longer padding it out to compensate.**
+    Found diagnosing three facts that vanished from a real VGroup.html
+    re-extraction (base class, non-mutating `+`/`-` operator semantics,
+    9 of 12 listed attributes) -- confirmed by direct keyword search
+    against the actual stored `source_chunk` text that **all three were
+    fully present, cleanly formatted, in the chunk the LLM was given**
+    (`Bases: \`VMobject\``, the full `+`/`+=` doctest contrast, and the
+    complete attribute table including blank-description rows) --
+    see `LESSONS_LEARNED.md` #43. This rules out the content pipeline
+    (chrome-strip, link normalization, chunking) as the cause -- the
+    text was there and the model chose not to write pairs about it.
+    Working hypothesis, not confirmed: the Step 3 prompt's anti-padding
+    instruction ("one pair per genuinely distinct fact... do not pad")
+    may bias the model toward richer prose facts and away from short
+    one-line facts or repetitive table rows when it's self-selecting
+    what counts as "genuinely distinct," precisely because those
+    generate less to say per pair. Only one page examined in this depth
+    -- not yet checked whether this generalizes past attribute/parameter
+    tables specifically, or past this one page. **Size: unknown --
+    needs the same kind of chunk-vs-pairs diff done here repeated across
+    a few more tabular reference pages before a real fix (e.g. a
+    dedicated pass over table-shaped content, or an explicit "cover
+    every row of any table present" prompt rule) is worth choosing.**
 
 ---
 
