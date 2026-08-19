@@ -753,6 +753,22 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
       chunks is an open design question this measurement surfaces, not
       answers. **Size: unclear until a direction is picked for either.**
 
+38. **`crawl/robots_cache.py` reads robots.txt but not the `Content-Signal`
+    directive some sites now publish alongside it.** Noticed inspecting
+    `blog.cloudflare.com/robots.txt` before a real crawl there (see
+    `LESSONS_LEARNED.md`): it declares
+    `Content-Signal: ai-train=yes, search=yes, ai-input=yes` -- a
+    machine-readable statement of what the operator permits, separate
+    from and more specific than robots.txt's crawl/no-crawl. A tool whose
+    entire purpose is turning crawled sites into AI training data should
+    at minimum be able to *read* that signal, even before deciding
+    whether/how to act on it (e.g. warn or refuse when `ai-train=no` is
+    present, since that's exactly the use this project makes of a site).
+    *Not fixed*: no parsing, no enforcement, no warning today --
+    `RobotsCache` only resolves Allow/Disallow. **Size: S to parse and
+    surface (log the values found); a real decision about whether to
+    gate the crawl on `ai-train=no` is a separate, bigger conversation.**
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

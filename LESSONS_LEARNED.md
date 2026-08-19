@@ -2894,4 +2894,39 @@ single-page facts. Neither fixed here -- this was the measurement.
 
 ---
 
+## 2026-08-19 — Site recon for the relevance-gate test surfaced a signal the crawler doesn't read yet
+
+### 52. `blog.cloudflare.com/robots.txt` publishes a `Content-Signal` directive alongside the usual Allow/Disallow rules -- `RobotsCache` has no idea it exists
+While scoping a real crawl target for the relevance-threshold measurement
+(ROADMAP #24 -- picking a threshold from data needs a site with genuinely
+mixed relevance, not another docs site), a `--dry-run` + a plain
+`curl robots.txt` on the chosen candidate turned up:
+
+```
+Content-Signal: ai-train=yes, search=yes, ai-input=yes
+```
+
+This is the emerging Content Signals convention (referenced via the
+comment block above it in the same file, citing EU Directive 2019/790
+Article 4 rights-reservation language) -- a per-use permission statement
+(`search` / `ai-input` / `ai-train`) that sits next to, and is more
+specific than, the traditional crawl/no-crawl Allow/Disallow directive.
+For this project specifically -- a tool whose entire output is AI
+training data -- `ai-train` is exactly the use being made of the site.
+
+Two things worth separating:
+1. **Noticing this costs nothing and is unambiguously useful**: logged
+   as ROADMAP #38 (parse and surface the values found, no enforcement
+   decision implied).
+2. **Deciding whether to act on `ai-train=no`** (warn? refuse? crawl
+   anyway since Allow: / already grants blanket robots.txt permission?)
+   is a separate, bigger conversation -- not decided here, not implied
+   by logging the finding.
+
+`blog.cloudflare.com` itself declares `ai-train=yes` -- this crawl is
+going ahead regardless of the outcome of that future conversation; the
+finding is about the tool's blind spot, not a blocker for this site.
+
+---
+
 <!-- Append new entries below this line, most recent last, dated. -->
