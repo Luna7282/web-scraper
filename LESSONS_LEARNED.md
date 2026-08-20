@@ -3382,4 +3382,112 @@ hung connection never raised anything to catch in the first place.
 
 339 tests green (337 + 2 new). `ROADMAP.md` #40 marked resolved.
 
+---
+
+## 2026-08-20 — Phase 2 complete: 400-page real gated crawl, resumability proven, hub-page risk confirmed real but small
+
+### 58. blog.cloudflare.com, threshold=0.50, extract_workers=2/crawl_workers=5, RAG on -- 413 terminal pages across one external kill and one resume cycle
+Final numbers (frontier fully reconciled: 2039 total discovered URLs = 312
+done + 101 skipped_extract + 8 in_progress + 314 skipped_follow + 1304
+still queued):
+
+- **Fetched**: 413 pages (done + skipped_extract) against a `max_pages=400`
+  cap -- **3.25% overshoot** (13 pages), much smaller than Phase 1's ~9%
+  or the earlier throughput tests' overshoots at higher concurrency;
+  `extract_workers=2` keeping the pipeline slower evidently also keeps
+  `claim()` from racing as far past the cap before quiescence catches up.
+- **Extraction calls saved vs. threshold=0**: 101 pages fetched but not
+  extracted (would all have cost real LLM calls at threshold=0), *plus*
+  314 pages whose fetch was avoided entirely via the follow-gate --
+  those never cost a crawl4ai fetch, an embedding call, *or* an
+  extraction call. Real, compounding savings at both the crawl and
+  extraction level, not just the extraction level the threshold
+  nominally gates.
+- **Frontier size**: 2039 rows, `frontier.db` file size ~400KB --
+  confirms `ROADMAP.md`'s and CLAUDE.md's design assumption that SQLite
+  handles "the frontier holds thousands of rows, not dozens" without
+  needing anything different from the dozens-of-rows case tested so
+  far.
+- **Memory**: stayed low and flat throughout (~18-180MB across all
+  `python.exe` processes at various checks, no upward trend over ~8
+  hours of combined runtime) -- no leak.
+- **Rate limiting**: zero 429s, zero rate-limit-tagged `last_error`
+  entries, across the entire run. The 429-backoff path remains
+  unexercised against a real rate limit (same gap noted in #56).
+- **Wall-clock**: ~8.1 hours combined across two process launches (the
+  first killed ~161.6 min in at 99 terminal pages; the resume ran
+  ~5.415 hours to 413 terminal pages) -- consistent with the ~0.76
+  done/min measured in #56 projected to ~400 pages (predicted 8-9
+  hours).
+
+**Resumability -- the thing this whole exercise was partly testing**:
+the first process was killed externally (same pattern noted in #56 --
+external, not a crash, not a bug) with 22 rows `in_progress`. Resuming
+against the *same* `frontier.db` (not deleted) printed `Resumed from a
+prior run in data\run\frontier.db: 22 rows requeued, 0 marked failed` --
+every one of the 22 in-flight rows correctly went back to `queued`
+rather than being lost or double-counted, confirmed by the exact count
+match. `canonical.jsonl` (313 distinct `source_url`s across 11,656 pair
+rows) and the Chroma collection (11,956 vectors) both grew consistently
+across the restart with no evidence of duplication or loss -- the
+`source_url`-based dedup this project already relies on for
+crash-resume (CLAUDE.md's JSONL-duplicate-write-risk section) held up
+at real multi-hour, multi-hundred-page scale, not just in the unit
+tests that first proved it.
+
+**The 53-minute silent gap that triggered re-instrumenting for the
+resume did not recur.** Re-ran with entry/exit + a 30-second heartbeat
+(oldest-pending-call age, logged whether or not anything changed) for
+the full ~5.4-hour resume. Two direct answers to what was asked before
+resuming, from live data, not inference:
+- **Is chunk-splitting (`content_relevance.py::chunk_text`, used by both
+  `extraction_units.py`'s `PER_CHUNK` unit selection and
+  `chunk_store.py`'s RAG parent/child split) on the event loop or in a
+  thread?** On the loop, confirmed -- neither call site wraps it in
+  `asyncio.to_thread`, so the earlier blocking-I/O audit (#56) correctly
+  didn't flag it (it's not I/O), but it does run synchronously on the
+  same shared loop. **Measured cost, not just location**: max 92ms
+  (RAG split) / 46ms (unit split) across 24 real calls each in the
+  monitored window, including link-heavy pages. Confirmed harmless at
+  this site's real page sizes -- the earlier gap was not this.
+- **Heartbeat pattern across the full resume**: oldest-pending-call age
+  never exceeded ~57s across dozens of 30-second samples spanning past
+  the 108-minute mark where the previous run went quiet. No slow build-
+  up, no recurrence. The most defensible read: the original 53-minute
+  gap was a one-off (a coincidental pile-up of several genuinely slow
+  LLM calls, or an external factor outside this process) rather than a
+  reproducible defect -- consistent with, not contradicted by, #56's
+  finding that individual LLM calls can legitimately take up to 153.5s
+  and `PER_CHUNK` makes a many-chunk page's calls sum sequentially.
+
+**The hub-page/follow-gate risk raised before firing Phase 2 (a
+low-scoring parent cutting off a genuinely relevant child) is real, but
+rare and narrow in this run, not the generic tag-page problem
+originally worried about.** Checked directly: sampled the 314
+`skipped_follow` rows for anything DDoS/security-keyword-adjacent (6
+matches). Five were correctly excluded on inspection (log4j RCE x2 --
+a code-execution vuln, not DDoS; two broad `cybersecurity`/
+`email-security` tag pages and a product-feature page, all genuinely
+tangential to the DDoS-specific intent). One was a real loss:
+`on-the-recent-http-2-dos-attacks` (an HTTP/2 DoS article -- squarely
+on-topic) was only discoverable as a child of
+`madeyoureset-an-http-2-vulnerability-thwarted-by-rapid-reset-mitigations`
+(itself genuinely DDoS/HTTP2-related), whose own score, 0.4325, missed
+the 0.50 follow_threshold by 0.07 -- a **near-miss borderline article
+failing to promote a citation to another relevant article**, not a
+generic navigation-hub failure. The specific `/tag/*` pages checked
+directly (`tag/bgp`, `tag/routing-security`, `tag/rpki`, etc.) were all
+independently reached and fetched, matching Phase 1's finding that tag
+pages on this site score well above threshold on their own. **Net: 1
+concrete loss out of 314 (0.3%)**, and it's a different failure shape
+(near-miss article, not hub page) than what was flagged as the risk to
+watch -- worth knowing, not worth changing `follow_threshold` over on
+this evidence alone.
+
+**Diagnostic instrumentation** (entry/exit logging + heartbeat, same
+pattern as #56) was added, used for the resume cycle, and reverted
+(`git checkout`) before this entry was written -- never committed, 339
+tests green afterward with production code back to its pre-instrumented
+state.
+
 <!-- Append new entries below this line, most recent last, dated. -->
