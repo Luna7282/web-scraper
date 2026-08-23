@@ -2,10 +2,18 @@
 in_flight/quiescence bookkeeping that decides when a run is actually done.
 
 State machine (see CLAUDE.md for the full table): pending_score -> queued ->
-in_progress -> done / failed / skipped_follow / skipped_extract. done and
-skipped_extract both imply a relevance score was computed; failed is the only
-terminal state that doesn't, which is why orphan resolution keys off it alone
-(see _locked_mark_terminal).
+in_progress -> done / failed / skipped_follow / skipped_extract / mapped.
+done and skipped_extract both imply a relevance score was computed; failed
+is the only one of those five that doesn't, which is why orphan resolution
+keys off it alone (see _locked_mark_terminal). mapped means a page was
+fetched with no scoring/extraction attempted at all (map mode -- see
+CLAUDE.md) -- kept distinct from skipped_extract (which means the
+relevance gate *did* run and reject the page) so a map run's status counts
+don't read as a mass rejection.
+
+cancelled is a sixth terminal status, reachable from pending_score/queued/
+in_progress only (see cancel()) -- not part of the score/no-score split
+above since it means "never processed", not an outcome of processing.
 
 ## Locking discipline (structurally enforced, not just documented)
 
@@ -46,7 +54,8 @@ CREATE TABLE IF NOT EXISTS frontier (
     parent_url      TEXT,
     status          TEXT NOT NULL CHECK (status IN (
                         'pending_score', 'queued', 'in_progress',
-                        'done', 'failed', 'skipped_follow', 'skipped_extract'
+                        'done', 'failed', 'skipped_follow', 'skipped_extract',
+                        'mapped', 'cancelled'
                     )),
     relevance_score REAL,
     retry_count     INTEGER NOT NULL DEFAULT 0,
@@ -58,6 +67,38 @@ CREATE TABLE IF NOT EXISTS frontier (
 CREATE INDEX IF NOT EXISTS idx_frontier_status ON frontier(status);
 CREATE INDEX IF NOT EXISTS idx_frontier_parent ON frontier(parent_url);
 CREATE INDEX IF NOT EXISTS idx_frontier_host   ON frontier(host);
+
+-- Every (parent, child) discovery edge, not just the first-discoverer
+-- winner frontier.parent_url keeps (INSERT OR IGNORE means a second
+-- parent linking to an already-inserted child is otherwise silently
+-- lost). Additive on an existing DB opened by a newer version of this
+-- module -- CREATE TABLE IF NOT EXISTS, no migration of old rows,
+-- because there's nothing to migrate: a DB written before this table
+-- existed genuinely never recorded those extra edges. See CLAUDE.md /
+-- crawl/graph.py for what reads this (real inbound-link-count per node).
+CREATE TABLE IF NOT EXISTS discovery_edges (
+    parent_url    TEXT NOT NULL,
+    child_url     TEXT NOT NULL,
+    discovered_at TEXT NOT NULL,
+    PRIMARY KEY (parent_url, child_url)
+);
+CREATE INDEX IF NOT EXISTS idx_edges_child ON discovery_edges(child_url);
+"""
+
+# The three statuses nothing has claimed and nothing has finished with --
+# reused by the quiescence stray-check and by cancel(), which is
+# specifically "stop this before it happens", not "annotate an outcome".
+NON_TERMINAL_STATUSES = ("pending_score", "queued", "in_progress")
+
+# Recursive CTE shared with crawl/graph.py's subtree-scoped projection
+# queries -- same parent_url relationship, same shape, kept in one place
+# so the two never drift on how "descendant" is defined.
+SUBTREE_CTE = """
+WITH RECURSIVE subtree(url) AS (
+    SELECT url FROM frontier WHERE {seed_clause}
+    UNION ALL
+    SELECT f.url FROM frontier f JOIN subtree s ON f.parent_url = s.url
+)
 """
 
 
@@ -134,7 +175,7 @@ class Frontier:
         done_n = None
         if self._max_pages is not None:
             cur = await self._conn.execute(
-                "SELECT COUNT(*) FROM frontier WHERE status IN ('done','skipped_extract')"
+                "SELECT COUNT(*) FROM frontier WHERE status IN ('done','skipped_extract','mapped')"
             )
             done_n = (await cur.fetchone())[0]
         cap_reached = self._max_pages is not None and done_n >= self._max_pages
@@ -171,7 +212,7 @@ class Frontier:
             )
             AND (
                 ? IS NULL OR
-                (SELECT COUNT(*) FROM frontier WHERE status IN ('done','skipped_extract')) < ?
+                (SELECT COUNT(*) FROM frontier WHERE status IN ('done','skipped_extract','mapped')) < ?
             )
             RETURNING *
             """,
@@ -195,6 +236,19 @@ class Frontier:
         child_depth = parent_depth + 1
         if self._max_depth is not None and child_depth > self._max_depth:
             return  # discovery cap: never inserted at all
+
+        # A subtree cancelled while this parent was already in_progress
+        # (fetch in flight) can't be interrupted -- see cancel()'s
+        # docstring -- but its children must not resurrect the subtree.
+        # This is the actual enforcement point: the parent's own status
+        # flips to 'cancelled' immediately on cancel(), so by the time
+        # this fetch completes and reaches here, the check below sees it
+        # and refuses to insert (or edge-record) anything downstream.
+        cur = await self._conn.execute("SELECT status FROM frontier WHERE url = ?", (parent_url,))
+        parent_row = await cur.fetchone()
+        if parent_row is not None and parent_row["status"] == "cancelled":
+            return
+
         exempt = parent_depth <= self._follow_gate_exempt_depth
         status = "queued" if exempt else "pending_score"
         now = _now()
@@ -209,6 +263,17 @@ class Frontier:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
+        )
+        # Every (parent, child) edge, even when the child row already
+        # existed (a second parent linking to an already-discovered page)
+        # -- INSERT OR IGNORE above silently drops that case, which is
+        # exactly the real inbound-link-count information this table
+        # exists to keep. See crawl/graph.py.
+        edge_rows = [(parent_url, url, now) for url, _label in children]
+        await self._conn.executemany(
+            "INSERT OR IGNORE INTO discovery_edges (parent_url, child_url, discovered_at) "
+            "VALUES (?, ?, ?)",
+            edge_rows,
         )
         await self._conn.commit()
 
@@ -237,7 +302,7 @@ class Frontier:
         await self._locked_check_quiescence()
 
     async def _locked_mark_terminal(self, url: str, status: str, error: str | None = None) -> None:
-        assert status in ("done", "failed", "skipped_extract")
+        assert status in ("done", "failed", "skipped_extract", "mapped")
         await self._conn.execute(
             "UPDATE frontier SET status = ?, last_error = ?, updated_at = ? WHERE url = ?",
             (status, error, _now(), url),
@@ -401,6 +466,114 @@ class Frontier:
     async def mark_write_failed(self, url: str, error: str, backoff_seconds: float = 0.0) -> bool:
         async with self._lock:
             return await self._locked_retry_or_fail(url, error, backoff_seconds)
+
+    async def mark_mapped(self, url: str) -> None:
+        """map_worker-owned, parallel to mark_written: a page was fetched
+        and its links discovered, but no relevance score and no extraction
+        was ever attempted -- deliberately a distinct terminal status from
+        skipped_extract (which means the relevance gate *did* run and
+        rejected the page). Conflating the two would make a map run's
+        counts_by_status() look like a mass relevance-gate rejection."""
+        async with self._lock:
+            await self._locked_mark_terminal(url, "mapped")
+
+    @staticmethod
+    def _escape_like(s: str) -> str:
+        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    async def cancel(self, *, url: str | None = None, prefix: str | None = None) -> list[str]:
+        """Cancel a node (or every node whose URL starts with prefix) and
+        every descendant reachable through parent_url, in one transaction.
+        Exactly one of url/prefix must be given.
+
+        Only touches rows currently in a NON_TERMINAL_STATUSES status --
+        rows already done/failed/skipped_extract/skipped_follow/mapped are
+        left alone (already-terminal work is not undone), and re-cancelling
+        an already-cancelled row is a no-op.
+
+        In-flight handling: a row that is 'in_progress' right now (a fetch
+        or extraction actually in flight) is cancelled here too -- but
+        this pipeline has no mechanism to abort an in-flight crawl4ai fetch
+        or LLM call mid-request (and building one is out of scope: same
+        conservative posture as BrowserDriverError's fail-fast design,
+        nothing here has been proven safe to interrupt mid-call). So it
+        finishes naturally and overwrites this 'cancelled' status with its
+        real outcome (done/failed/skipped_extract) when the owning worker
+        calls its normal mark_* method -- cancellation does not undo work
+        already in flight, it only stops *new* work from starting.
+        What it does stop: _locked_insert_children checks the parent's
+        current status before inserting anything, so a node that finishes
+        fetching after being cancelled mid-flight does not propagate any
+        new children into the frontier -- the subtree can't regrow through
+        the one node cancel() couldn't reach in time.
+        """
+        if (url is None) == (prefix is None):
+            raise ValueError("cancel() requires exactly one of url or prefix")
+        if url is not None:
+            seed_clause, seed_params = "url = ?", (url,)
+        else:
+            seed_clause, seed_params = "url LIKE ? ESCAPE '\\'", (self._escape_like(prefix) + "%",)
+
+        non_terminal_list = ", ".join(f"'{s}'" for s in NON_TERMINAL_STATUSES)
+        query = SUBTREE_CTE.format(seed_clause=seed_clause) + (
+            "UPDATE frontier SET status = 'cancelled', updated_at = ? "
+            f"WHERE url IN (SELECT url FROM subtree) AND status IN ({non_terminal_list}) "
+            "RETURNING url"
+        )
+        async with self._lock:
+            cur = await self._conn.execute(query, (*seed_params, _now()))
+            cancelled = [row["url"] for row in await cur.fetchall()]
+            await self._conn.commit()
+            await self._locked_check_quiescence()
+            return cancelled
+
+    async def requeue_for_extraction(self, *, url: str | None = None, prefix: str | None = None) -> list[str]:
+        """The 'select' step of map-then-select-then-extract: promote a
+        previously-mapped node (or every mapped node under a URL prefix)
+        and its mapped descendants back to 'queued', so a resumed run
+        re-fetches and actually extracts them. Content from the map pass
+        was never persisted (it only ever lived in the in-memory
+        content_queue -- see CLAUDE.md), so 'resume' here means re-fetch,
+        same as crash recovery's requeue path.
+
+        Traversal stops at a 'cancelled' node instead of walking through
+        it -- a prior cancel() is a deliberate exclusion decision, and
+        selecting an ancestor for extraction should not silently resurrect
+        a subtree that was explicitly cancelled underneath it.
+        Only rows currently 'mapped' are touched; already-queued,
+        -cancelled, or -failed rows are left alone.
+        """
+        if (url is None) == (prefix is None):
+            raise ValueError("requeue_for_extraction() requires exactly one of url or prefix")
+        if url is not None:
+            seed_clause, seed_params = "url = ? AND status != 'cancelled'", (url,)
+        else:
+            seed_clause, seed_params = (
+                "url LIKE ? ESCAPE '\\' AND status != 'cancelled'",
+                (self._escape_like(prefix) + "%",),
+            )
+
+        query = (
+            f"""
+            WITH RECURSIVE subtree(url) AS (
+                SELECT url FROM frontier WHERE {seed_clause}
+                UNION ALL
+                SELECT f.url FROM frontier f JOIN subtree s ON f.parent_url = s.url
+                WHERE f.status != 'cancelled'
+            )
+            UPDATE frontier SET status = 'queued', updated_at = ?
+            WHERE url IN (SELECT url FROM subtree) AND status = 'mapped'
+            RETURNING url
+            """
+        )
+        async with self._lock:
+            cur = await self._conn.execute(query, (*seed_params, _now()))
+            requeued = [row["url"] for row in await cur.fetchall()]
+            await self._conn.commit()
+            if requeued and self._shutdown_triggered:
+                self._shutdown_triggered = False
+                self.quiescent.clear()
+            return requeued
 
     async def put_content(self, content_queue: asyncio.Queue, item) -> None:
         async with self._lock:

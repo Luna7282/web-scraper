@@ -36,11 +36,14 @@ not by accident.
 
 | Package | Module | Role |
 |---|---|---|
-| `crawl/` | `frontier.py` | SQLite-backed crawl state machine, quiescence, retries |
-| | `pipeline.py` | `crawl_worker`/`extract_worker`/`writer_worker` — the real loops `main.py` runs |
+| `crawl/` | `frontier.py` | SQLite-backed crawl state machine, quiescence, retries, cancellation |
+| | `pipeline.py` | `crawl_worker`/`extract_worker`/`writer_worker`/`map_worker` — the real loops `main.py` runs |
 | | `robots_cache.py` | robots.txt/sitemap.xml/llms.txt, own RFC 9309 Allow/Disallow resolver |
+| | `sitemap.py` | `parse_sitemap_urls` — pure XML parsing, not yet wired into map mode (`ROADMAP.md` #42) |
 | | `scope.py` | `normalize_url`/`derive_prefix`/`is_in_scope` — pure, no site-specific logic |
 | | `discovery.py` | `discover_branches`/`fetch_page_links` — one-page link discovery |
+| | `graph.py` | `discovery_graph`/`path_tree`: JSON graph projections over a frontier DB (`--graph`) |
+| | `live_status.py` | `read_live_status`: poll-friendly crawl-state snapshot, own connection (`--live-status`) |
 | | `score_report.py` | `--score-report`: relevance-score distribution from a prior run |
 | `content/` | `chrome_strip.py` | Nav/header/footer/aside/button exclusion, applied in `main.py::_make_fetch_fn` |
 | | `extraction.py` | `parse_qa_json`, the Q&A system prompt |
@@ -328,6 +331,79 @@ JSONL file's own `source_url` field (scanned at startup, same pattern as the
 existing instruction-text preload) is the actual source of truth for "was
 this URL's content already persisted" — it survives independently of
 whatever the frontier's status column says.
+
+## Map mode, cancellation, graph projections, live feed (pre-UI backend work)
+
+Four CLI-usable-on-their-own capabilities, added before any UI, each with
+its own tests (`tests/test_map_worker.py`, `tests/test_cancel_subtree.py`,
+`tests/test_graph_projections.py`, `tests/test_live_status.py`); see
+`LESSONS_LEARNED.md` #59 for the design decisions and what was measured.
+
+**Map mode** (`uv run python main.py --map <url>`, `crawl/pipeline.py::map_worker`):
+a discovery-only pass — fetch, discover + scope-filter links, record the
+frontier — with no relevance scoring, no LLM calls, no chunking. Reuses
+`crawl_worker` unmodified; only the extract stage is replaced. Every fetched
+page lands as `mapped`, a terminal status kept deliberately distinct from
+`skipped_extract` (which means the relevance gate *did* run and reject the
+page — conflating the two would make a map run's `counts_by_status()` read
+as a mass rejection). Content is never persisted (same as a normal
+extract pass — it only ever lived in `content_queue`), so resuming means
+re-fetching, not resuming from saved text. Workflow: map, then
+`--select`/`--select-prefix` (`Frontier.requeue_for_extraction`) promotes a
+chosen subtree's `mapped` rows back to `queued`, then a normal
+`python main.py` run against the same `frontier.db` re-fetches and actually
+extracts just that subtree. Anything never selected stays `mapped` forever
+— no need to explicitly cancel what wasn't selected.
+
+**Cancellation** (`--cancel <url>` / `--cancel-prefix <prefix>`,
+`Frontier.cancel`): a new terminal `cancelled` status. Cancels every
+row reachable from the target(s) via `parent_url`, in one transaction,
+touching only rows currently `pending_score`/`queued`/`in_progress` —
+already-terminal rows are left alone. **In-flight decision, made and
+documented on `Frontier.cancel`'s docstring, not left implicit**: there is
+no mechanism to abort an in-flight crawl4ai fetch or LLM call mid-request
+(same conservative posture as `BrowserDriverError`'s fail-fast design), so
+a claimed row keeps running and overwrites its own `cancelled` status with
+its real outcome once it finishes naturally. What actually stops the
+subtree from regrowing through that node: `_locked_insert_children` checks
+the parent's *current* status before inserting anything, so a node
+cancelled while in flight never gets its children (or their
+`discovery_edges` rows) written once its fetch completes.
+`requeue_for_extraction` walks the same tree but explicitly stops at a
+cancelled node instead of through it — selecting an ancestor for
+extraction must not silently resurrect a subtree that was deliberately
+excluded underneath it.
+
+**Graph projections** (`--graph {discovery,path-tree}`, `crawl/graph.py`,
+pure reads over a fresh sqlite3 connection — never the async `Frontier`):
+`discovery_graph` (edges = `parent_url`, the literal shape the crawl found
+things in) and `path_tree` (grouped by URL path segments, "what a site
+looks like"; off-seed-host URLs are reported flat in `cross_host_nodes`
+rather than forced into a path hierarchy for a site the crawl never
+explored). Both support a subtree-scoped/depth-limited query
+(`--graph-root`/`--graph-max-depth`) for progressive loading at scale, and
+report `depth`/`child_count`/`subtree_size` per node (computed at query
+time, one linear in-memory pass, not stored) as layout inputs for a future
+renderer. `url` is the stable node id across polls — no surrogate key.
+**`frontier.parent_url` only ever records a URL's first discoverer**
+(`INSERT OR IGNORE`); a `discovery_edges(parent_url, child_url,
+discovered_at)` table (populated by every `insert_children` call, schema-
+additive, no migration) is what makes real inbound-link counts
+(`inbound_count` per node, `multi_inbound_link_count` overall) possible.
+A `frontier.db` written before this table existed reports
+`edges_tracked: false` and `multi_inbound_link_count: null` — explicitly
+unknown, never a misleading `0`; there is no way to reconstruct those
+missing edges after the fact.
+
+**Live feed** (`--live-status`, `crawl/live_status.py::read_live_status`):
+a poll-friendly, read-only snapshot — status counts, in-flight rows (each
+with `parent_url` and `running_seconds`, computed as `now - updated_at`
+since nothing else touches an in-progress row's `updated_at` between
+`claim()` and whatever `mark_*` call ends that claim), recently-completed
+rows, and the timestamp of the last change. Opens its own short-lived
+sqlite3 connection — safe to run from a different process against a
+`frontier.db` a crawl is actively writing to (WAL mode). No push mechanism
+yet (`ROADMAP.md` #43) — poll again for a fresh snapshot.
 
 ## Event loop invariant: no blocking I/O, ever, in any `async def`
 

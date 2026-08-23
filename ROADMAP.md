@@ -841,6 +841,39 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     direction** -- both are real design changes to the extraction loop,
     not a config tweak.
 
+42. **Map mode never checks sitemap.xml as a fetch-avoiding seed, even
+    though the parser exists.** `crawl/sitemap.py::parse_sitemap_urls`
+    (offline-tested) turns a sitemap's XML into page URLs / sub-sitemap
+    URLs, and `RobotsCache` already discovers a host's `sitemap_urls`
+    during its normal robots.txt fetch -- but `main.py::map_main` never
+    calls the parser, so map mode always fetches every page even on a
+    site whose sitemap.xml would give the same URL list for near-zero
+    cost. **Checked live against all 5 fixture sites (`LESSONS_LEARNED.md`
+    #60): none support a zero-fetch full map today.**
+    `docs.manim.community`'s sitemap is real but only 15 URLs (nowhere
+    near the hundreds under `/en/stable/*`); `fastapi.tiangolo.com`'s is
+    more substantial (151 URLs) but not verified for completeness;
+    `www.manim.community` and `stackblitz.com` declare/imply a sitemap
+    that 404s; `blog.cloudflare.com`'s is a `sitemapindex` needing its 4
+    child sitemaps followed, not done. **Size: S** to wire the parser
+    into map mode's interactive flow anyway (offer sitemap-seeding when a
+    urlset resolves, follow a sitemapindex's children, fall back to
+    normal crawling on anything missing/malformed/incomplete-looking) --
+    still valuable for sites not yet checked, just not proven to fully
+    replace a fetch on any of the 5 known ones.
+
+43. **The live feed (`crawl/live_status.py`) is poll-only, as asked for
+    this phase.** A UI animating dozens of concurrent in-flight sprites
+    at real crawl scale (thousands of nodes) will eventually want a push
+    mechanism (SSE/WebSocket over `frontier.db`'s WAL, or a lighter
+    diff-since-last-poll response) instead of re-querying the whole
+    `in_flight`/`recently_completed` window every tick. Not needed yet --
+    `read_live_status()`'s query cost is sub-millisecond against a
+    2,000-row frontier (see `LESSONS_LEARNED.md` #59) -- but worth
+    re-measuring once a UI actually polls it continuously against a
+    much larger, actively-writing frontier. **Size: M**, and only once
+    polling is actually measured to be a problem.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

@@ -1,7 +1,9 @@
 import argparse
 import asyncio
+import json
 import os
 import sys
+import time
 
 import requests
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
@@ -16,11 +18,13 @@ from llm_factory import get_llm
 from crawl.discovery import discover_branches, fetch_page_links
 from crawl.scope import normalize_url, derive_prefix, is_in_scope
 from crawl.frontier import Frontier
-from crawl.pipeline import crawl_worker, extract_worker, writer_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError
+from crawl.pipeline import crawl_worker, extract_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError
 from crawl.politeness import HostPoliteness
 from content.extraction import QA_EXTRACTION_SYSTEM_PROMPT
 from content.relevance import make_score_fn
 from crawl.robots_cache import RobotsCache
+from crawl.graph import discovery_graph, path_tree, to_json
+from crawl.live_status import read_live_status
 from storage.writer import Writer
 from progress_display import run_progress_display
 from crawl.score_report import format_score_report
@@ -111,6 +115,196 @@ async def dry_run(root_url: str):
             for u, reason in group:
                 console.print(f"    - {u}  ({reason})")
         console.print()
+
+
+async def map_main(root_url: str):
+    """Map-only crawl: fetch pages, discover + scope-filter links, record
+    them in the frontier -- no relevance scoring, no LLM extraction, no
+    chunking, no embeddings, so the only real cost is fetching. Reuses the
+    same frontier/crawl_worker/scope/politeness as a full crawl untouched;
+    only the extract stage is replaced by map_worker (crawl/pipeline.py).
+
+    Resumable into a full crawl by design: everything fetched here lands
+    as 'mapped', a terminal status nothing auto-promotes out of. Running
+    `--select`/`--select-prefix` against the same frontier.db requeues a
+    chosen subtree to 'queued'; a subsequent `python main.py` run against
+    the same root re-fetches (content from this pass was never persisted)
+    and actually extracts just that subtree. Anything never selected stays
+    'mapped' forever and is never touched again -- no need to explicitly
+    cancel what you didn't select.
+    """
+    console.print(Panel.fit(f"[bold blue]Map-only crawl: {root_url}[/bold blue]"))
+    if not root_url.startswith("http"):
+        root_url = "https://" + root_url
+
+    branches = await discover_branches(root_url)
+    if not branches:
+        console.print("[red]No branches discovered or discovery failed.[/red]")
+        sys.exit(1)
+
+    table = Table(title="Discovered Branches")
+    table.add_column("ID", style="cyan")
+    table.add_column("Category", style="magenta")
+    table.add_column("Count", justify="right", style="green")
+    branch_list = list(branches.items())
+    for i, (cat, urls) in enumerate(branch_list, 1):
+        table.add_row(str(i), cat, str(len(urls)))
+    console.print(table)
+
+    branch_input = Prompt.ask("Enter comma-separated IDs of branches to map, or 'all'")
+    selected_branches: list[tuple[str, list[str]]] = []
+    if branch_input.strip().lower() == "all":
+        selected_branches = branch_list
+    else:
+        try:
+            ids = [int(x.strip()) for x in branch_input.split(",")]
+        except ValueError:
+            console.print("[red]Invalid input. Exiting.[/red]")
+            sys.exit(1)
+        for i in ids:
+            if 1 <= i <= len(branch_list):
+                selected_branches.append(branch_list[i - 1])
+    if not selected_branches:
+        console.print("[yellow]No branches selected. Exiting.[/yellow]")
+        sys.exit(0)
+
+    seeds: list[tuple[str, str | None]] = []
+    host_prefix_pairs: list[tuple[str, str | None]] = []
+    for category, urls in selected_branches:
+        prefix_result = derive_prefix(urls)
+        host_prefix_pairs.append((prefix_result.host, prefix_result.prefix))
+        for url in urls:
+            seeds.append((url, category))
+    scope_check = _make_scope_check(host_prefix_pairs)
+
+    max_pages_input = Prompt.ask("Max pages to fetch (blank = unlimited)", default="")
+    max_pages = int(max_pages_input) if max_pages_input.strip() else None
+    max_depth_input = Prompt.ask("Max crawl depth (blank = unlimited)", default="")
+    max_depth = int(max_depth_input) if max_depth_input.strip() else None
+    crawl_workers_n = int(Prompt.ask("Concurrent crawl workers", default="5"))
+
+    os.makedirs(RUN_DIR, exist_ok=True)
+    frontier = Frontier(FRONTIER_DB_PATH, max_pages=max_pages, max_depth=max_depth)
+    await frontier.open()
+    recovery = await frontier.recover_crashed()
+    if recovery["requeued"] or recovery["failed"]:
+        console.print(
+            f"[yellow]Resumed from a prior run in {FRONTIER_DB_PATH}: "
+            f"{recovery['requeued']} rows requeued, {recovery['failed']} marked failed.[/yellow]"
+        )
+    await frontier.seed(seeds)
+
+    robots_cache = RobotsCache(_http_get_text)
+
+    console.print(
+        f"\n[bold green]Starting map-only crawl: {crawl_workers_n} crawl workers, "
+        f"1 map worker -- no LLM calls, no relevance scoring[/bold green]"
+    )
+
+    started_at = time.monotonic()
+    async with AsyncWebCrawler() as crawler:
+        fetch_fn = _make_fetch_fn(crawler)
+        content_queue = asyncio.Queue(maxsize=max(4, crawl_workers_n * 2))
+        politeness = HostPoliteness(
+            max_concurrent_per_host=config.MAX_CONCURRENT_REQUESTS_PER_HOST,
+            default_delay_seconds=config.DEFAULT_POLITENESS_DELAY_SECONDS,
+        )
+        fatal_errors: list[str] = []
+        tasks = [
+            asyncio.create_task(
+                crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness,
+                             fatal_error_sink=fatal_errors)
+            )
+            for _ in range(crawl_workers_n)
+        ] + [
+            asyncio.create_task(map_worker(frontier, content_queue)),
+            asyncio.create_task(run_progress_display(frontier)),
+        ]
+        await frontier.quiescent.wait()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    elapsed_minutes = max((time.monotonic() - started_at) / 60, 1e-9)
+    counts = await frontier.counts_by_status()
+    await frontier.close()
+    mapped = counts.get("mapped", 0)
+    if fatal_errors:
+        console.print(f"\n[bold red]Stopped early: {fatal_errors[0]}[/bold red]")
+        console.print(f"[bold red]{counts}[/bold red]")
+        sys.exit(1)
+    console.print(f"\n[bold blue]Map complete.[/bold blue] {counts}")
+    console.print(
+        f"[dim]{mapped} pages fetched in {elapsed_minutes:.2f} min "
+        f"({mapped / elapsed_minutes:.1f} pages/min) -- no LLM calls made.[/dim]"
+    )
+    console.print(
+        f"[dim]Select a subtree for real extraction with `python main.py "
+        f"--select-prefix <url-prefix>`, then rerun `python main.py` against "
+        f"the same root -- selected pages re-fetch (content isn't persisted "
+        f"from a map pass) and extract for real this time.[/dim]"
+    )
+
+
+async def cancel_command(db_path: str, url: str | None, prefix: str | None):
+    if not os.path.exists(db_path):
+        console.print(f"[red]No frontier DB found at {db_path}[/red]")
+        sys.exit(1)
+    frontier = Frontier(db_path)
+    await frontier.open()
+    cancelled = await frontier.cancel(url=url, prefix=prefix)
+    await frontier.close()
+    console.print(f"[yellow]Cancelled {len(cancelled)} row(s).[/yellow]")
+    for u in cancelled[:50]:
+        console.print(f"  - {u}")
+    if len(cancelled) > 50:
+        console.print(f"  ... and {len(cancelled) - 50} more")
+
+
+async def select_command(db_path: str, url: str | None, prefix: str | None):
+    if not os.path.exists(db_path):
+        console.print(f"[red]No frontier DB found at {db_path}[/red]")
+        sys.exit(1)
+    frontier = Frontier(db_path)
+    await frontier.open()
+    requeued = await frontier.requeue_for_extraction(url=url, prefix=prefix)
+    await frontier.close()
+    console.print(f"[green]Selected {len(requeued)} mapped row(s) for extraction (requeued to 'queued').[/green]")
+    for u in requeued[:50]:
+        console.print(f"  - {u}")
+    if len(requeued) > 50:
+        console.print(f"  ... and {len(requeued) - 50} more")
+
+
+def graph_command(db_path: str, graph_type: str, root: str | None, max_depth: int | None, out: str | None):
+    if not os.path.exists(db_path):
+        console.print(f"[red]No frontier DB found at {db_path}[/red]")
+        sys.exit(1)
+    started = time.perf_counter()
+    if graph_type == "discovery":
+        projection = discovery_graph(db_path, root_url=root, max_depth=max_depth)
+    else:
+        projection = path_tree(db_path, root_prefix=root, max_depth=max_depth)
+    elapsed = time.perf_counter() - started
+    payload = to_json(projection)
+    console.print(
+        f"[dim]Built {graph_type} projection in {elapsed:.3f}s -- "
+        f"{projection['node_count']} nodes, {len(payload)} bytes JSON, "
+        f"edges_tracked={projection['edges_tracked']}.[/dim]"
+    )
+    if out:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(payload)
+        console.print(f"[green]Wrote {out}[/green]")
+    else:
+        print(payload)
+
+
+def live_status_command(db_path: str):
+    if not os.path.exists(db_path):
+        console.print(f"[red]No frontier DB found at {db_path}[/red]")
+        sys.exit(1)
+    print(json.dumps(read_live_status(db_path), indent=2))
 
 
 async def score_report_command(db_path: str):
@@ -510,11 +704,112 @@ if __name__ == "__main__":
         default=None,
         help="Optional frontier DB to cross-reference with --dataset-report.",
     )
+    parser.add_argument(
+        "--map",
+        metavar="URL",
+        help="Map-only crawl: fetch + discover links + record the frontier, "
+             "no relevance scoring, no LLM extraction, no chunking, no "
+             "embeddings. Interactive branch selection, same as a full crawl "
+             "-- writes to the same frontier.db, so it's resumable into a "
+             "full crawl via --select/--select-prefix afterward.",
+    )
+    parser.add_argument(
+        "--cancel",
+        metavar="URL",
+        help="Cancel this URL and every descendant reachable through "
+             "parent_url (one transaction). Pairs with --cancel-db.",
+    )
+    parser.add_argument(
+        "--cancel-prefix",
+        metavar="PREFIX",
+        help="Cancel every URL under this prefix, and their descendants. "
+             "Pairs with --cancel-db.",
+    )
+    parser.add_argument(
+        "--cancel-db",
+        metavar="FRONTIER_DB",
+        default=FRONTIER_DB_PATH,
+        help="Frontier DB to cancel against (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--select",
+        metavar="URL",
+        help="Promote a previously-mapped URL (and its mapped descendants) "
+             "back to 'queued', so the next crawl run against this frontier "
+             "actually re-fetches and extracts it. Pairs with --select-db.",
+    )
+    parser.add_argument(
+        "--select-prefix",
+        metavar="PREFIX",
+        help="Same as --select, but every mapped URL under this prefix. "
+             "Pairs with --select-db.",
+    )
+    parser.add_argument(
+        "--select-db",
+        metavar="FRONTIER_DB",
+        default=FRONTIER_DB_PATH,
+        help="Frontier DB to select against (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--graph",
+        choices=["discovery", "path-tree"],
+        help="Print a JSON graph projection over a frontier DB -- "
+             "'discovery' (edges = parent_url, the first-discoverer shape) "
+             "or 'path-tree' (grouped by URL path segments). Offline, no "
+             "crawl, no LLM calls. Pairs with --graph-db/--graph-root/"
+             "--graph-max-depth/--graph-out.",
+    )
+    parser.add_argument("--graph-db", metavar="FRONTIER_DB", default=FRONTIER_DB_PATH,
+                         help="Frontier DB to read (default: %(default)s).")
+    parser.add_argument(
+        "--graph-root",
+        metavar="URL_OR_PREFIX",
+        default=None,
+        help="Scope to this node's subtree (discovery graph) or this path "
+             "prefix (path tree) instead of dumping the whole DB.",
+    )
+    parser.add_argument(
+        "--graph-max-depth",
+        type=int,
+        default=None,
+        help="With --graph-root, how many hops (discovery) or path segments "
+             "(path-tree) deep to return. subtree_size/child_count on the "
+             "boundary nodes still reflect the true, unpruned subtree.",
+    )
+    parser.add_argument("--graph-out", metavar="PATH", default=None,
+                         help="Write the JSON here instead of stdout.")
+    parser.add_argument(
+        "--live-status",
+        action="store_true",
+        help="Print one JSON snapshot of a crawl's current state -- counts "
+             "by status, in-flight URLs (with parent + elapsed seconds), "
+             "recently completed, and the last-change timestamp. Read-only, "
+             "safe to run against a frontier.db a crawl is actively writing "
+             "to. Poll by re-running. Pairs with --live-status-db.",
+    )
+    parser.add_argument("--live-status-db", metavar="FRONTIER_DB", default=FRONTIER_DB_PATH,
+                         help="Frontier DB to read (default: %(default)s).")
     args = parser.parse_args()
 
     try:
         if args.dry_run:
             asyncio.run(dry_run(args.dry_run))
+        elif args.map:
+            asyncio.run(map_main(args.map))
+        elif args.cancel or args.cancel_prefix:
+            if args.cancel and args.cancel_prefix:
+                console.print("[red]Use only one of --cancel / --cancel-prefix.[/red]")
+                sys.exit(1)
+            asyncio.run(cancel_command(args.cancel_db, url=args.cancel, prefix=args.cancel_prefix))
+        elif args.select or args.select_prefix:
+            if args.select and args.select_prefix:
+                console.print("[red]Use only one of --select / --select-prefix.[/red]")
+                sys.exit(1)
+            asyncio.run(select_command(args.select_db, url=args.select, prefix=args.select_prefix))
+        elif args.graph:
+            graph_command(args.graph_db, args.graph, args.graph_root, args.graph_max_depth, args.graph_out)
+        elif args.live_status:
+            live_status_command(args.live_status_db)
         elif args.score_report:
             asyncio.run(score_report_command(args.score_report))
         elif args.query:

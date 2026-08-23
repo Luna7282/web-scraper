@@ -3490,4 +3490,176 @@ pattern as #56) was added, used for the resume cycle, and reverted
 tests green afterward with production code back to its pre-instrumented
 state.
 
-<!-- Append new entries below this line, most recent last, dated. -->
+### 59. Backend-first pre-UI feature set (map mode, cancellable subtrees, graph projections, live feed): four independently-testable additions, no UI, no live crawl -- 2026-08-23
+
+Implemented the four backend capabilities a future UI needs, each usable
+standalone from the CLI, per an explicit "no UI yet" brief. 380 tests green
+(372 pre-existing + 8 new files), all offline -- no live crawl was run;
+the closest thing was an offline ~12-node synthetic-graph demo (see below)
+and read-only queries against the real 413-page Phase 2 `frontier.db`.
+
+**Schema additions, both additive (`CREATE TABLE/CHECK IF NOT EXISTS`, no
+migration code, nothing to migrate)**:
+- Two new terminal `frontier.status` values: `mapped` (map mode's "fetched,
+  never scored/extracted" outcome) and `cancelled`. Kept `mapped` distinct
+  from `skipped_extract` on purpose -- reusing the latter would make a map
+  run's `counts_by_status()` read as a mass relevance-gate rejection when
+  no gate ever ran.
+- A `discovery_edges(parent_url, child_url, discovered_at)` table, because
+  `frontier.parent_url` only ever recorded the *first* discoverer
+  (`INSERT OR IGNORE`) -- a second parent linking to an already-discovered
+  page left zero trace. This was necessary, not optional: the graph-
+  projection brief explicitly asked to report how many discovered URLs in
+  the real Phase 2 frontier have more than one inbound link, and that
+  number was **not recoverable** -- Phase 2's `frontier.db` predates this
+  table, the content that would let it be re-derived was never persisted
+  (live crawls use `CacheMode.BYPASS`), and re-deriving it would mean
+  re-crawling 413 real pages, which wasn't done without asking first. Said
+  so directly in `crawl/graph.py`'s output (`edges_tracked: false`,
+  `multi_inbound_link_count: null` -- explicitly `null`, not a misleading
+  `0`) rather than fabricating a number. Going forward every
+  `insert_children` call records an edge for every (parent, child) pair
+  it's given, even when the frontier-row insert itself was a no-op.
+
+**Cancellation's in-flight decision, stated and tested, not left implicit**:
+a row that's `in_progress` when `cancel()` fires keeps running -- there is
+no mechanism anywhere in this pipeline to abort an in-flight crawl4ai fetch
+or LLM call mid-request, and building one wasn't in scope (same posture as
+`BrowserDriverError`'s fail-fast design: don't do something nothing has
+proven safe). It finishes naturally and overwrites the DB's `cancelled`
+with its real outcome. What actually stops the subtree from regrowing
+through that one node: `_locked_insert_children` now checks the parent's
+*current* status before inserting anything, so if it was cancelled while
+in flight, its children (and the edges to them) are simply never written.
+`requeue_for_extraction` (the "select" half of map-then-select-then-extract)
+walks the same parent_url tree but explicitly stops at a cancelled node
+rather than through it -- a prior cancel is a deliberate exclusion, not
+something a later "select this ancestor" call should silently undo.
+
+**Quiescence held up** (the thing this codebase has been bitten by twice
+before, both times from a state nothing moves out of -- `LESSONS_LEARNED`
+#44, #12): `cancelled` needed no change to `_locked_check_quiescence`
+itself, since it was never in the three counted non-terminal statuses to
+begin with; `mapped` did need wiring into both `claim()`'s and
+`_locked_check_quiescence()`'s page-budget count (alongside `done`/
+`skipped_extract`), or `max_pages` would never trip during a map run.
+Regression-tested with real concurrent worker tasks (not just direct
+`counts_by_status()` assertions), same shape as the existing
+`test_frontier_quiescence.py`.
+
+**Test-writing mistakes worth remembering, both from the same test file**:
+- An uncaught exception inside a background `asyncio.create_task()` (here,
+  a failed `assert` inside `_locked_check_quiescence`, itself caused by a
+  test's stub worker forgetting to call `resolve_children` before marking
+  a page terminal) doesn't surface as a test failure -- it just silently
+  kills that task while everything else keeps waiting on an event the dead
+  task would have set. Looks exactly like a hang from the outside (the tool
+  moved a 30s-timeout run to background with zero output). Diagnosed by
+  isolating the failing test class alone and reading its actual traceback,
+  not by staring at the hang longer.
+- Siblings inserted in the same `insert_children()` call share one
+  `created_at` timestamp, so `claim()`'s `ORDER BY created_at LIMIT 1`
+  does not guarantee which same-batch sibling comes back first. A test
+  that asserts an exact claim order for two such siblings is flaky by
+  construction; claim-drain-then-look-up-by-url (what
+  `test_frontier_quiescence.py` already does implicitly) is the pattern
+  that holds up. A race meant to land `cancel()` mid-flight needs either
+  deterministic polling on the *target row's own status* (not a fixed
+  `sleep`) or an artificial delay in the test's stub worker to widen the
+  window -- a bare `sleep(0.03)` before a cancel call, racing against a
+  synthetic in-memory pipeline with no real I/O latency anywhere, is not
+  reliable; this graph's whole 7-node run completed in single-digit
+  milliseconds without one.
+
+**Scale check (item 4), against the real Phase 2 `frontier.db`
+(2,039 rows)**: `discovery_graph()` ~0.13-0.14s, `path_tree()` ~0.02s,
+both pure offline reads, no network. Not a concern at this size; both use
+one linear in-memory pass (iterative post-order, not per-node recursive
+queries) for `child_count`/`subtree_size`, so the shape of that cost is
+O(n) in row count, not O(n) in query count -- worth re-measuring if a
+future run's frontier grows an order of magnitude past this one, but
+nothing here suggests it needs to change before then.
+
+**Mid-task addendum (pixel-art UI direction) changed item 3/5's shape but
+needed zero additional schema changes** -- checked directly, not assumed,
+since the addendum explicitly asked: stable node IDs (`url` is already the
+frontier PRIMARY KEY, used as-is), edge-level progress (`parent_url` +
+`updated_at` -- already valid as a claim-timestamp proxy, since nothing
+else touches an in-progress row's `updated_at` between `claim()` and
+whatever `mark_*` call ends that claim), and subtree-scoped/partial
+queries (existing `idx_frontier_parent` index already backs a
+recursive-CTE-from-one-node query) were all already sufficient. Layout
+inputs (`depth`, `child_count`, `subtree_size`) are computed at query
+time, not stored.
+
+**Offline proof of map mode** (in place of a live 20-page run, not yet
+asked for): a synthetic ~12-node graph run through the real
+`crawl_worker` + new `map_worker` + real `Frontier` (StubFetcher-style,
+same pattern as `test_crawl_worker.py`) -- 12/12 pages reached `mapped`,
+zero relevance scores computed, zero `score_fn`/`extract_fn` calls
+(map_worker's signature has neither parameter). Full workflow proven
+end to end in the same test: map everything -> `requeue_for_extraction`
+on one subtree -> a second, real (stubbed) extraction pass touches
+exactly that subtree and nothing else (`done` count == subtree size,
+`mapped` count == everything else, untouched).
+
+**Deferred, not built this session** (see `ROADMAP.md`): wiring
+`crawl/sitemap.py`'s parser into `main.py`'s interactive map-mode flow as
+an actual "seed from sitemap instead of fetching" option (the parser
+itself exists and is tested offline -- see entry #60 for the live sitemap
+check that followed this same session); a push-based live feed (poll-only,
+as asked for).
+
+### 60. Live map run + graph projections against a real site, and a real path_tree bug found from it -- 2026-08-23
+
+Two live checks, both explicitly approved first (not run speculatively):
+
+**Sitemap check, all 5 fixture sites, 5-10 small `GET` requests, no
+crawling**: `docs.manim.community` declares one (`/sitemap.xml`, 15 URLs)
+-- nowhere near comprehensive (the real `/en/stable/*` tree the map run
+below found has hundreds of pages), so it would not replace fetching for a
+full map here. `fastapi.tiangolo.com` has no robots.txt declaration but
+the conventional `/sitemap.xml` resolves anyway, 151 URLs -- plausibly
+closer to comprehensive, not verified further. `www.manim.community`
+declares a sitemap-index URL that itself 404s. `stackblitz.com` has
+neither a declaration nor a working conventional URL.
+`blog.cloudflare.com`'s `/sitemap.xml` is a real `sitemapindex` (4 child
+sitemaps, not followed here) -- confirms `crawl/sitemap.py`'s
+index-vs-urlset distinction against real, not just synthetic, XML.
+**Net: none of the 5 sites support a zero-fetch full map today** without
+following an index or accepting known-incomplete coverage --
+`ROADMAP.md` #42 updated accordingly rather than closed.
+
+**Live map run**: `docs.manim.community/en/stable/`, `max_pages=50`
+(landed at 55 -- same soft-cap-under-concurrency behavior already
+documented for `done`/`skipped_extract`, now confirmed for `mapped` too).
+**55 pages fetched, 740 URLs discovered -- a 13.5x fan-out**, the same
+directional shape as Phase 2's 413-fetched/2,039-discovered (4.9x) on a
+different site/scope, confirming "map shows more than you'd fetch" isn't
+a one-site artifact. **31.7s wall-clock, 104.25 pages/min vs. the 0.76
+pages/min measured for a full extraction crawl (entry #56) -- ~137x**,
+the actual number behind "near-zero cost" rather than an assumed one.
+**656 `discovery_edges` rows, 104 URLs with more than one inbound link**
+-- the real version of the number Phase 2's frontier.db could only report
+as unrecoverable (entry #59). Both graph projections built in ~0.01-0.02s
+against this 740-row frontier -- consistent with the earlier 2,039-row
+timing, nothing here suggests non-linear cost yet.
+
+**Real bug found by actually looking at the districts view, not by
+inspecting the code**: asked to render `path_tree` at depth 1-2 as "the
+districts view" -- it collapsed to a single node (`/en/stable`) both
+times, because `_prune_depth` measured `max_depth` from the domain root
+("/"), not from `root_prefix`'s own node. Every real crawl root that sits
+several path segments deep (locale/version prefixes like `/en/stable/`
+here) made *any* small `max_depth` look flat regardless of scoping --
+the existing offline tests didn't catch it because the synthetic fixture
+sites used shallow (1-segment) prefixes, where domain-root depth and
+scope-root depth happen to coincide. Fixed in `crawl/graph.py::path_tree`
+by walking to `root_prefix`'s own tree node before pruning; verified
+against the same real frontier -- depth 1-2 relative to `/en/stable/` now
+shows the real regions (`reference/` dominant at 389 pages, `changelog/`
+33, `contributing/`/`faq/`/`reference_index/` 6 each, `guides/`/
+`installation/`/`tutorials/` 4-5 each, plus loose top-level pages) instead
+of one opaque node. New regression test uses a synthetic multi-segment
+prefix specifically so this can't silently regress back to only being
+caught on a real site.

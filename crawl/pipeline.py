@@ -265,6 +265,36 @@ async def extract_worker(
         await frontier.content_done(content_queue)
 
 
+async def map_worker(
+    frontier: Frontier,
+    content_queue: asyncio.Queue,
+    poll_interval: float = POLL_INTERVAL,
+) -> None:
+    """Map-mode's extract-stage replacement: drains content_queue same as
+    extract_worker, but does none of extract_worker's work -- no score_fn,
+    no extract_fn, no chunking, no LLM calls at all. Every discovered
+    in-scope child is promoted unconditionally (map mode has no relevance
+    gate to promote against -- it's a "what's out there" pass, not a
+    filtered one), and the page itself is marked 'mapped', a status
+    distinct from skipped_extract so a map run's counts_by_status doesn't
+    read as a mass relevance-gate rejection (see Frontier.mark_mapped).
+    Content itself is never persisted -- same as extract_worker, it only
+    ever lived in content_queue -- so "select this subtree for real
+    extraction later" (Frontier.requeue_for_extraction) means a re-fetch,
+    not a resume from saved content.
+    """
+    while True:
+        try:
+            url, _content = await asyncio.wait_for(content_queue.get(), timeout=poll_interval)
+        except asyncio.TimeoutError:
+            if frontier.quiescent.is_set():
+                return
+            continue
+        await frontier.resolve_children(url, promote=True)
+        await frontier.mark_mapped(url)
+        await frontier.content_done(content_queue)
+
+
 async def writer_worker(
     frontier: Frontier,
     results_queue: asyncio.Queue,
