@@ -3663,3 +3663,524 @@ shows the real regions (`reference/` dominant at 389 pages, `changelog/`
 of one opaque node. New regression test uses a synthetic multi-segment
 prefix specifically so this can't silently regress back to only being
 caught on a real site.
+
+### 61. Control server (Flask, subprocess-isolated jobs) built, then broken and fixed four separate ways by actually running the headless demo -- 2026-08-23
+
+Backend control layer for the coming UI: start/stop/pause/resume a run,
+cancel/select subtrees, graph/live-status/dataset-report, export, RAG
+query -- all over HTTP, localhost-only, no auth. 34 new tests (413 total).
+See `README.md`'s "Control server" section for the endpoint list and
+`CLAUDE.md` for the pause/quiescence design. The user pre-flagged one real
+risk before any code was written (pause interacting with quiescence, see
+below) -- caught and tested before it could ever reach a live run. The
+other four were found only by running the actual demo end to end against
+a real site (`docs.manim.community`, capped small), not by review:
+
+1. **Pause explicitly excluded from quiescence, tested exactly as asked.**
+   `_locked_claim` making a paused run return `None` while rows stay
+   `queued` is precisely quiescence's own trigger shape
+   (`in_flight==0`, nothing claimable) -- the third instance of this bug
+   class (`#44`, and the cancellation work in entry `#59`). Fixed with an
+   explicit `if await self._locked_is_paused(): return` at the top of
+   `_locked_check_quiescence`, read fresh from a DB table (`control`) on
+   every check, not a cached attribute -- pause is set by a different OS
+   process (the server) than the one running the claim loop, so nothing in
+   that loop can assume its own view of "paused" is current. Verified live:
+   pausing mid-crawl froze `counts_by_status` completely across three
+   `--live-status` polls spanning 6 seconds (in-flight drained to 0,
+   `queued` stayed at 867, job stayed `running`) -- then resumed
+   immediately on unpause.
+2. **`_final_summary`'s tail-read seeked to the end to get the file size,
+   then read from that same position -- always empty.** `f.seek(0,
+   SEEK_END)` to measure size, then `f.read()` with no seek back to 0 for
+   the common (small-file) branch -- a copy/paste-shaped off-by-one that
+   only a real file with real content exposed; every synthetic test in the
+   first pass happened to hit the *other* branch's explicit seek. Fixed by
+   always seeking to the correct start position before reading.
+3. **`stop()` unconditionally overwrote job status to 'stopped', even when
+   the process had already finished on its own.** Found live: a map job
+   hit `max_pages` and quiesced naturally in the few seconds between
+   deciding to stop it and the API call landing; `stop()` still force-
+   killed (harmless no-op on an already-dead pid) and marked it
+   `'stopped'`, discarding the real `'done'` outcome. Fixed: `stop()` now
+   checks liveness first and only overwrites status if it actually had to
+   kill something.
+4. **Job-completion detection sniffed stdout for one specific JSON shape
+   (`headless_run`'s `{counts_by_status, fatal_errors}`) -- export jobs
+   never matched it and always reported `'exited'`, even on a clean
+   success.** `export.py` prints a `dataset_card` with none of those keys.
+   The actual reliable, job-kind-agnostic signal is the process's real
+   exit code, which this design deliberately doesn't hold onto (no cached
+   Popen handle, for restart-survival -- see `JobManager`'s docstring).
+   Fixed by wrapping every launched command in a thin `python -c` shim
+   that runs it as a child, waits, and prints one unambiguous marker line
+   with the real return code, independent of whatever the inner command
+   does or doesn't print to stdout. `result` (the parsed summary, now
+   purely informational) is a separate best-effort search that also had to
+   grow to handle multi-line pretty-printed JSON (`export.py` uses
+   `json.dumps(..., indent=2)`; `headless_run` doesn't) -- growing-suffix
+   parsing from the newest line backward, not a single-line check.
+5. **`discover_branches` seeds every URL found on the root page as a flat
+   depth-0 row with `parent_url=NULL` -- not a tree under one root.** This
+   is the existing, already-tested `main.py::map_main`/`main` design
+   (confirmed, not a server-side regression), but it broke an assumption
+   made while building the demo: `cancel(url=<root>)` found zero
+   descendants, because nothing has the root URL as its actual
+   `parent_url` -- the "root" is just one of ~467 parallel top-level
+   seeds. Prefix-based cancel/select still work correctly (they don't
+   depend on a single tree root); a true single-root cancel does not apply
+   to this seeding shape. Worth knowing before assuming a discovery
+   branch's root URL is a real ancestor of anything.
+6. **Selecting a subtree for real extraction does not isolate it from
+   everything else still `queued` from the broader map -- `categories:
+   "all"` at `/runs/start` includes off-site branches (github.com,
+   youtube.com, etc.) at host-only scope, and a promoted crawl will follow
+   them too.** Found live and stopped immediately: after selecting 2
+   `changelog/*` pages and promoting to a real crawl, the run picked up
+   external GitHub pages discovered from an `all`-category map and began
+   real LLM extraction on them -- caught via `--live-status`'s `in_flight`
+   field showing a `github.com` URL, not by the job "failing". The
+   working pattern for a clean map-then-select-then-crawl: cancel by
+   prefix (broad, catches every still-queued leftover) **before**
+   selecting the target subtree, not after (selecting first and cancelling
+   broadly second re-cancels the very rows just selected, since select
+   only changes `mapped`→`queued`). Not fixed at the API level this
+   session -- `/runs/start`'s `categories` should probably default to same-
+   host-only rather than `"all"` for anything meant to lead to a real
+   crawl, and a "cancel everything except this selection" primitive would
+   make the isolation atomic instead of order-dependent. See `ROADMAP.md`.
+
+**Net real cost of the live demo, worth recording since this touched real
+LLM calls**: exactly 2 pages reached `done` with real extraction (both
+produced zero Q&A pairs -- changelog release notes aren't naturally
+Q&A-shaped content, a legitimate `[]` outcome per `content/extraction.py`'s
+documented "empty is not an error" rule, not a failure) before finding #6
+above stopped the run; one additional GitHub page was mid-extraction when
+killed. `canonical.jsonl` was correctly never created (`Writer.write()` is
+a documented no-op on an empty pairs list) -- confirmed by checking, not
+assumed. Export was demonstrated separately against the existing Phase 2
+data (`data/run/`, 11,656 real pairs, zero new LLM cost).
+
+### 62. UI stage 1 (Runs + Map pages): five real bugs found by actually clicking through the flow, none of them visible from review -- 2026-08-23
+
+Vanilla JS/HTML/CSS, no build step, served as static files by the existing
+Flask server (`server/static/`) -- two pages: Runs (list, start-run form,
+detail with live status/dataset-report/export/RAG-query/pause-resume-stop)
+and Map (squarified treemap over `path_tree`, zoom via click-to-select +
+"Zoom in", breadcrumbs, cancel/select per region, cross-host gates,
+discovery-graph toggle, live in-flight overlay). Built and driven against
+the preserved `run-map-only-docs-manim-community-20260823` frontier per
+the brief, then validated further with a fresh small map→select→crawl
+cycle through the real server (not mocks) via a real browser
+(claude-in-chrome), because the brief specifically asked to see the flow
+clicked through, not just unit-tested.
+
+**Rendering choice: SVG, both stages.** ~20 regions plus one expanded
+level, single-digit concurrent sprites (bounded by worker concurrency) --
+nowhere near SVG's practical ceiling, and per-element click/hover handling
+is simpler than hand-rolled canvas hit-testing. Confirmed adequate at
+scale during testing: the treemap layout itself (squarify,
+`server/static/js/treemap.js`) computed and rendered instantly for both
+17 top-level regions and 389 flat leaf pages.
+
+Five real bugs, all found by clicking through the actual flow, not by
+review -- the same pattern as entry #61 (the backend demo), one level up
+the stack now:
+
+1. **389 flat leaf pages under `reference/` rendered as unlabeled,
+   effectively unclickable slivers.** The brief explicitly named this
+   case ("a very wide region with hundreds of children") and it happened
+   on the very first zoom-in. The treemap layout itself was correct
+   (verified directly: `squarify()` placed all 389 rects with sane, non-
+   overlapping geometry) -- the failure was one of usability, not
+   correctness. Fixed with a hard threshold (60 items): above it, render
+   a plain sortable/scrollable list instead of a treemap, same click-to-
+   select interaction either way. A treemap communicates relative size
+   well at ~20 items; at hundreds, a list is strictly more usable.
+2. **Cancel/select silently reset the zoom position back to the top on
+   every single action.** `runAction()` called the same `loadPathTree()`
+   used for the initial page load, which (correctly, for that one case)
+   resets breadcrumbs to the effective root -- but calling it after every
+   click meant a user could never drill down, act, and stay drilled down.
+   Fixed by splitting data-refresh (`refreshPathTreeData()`) from
+   navigation-state-initialization (`loadPathTree()`, initial load only);
+   `runAction()` now re-points each breadcrumb's node reference into the
+   freshly-fetched tree by path instead of resetting the stack.
+3. **The side panel kept showing pre-action status after a successful
+   cancel/select.** Verified directly against the DB that the action DID
+   work (`status='cancelled'`) while the UI still showed `queued` --
+   `state.selected` was never re-derived from fresh data, only the
+   underlying tree was refreshed. Fixed: every `render()` now re-resolves
+   `state.selected` against the current level's freshly-computed regions
+   by id, so the panel reflects real post-action state, with a `✓
+   <message>` confirmation line that survives the refresh (cleared only
+   when the user makes a new navigation choice).
+4. **The detail page 404'd immediately after starting a run.** Landing on
+   `#run/<id>` right after `POST /runs/start` returns can race
+   `frontier.db`'s creation -- it's created a few seconds into the
+   subprocess's own `Frontier.open()` call, not before the subprocess
+   launches, and `main.py`'s own heavy imports (crawl4ai, langchain, even
+   for a path that never touches them) make "a few seconds" real, not
+   theoretical (~5-8s observed for a bare `--cancel` round trip). Fixed
+   client-side (not server-side -- `run_detail` legitimately needs the DB
+   to report anything) with a bounded silent retry (10 attempts, 1s
+   apart) on exactly this transient-404 case, on both the Runs detail
+   view and the Map page's own boot sequence.
+5. **"Promote to real crawl" did nothing, twice, for two different
+   reasons -- both only visible by actually running it.** First attempt
+   used `max_pages: 1`: `max_pages` counts *cumulative*
+   done+skipped_extract+mapped rows since the frontier.db was created, not
+   "new pages this pass" (documented in CLAUDE.md, and already hit once
+   in entry #61's backend demo) -- with 21 rows already `mapped`, `21 < 1`
+   is false from the very first `claim()`, so the crawl subprocess
+   started, immediately found nothing claimable, and exited cleanly
+   (`done`, not `failed` -- indistinguishable from success without
+   checking `queued` count directly). Second attempt omitted `max_pages`
+   entirely, expecting that to mean "unbounded" -- but `/runs/<id>/resume`
+   only overrides a config key when the request actually includes it, so
+   the *stale* `max_pages: 1` from the first attempt silently survived
+   into the second. Two-part fix in `promoteToCrawl()`: stopped prompting
+   for `max_pages` at all (the real scope boundary for a promoted crawl is
+   the map→select→cancel-the-rest sequence itself -- only the selected
+   rows are left `queued`, so nothing else can run away regardless of any
+   cap), and explicitly sends `max_pages: null`/`max_depth: null` rather
+   than omitting them, so a bad value from an earlier attempt can't
+   survive silently into the next one.
+
+**Also confirmed correct, not just assumed**, by direct inspection during
+the same session: cancelled regions render visibly dead (grey, matching
+`statusColor()`'s `cancelled-full` case) once a subtree is *fully*
+cancelled -- verified on the real `reference/` region after cancelling it
+via the map; the in-flight overlay correctly marks an ancestor grouping
+region (not just an exact leaf match) when a live in-flight URL falls
+under its path prefix, confirmed by injecting a real in-flight URL from
+the live frontier and checking the marker rendered on `changelog/`, the
+correct ancestor.
+
+Not built this session (stage 2, per the brief -- "stop here and show
+me" before starting it): the pixel-art visual pass, sprite assets, zoom-
+as-a-first-class-interaction, `prefers-reduced-motion` handling.
+
+---
+
+### 63. UI stage 2 (pixel-art skin): sprite provenance verified by rendering, not reading; two real dark-on-dark legibility bugs found only by loading the Runs page -- 2026-08-24
+
+**Sprite sourcing.** Two CC0 candidates were downloaded and actually
+rendered (with proper alpha compositing, not just eyeballed thumbnails)
+before either was trusted: `cutebugs_by_madameberry.zip`'s 8x8 sprites
+did not read as recognizable insects at 20x scale even composited
+correctly; `BugSprites.png`'s "SMALL BUGS" row (from Master484's `Old
+Bugs`, OpenGameArt.org) did, with a real 5-frame leg-scuttle cycle.
+Vendored as `server/static/assets/sprites/beetle.png` (34x34px x 5
+frames, black-keyed to transparent) with a `LICENSE.md` recording source
+URL, author, and CC0 status -- not hotlinked. Neither pack has
+directional (4/8-way) walk frames, confirmed by inspecting every frame,
+not assumed from the description; direction is conveyed by CSS rotation
+instead (`.sprite-wiggle`), which the brief had already anticipated as an
+acceptable outcome, not a fallback to apologize for.
+
+**The in-flight sprite initially used neither of the two fields the brief
+named.** First pass positioned each beetle at a fixed cell-center (leaf)
+or fixed corner offset (grouping region) -- `parent_url` and
+`running_seconds` were fetched from `/runs/<id>/live_status` into
+`state.liveStatus` but never read; a comment even rationalized this as
+"what 'using parent_url and running_seconds' means here," which was
+false on inspection, not just weak. Root cause: the realistic case (the
+fetching page's parent tile is usually one breadcrumb level up, off the
+current view) was solved for before the common case (the destination
+tile it's arriving at, which *is* on screen) was actually made to move.
+Fixed: `buildSvg()` now builds a `tileCenterByUrl`/`tileCentersByPrefix`
+lookup from the tiles it's already placing, resolves `parent_url` against
+it when the parent tile happens to be on screen, and always interpolates
+sprite position along the parent→destination line by
+`running_seconds / SPRITE_TRANSIT_SECONDS` (capped at 1) -- so a sprite
+now visibly advances toward its tile as the fetch runs, with a same-tile-
+corner fallback (still time-driven, not static) when the parent isn't
+resolvable in the current view. Verified by injecting fake
+`state.liveStatus` and reading the rendered `<line>`/`<g transform>`
+coordinates directly against the lerp math at `running_seconds` = 2 and
+6, plus the unresolvable-parent fallback -- not by eyeballing a
+screenshot, which at map scale can't distinguish "positioned correctly"
+from "positioned approximately."
+
+**Two real legibility bugs, both the same root cause, both invisible from
+reading the CSS in isolation.** The stage 2 rewrite changed `body`'s
+background from light to a dark stone checkerboard, and updated every
+container that visibly needed it (`.panel`, `#side-panel`, buttons) --
+but two loose (non-`.panel`) elements kept color choices from the old
+light-background stylesheet: the bare `<table>` on the Runs list (`color:
+var(--ink)`, a near-black, with no background of its own -- text and
+backdrop differed by almost nothing) and `.hint`/`.empty-state`
+(`color: var(--stone-dark)`, which is the *exact* token used for the body
+background itself -- literally invisible, not just low-contrast). Neither
+was caught by reading `style.css`; both were caught by actually loading
+`http://127.0.0.1:8420/` and finding the Runs list rendered as a bare
+heading with nothing legible below it. A third, inverse case surfaced the
+same root cause from the other direction: `h2` styled for the dark body
+(`color: var(--parchment)`, light-on-dark) was reused unchanged inside
+`.panel` (which has a *parchment* background), so "Start a new run"
+rendered as a hollow shadow-outline -- the fill color matched its own
+backdrop again. Fixed: `table` gets its own `.panel`-equivalent
+background/border/shadow; `.hint`/`.empty-state` moved to `var(--stone)`,
+readable against both the dark body and parchment panels; added
+`.panel h2 { color: var(--ink); text-shadow: none; }` as a scoped
+override rather than changing the loose `h2` rule two other call sites
+correctly depend on. **Why it matters**: "the CSS defines a color for
+every element" is not the same claim as "every element's color has
+contrast against the background it actually sits on" -- the second claim
+only breaks visibly, and only when the container tree is walked in a
+real browser, which is why this class of bug survived a full CSS rewrite
+undetected until the Runs page was actually loaded.
+
+**Also confirmed correct by direct testing, not just by reading the
+code**: the wide-region-list fallback (389-item `reference/` region)
+still renders as a legible pixel-styled scrollable list, not slivers, at
+the new visual density; the dead-mark skull renders on a fully-cancelled
+region (`guides/`) distinctly from the plain ash fill used for partial
+cancellation; the gates box visibly changes from open (gold, wider bars,
+link count) to shut (grey, tighter bars, "shut" label) when "Same-site
+only" is toggled, with no reload needed. Not live-tested this session:
+toggling the OS-level `prefers-reduced-motion` setting itself and
+confirming the map stays fully usable statically -- the animation gate is
+architecturally sound (every animation/transition rule lives inside a
+single `@media (prefers-reduced-motion: no-preference)` block in CSS, and
+the one JS timer that steps sprite frames checks the same media query
+before ever starting), but this was verified by reading that structure,
+not by actually flipping the OS setting and re-observing, because the
+tooling available this session had no way to emulate that media feature
+in the real browser under test.
+
+---
+
+### 64. UI stage 3 (map rework): treemap replaced with a node-link tree against a reference mock -- two real bugs found only by measuring rendered geometry, not by reading attributes or screenshots -- 2026-08-24
+
+The user supplied a reference mock (`screenshots/wanted.png`, a fictional
+"Automation Board" game UI) and asked for the Map page's districts view
+to become a node-link tree (root box + one row of direct children,
+pipe-style edges, beetles with progress fill on in-flight edges) inside
+an app-frame/dark-canvas/cream-panel layout, replacing the squarified
+treemap entirely. `crawl/graph.py`, every server endpoint, and the
+cancel/select/gate/dead-mark/reduced-motion functional layer were kept
+untouched by design -- this was a rendering change over the same data
+and the same click handlers, not a re-plumbing.
+
+**Bug 1 -- flex-wrap on a same-level children row faked a multi-level
+hierarchy that wasn't there.** First pass let a level's children wrap
+onto multiple CSS lines when there wasn't enough width (a real root
+level here has 17 children). Every edge still originated from the one
+root point, but a long edge to a child on a LATER wrapped line had to
+visually cross through boxes on EARLIER lines to get there -- reading,
+at a glance, exactly like those earlier-line boxes were the parents.
+Invisible at low child counts (nothing wraps, so nothing crosses);
+only showed up once real data with ~17 siblings was on screen, not in
+any review of the layout code. Fixed by making a level's children
+always ONE un-wrapped row (horizontal scroll if wide, never clipped)
+and computing the root box's horizontal position from the children's
+actual measured midpoint (`getBoundingClientRect()` after layout), not
+from the viewport's midpoint -- root and children now share one
+coordinate space, so nothing can visually drift apart.
+
+**That fix immediately hit a second, well-documented CSS trap**: the
+children row used `justify-content: center` to stay centered when
+narrow, which -- on a flex container whose content overflows its own
+`overflow: auto` ancestor -- is a known cross-browser bug where part of
+the overflow becomes permanently unreachable by scrolling, not merely
+scrolled-past. Confirmed directly here, not assumed from a bug tracker:
+`scrollLeft = 0` read back as `0`, but the DOM's actual first 4 children
+(`_modules`, `changelog`, `changelog.html`, `conduct.html`) were simply
+never on screen at any scroll position reachable via the scrollbar or
+`element.scrollLeft`. Fixed by switching to the safe pattern -- a
+block-level `width: fit-content; margin: 0 auto` row instead of
+`justify-content: center` on the scrolling flex container itself; block
+auto-margins center the same way when there's room and simply collapse
+to 0 (left-align, fully scrollable) when there isn't, with no unreachable
+region either way.
+
+**Bug 2 -- the in-flight beetle's CSS wiggle animation silently ate its
+own position.** The sprite's positioning (`translate(x, y)`) was an SVG
+presentation *attribute* on the same `<g>` that also carried the
+`.sprite-wiggle` CSS animation class. An element's CSS `transform`
+*property*, when present, completely REPLACES its SVG `transform`
+*attribute* rather than composing with it -- so the instant the wiggle
+animation was active (i.e. whenever `prefers-reduced-motion` wasn't
+set, the default case for most users), every sprite's real rendered
+position collapsed to the SVG's own origin, keeping only the rotation.
+This is exactly why it survived the *previous* session's sprite-position
+fix (entry #63) unnoticed: that verification read the `transform`
+attribute's string value back and checked it against the intended math
+-- which was correct -- without ever checking where the element actually
+painted on screen. Caught here only by comparing a sprite `<image>`'s
+live `getBoundingClientRect()` against its own transform attribute and
+finding they didn't agree; a screenshot of the result was ambiguous on
+its own (a 20px sprite pinned near an unrelated corner reads as "maybe a
+broken image icon", not obviously "mispositioned beetle"). Fixed by
+splitting positioning and rotation onto two nested `<g>`s -- an outer one
+carrying only the attribute translate, never touched by CSS, and an
+inner one carrying only the animation class -- so the two can no longer
+compete for the same `transform`. **General lesson, not just this bug**:
+never assume an attribute value that was correctly *written* was
+therefore correctly *applied* when CSS could be touching the same
+property; check the rendered box, not the source.
+
+**Also verified directly, not assumed**: the wide-region-list fallback
+(389-item `reference/`) still renders correctly under the new dark
+canvas; `zoomInto`/breadcrumbs navigate correctly through the node-link
+view exactly as they did through the treemap (same functions, unchanged);
+gates still open/shut correctly with the same-site-only toggle; the
+dead-mark skull still renders (now as a corner badge on a node box
+instead of a treemap-cell overlay) for a fully-cancelled subtree;
+discovery-graph mode renders without error even for a leaf node with no
+cached children. A real Runs-page control-button set (Pause/Unpause/Stop/
+Resume, existing endpoints only) and a real activity log (built from
+`live_status`'s own `recently_completed` rows, deduped by
+id+status+updated_at so a retried URL can legitimately reappear with a
+different outcome) were added to the new control panel -- genuine
+functionality gaps in the previous stage's Map page, not new server
+surface. The reference mock's "Deploy Bug"/"Wipe Map" buttons were
+deliberately NOT copied -- neither maps to a real endpoint, and
+inventing one to match a fictional mock would be exactly the kind of
+fabricated affordance the project's own anti-fabrication stance (see the
+taste skill, and CLAUDE.md's export-time honesty rules) argues against.
+
+---
+
+### 65. UI stage 4 (n8n-style canvas): fixed-box tree replaced with a pannable/zoomable world canvas -- three real bugs, two flagged in advance by the user and confirmed real, one found only by measuring geometry through a full zoom sweep -- 2026-08-24
+
+The user's brief was explicit that stage 3's *problem* was structural, not
+cosmetic: a fixed-size box for the map plus a permanent side column ate
+most of the screen regardless of content. The fix is an n8n-style model --
+the canvas fills the viewport, pans/zooms freely, and every panel
+(controls, stats, activity, node detail) floats over it as a draggable,
+collapsible, position-remembered card. Node/edge rendering moved from
+CSS-flow layout (stage 3's `.tree-children-row`) to explicit "world"
+pixel coordinates under one `.world` element, panned/zoomed by a single
+`transform: translate() scale()` -- every node position is assigned once
+at layout time and never touched again; the camera does all the work.
+
+Before writing any of this, the user sent three specific risks to watch
+for, based on exactly the kind of bug pattern this project had already
+hit twice (entries #63, #64). All three turned out to be real:
+
+**1. Panel positions in localStorage can strand a panel off-screen.**
+Confirmed directly: saved a panel position of `(1400, 900)`, which
+exceeds a real ~1536×674 viewport, and verified the panel rendered
+clamped to `(1232, 504)` -- exactly `viewport - panelSize - 4px margin`
+on both axes, not the raw saved value. `clampPanelElement()` runs on
+every panel's creation and on `window.resize`; a `resetPanelLayout()`
+control (clears the localStorage key, rebuilds panels at their defaults)
+is the escape hatch for a genuinely lost panel. Confirmed working: after
+deliberately mispositioning a panel, the reset button put it back at
+`(16, 110)` and `localStorage.getItem('map-panel-prefs')` came back
+`null`.
+
+**2. Adding a canvas-level zoom transform on top of the sprite system
+was flagged as "the same trap in a new place"** (see #64's CSS-
+transform-replaces-SVG-attribute bug). It genuinely was a new place to
+check, and checking it surfaced a REAL bug -- but not the one being
+watched for. A full sweep at zoom 0.5/1.0/2.0, comparing a sprite's true
+positioning anchor (its outer `<g>`'s `translate()`, converted through
+the camera to a screen point) against the edge path's actual
+`getPointAtLength()` result: **X matched within rounding at every zoom
+level** (confirming the #64 fix holds fine under an added ancestor
+transform -- composing two different elements' transforms is not the
+same failure mode as one element's CSS property overriding its own SVG
+attribute). **Y was off by a constant ~58px at every zoom level** -- the
+signature of a fixed coordinate-space offset, not a scaling bug, because
+a real scaling bug would grow/shrink proportionally with zoom and this
+didn't move at all. Root cause: `.canvas-viewport` sits below the header
+bar, so it is `.world`'s positioned ancestor but is NOT the same
+coordinate space as `window.innerWidth/innerHeight` or a raw
+`e.clientY` -- every camera function (`fitToBox`, `resetView`, the wheel
+handler, the toolbar's zoom buttons) was computing pan/zoom targets as
+if the canvas started at the window's top-left corner. X was silently
+correct only because the canvas happens to span the full window width
+with no horizontal offset; Y had a real, permanent bug on every camera
+operation, not just sprites -- pan-by-drag was unaffected (it only ever
+uses deltas, which cancel a constant offset out), but zoom-centered-on-
+cursor, fit-to-view, and reset-view were all quietly off vertically by
+the header's height. Fixed with one `viewportRect()` helper
+(`canvas-viewport.getBoundingClientRect()`) used everywhere pan/zoom
+math previously reached for `window.inner*` or a raw `clientX/clientY`.
+**A second, smaller finding from the same sweep, worth recording
+precisely so it isn't mistaken for a bug later**: comparing a sprite's
+`<image>` element's `getBoundingClientRect()` directly against the
+expected point showed a zoom-proportional X delta (`-40 * zoom`) that
+looked alarming at first. It wasn't real -- `getBoundingClientRect()`
+(and an ancestor `<g>`'s, too) reports the union of a shape's geometry
+regardless of `clip-path`; the sprite `<image>` is genuinely 100 units
+wide (5 animation frames) and only *visually* clipped to a 20-unit
+window, so its raw bounding box is never centered on the same point the
+clip window is. Re-measuring against the actual positioning source (the
+outer `<g>`'s transform attribute, which IS the authoritative source)
+gave an exact match at all three zoom levels. Lesson inside the lesson:
+`getBoundingClientRect()` is not a reliable oracle for "where does this
+element visually appear" when `clip-path` is involved -- check the
+transform that was actually SET, not the geometry the browser reports.
+
+**3. Drag-to-pan vs. click-to-select needing a movement threshold** was
+flagged as a UX-quality risk ("a click with two pixels of movement
+becomes a pan and the node never selects"). Implementing it surfaced a
+second, more serious version of the same risk that hadn't been named
+explicitly: without a threshold, "click the canvas background to go up a
+level" (a feature this stage explicitly adds) would fire on the
+`pointerup` of **every single pan gesture**, since a drag's release still
+lands on the same element it started on. Handling background-tap-to-
+ascend as a `click` listener would have made panning nearly unusable --
+almost every pan would also silently jump a level up. Fixed by handling
+both gestures in one `pointerdown`/`pointermove`/`pointerup` state
+machine with a `PAN_THRESHOLD = 5`px: movement past the threshold marks
+the gesture as a real drag (and is the only path that updates
+`camera.panX/panY`); an unmoved `pointerup` is treated as a tap and
+calls `ascendOneLevel()`. No separate `click` listener on the canvas
+background exists at all, specifically to avoid this exact race between
+the browser's synthesized `click` event and manual drag tracking.
+
+**Also confirmed directly, not assumed**: the promoted-node-in-place
+animation (clicked node stays exactly where it is and becomes the new
+root; its new children fly out from it; the level being left dims via
+individual per-element classes, not a group-wide opacity -- CSS opacity
+on an ancestor cannot be un-applied by a descendant, so the promoted node
+has to be excluded element-by-element, not wrapped out of a dimmed
+container) reads correctly end to end, including the DOM-sharing
+subtlety it depends on: a promoted node's element is simultaneously "a
+child of the level being left" and "the root of the new level," so
+`removeLevelDOM()` takes an explicit `keepEl` to skip over whichever
+element the adjacent level still needs, both when evicting the oldest of
+two dimmed levels (capped at one level of visible history) and when
+ascending back into a dimmed parent. Content-sized node labels were
+checked against the real stress case named in the brief (the manim
+site's `changelog/` children, e.g. `0.18.0.post0-changelog.html`, 28
+chars) -- all fit inside the 260px cap with no truncation at all, so an
+artificial 73-character label was also tested to confirm the ellipsis +
+`title`-attribute-tooltip path genuinely engages when a label actually
+is too long, not just that it never gets exercised by real data. Cancel/
+select-for-extraction, the 60-item list fallback (now a floating panel
+rather than an inline block), and the discovery/path-tree toggle were
+all re-verified working through the new architecture, not just carried
+over by inspection.
+
+**Two smaller real bugs, found in the first minute of actually clicking
+the thing rather than by review**: (a) `showDetailPanel()` inserted its
+close button via `header.insertBefore(closeBtn, header.querySelector(
+".float-panel-toggle"))` -- `insertBefore`'s reference node must be a
+DIRECT child of the node you call it on, and the toggle button was
+nested one level deeper than that at the time. The call threw, which
+silently aborted the rest of the function -- including the
+`document.body.appendChild(panel)` a few lines later -- so clicking any
+node appeared to do nothing at all (no error visible without opening the
+console; `state.selected` was set correctly, only the panel never made
+it into the document). Fixed by making the toggle a direct child of the
+header instead of wrapping it. (b) Dragging across the canvas to pan
+selected node label text as a side effect (native browser text
+selection, not this app's `.selected` styling) -- `.canvas-viewport` is
+a UI surface, not a document, so it now sets `user-select: none`.
+
+**One methodology note for future sessions**: `left_click_drag` (the
+browser-automation drag helper) did not move a floating panel at all in
+this session, while dispatching real `PointerEvent`s at the same
+coordinates via `javascript_exec` worked correctly and updated
+`localStorage` as expected. Read as "the tool's synthetic drag doesn't
+reliably emit the `pointermove` events this UI's drag handling listens
+for," not as a bug in the panel-dragging code -- confirmed by the fact
+that the identical drag gesture, dispatched as real pointer events,
+worked on the first try.

@@ -874,6 +874,41 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     much larger, actively-writing frontier. **Size: M**, and only once
     polling is actually measured to be a problem.
 
+44. **`/runs/start`'s `categories: "all"` can pull in off-site branches at
+    host-only scope, and a subsequent promoted crawl will follow them.**
+    Found live (`LESSONS_LEARNED.md` #61, finding 6): mapping "all"
+    branches on a real site includes `External: github.com` /
+    `youtube.com` / etc, each with `prefix=None` (host-only, unbounded
+    within that host) -- select a same-host subtree and promote to a real
+    crawl, and nothing stops the crawl from also following those external
+    branches if anything still queued links to them. Caught via
+    `--live-status`'s `in_flight` field, not by any error (the run doesn't
+    fail, it just does more -- and more costly -- work than intended).
+    Two independent fixes, either would help, ideally both: (a) default
+    `/runs/start`'s `categories` to same-host branches only unless the
+    caller explicitly opts into external ones; (b) a "cancel everything
+    except this selection" primitive on `Frontier`, so map-then-select-
+    then-crawl isolation is atomic instead of order-dependent (cancel by
+    prefix *before* selecting, never after -- selecting first and
+    cancelling broadly second re-cancels the very rows just selected,
+    since select only moves `mapped`→`queued`). **Size: S** for (a), **M**
+    for (b) (a real `Frontier` method + tests, not a query tweak).
+
+45. **`JobManager`'s `result` field for a `'stopped'` job can show a stale
+    summary from a previous run of the same `job.log` file.** `job.log` is
+    opened in append mode across resumes (by design -- one continuous
+    history per run), so a forcibly-killed process that never got to print
+    its own final line falls back to whatever JSON-shaped content is last
+    in the log, which could be left over from an earlier resume attempt.
+    Not caught by any test; noticed live while reading a `stop()` response
+    during the demo. `--live-status`/`GET /runs/<id>/live-status` is
+    always the authoritative "what actually happened" (reads the frontier
+    directly); `job.get_status()`'s `result` for anything other than
+    `'done'`/`'failed'` should be treated as best-effort, not
+    authoritative. **Size: XS** -- reset/truncate `job.log` at the start of
+    each new `start()` call instead of always appending, if a clean
+    per-launch log is worth losing the continuous history for.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

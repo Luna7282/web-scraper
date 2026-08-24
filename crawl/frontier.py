@@ -83,6 +83,18 @@ CREATE TABLE IF NOT EXISTS discovery_edges (
     PRIMARY KEY (parent_url, child_url)
 );
 CREATE INDEX IF NOT EXISTS idx_edges_child ON discovery_edges(child_url);
+
+-- Single-row control flags, readable/writable across process boundaries
+-- (the server pausing a crawl is a DIFFERENT OS process than the one
+-- running it -- an in-memory flag on this Frontier instance would be
+-- invisible to the other process's Frontier instance; the DB is the only
+-- thing both sides actually share). id=1 enforced so there is never more
+-- than one row to disagree with itself.
+CREATE TABLE IF NOT EXISTS control (
+    id     INTEGER PRIMARY KEY CHECK (id = 1),
+    paused INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO control (id, paused) VALUES (1, 0);
 """
 
 # The three statuses nothing has claimed and nothing has finished with --
@@ -167,8 +179,26 @@ class Frontier:
     # Never calls a public method.
     # ------------------------------------------------------------------
 
+    async def _locked_is_paused(self) -> bool:
+        cur = await self._conn.execute("SELECT paused FROM control WHERE id = 1")
+        row = await cur.fetchone()
+        return bool(row and row[0])
+
     async def _locked_check_quiescence(self) -> None:
         if self._in_flight != 0 or self._shutdown_triggered:
+            return
+        # Explicit, not just a corollary of the queued-count check below:
+        # a paused run makes claim() return None while rows are still
+        # genuinely 'queued' in the DB, so in_flight can genuinely reach 0
+        # (every in-flight page finished naturally, nothing new claimed) --
+        # "in_flight==0 and nothing claimable" is exactly quiescence's own
+        # trigger condition, and this is the third shape of that same bug
+        # (see LESSONS_LEARNED.md #44 and the cancellation work before this).
+        # Checked fresh from the DB, not a cached attribute -- pause is set
+        # by a different OS process (the server) than the one running this
+        # claim loop, so nothing here can assume its own process's view of
+        # "paused" is current.
+        if await self._locked_is_paused():
             return
         cur = await self._conn.execute("SELECT COUNT(*) FROM frontier WHERE status='queued'")
         queued_n = (await cur.fetchone())[0]
@@ -199,6 +229,8 @@ class Frontier:
             self.quiescent.set()
 
     async def _locked_claim(self) -> FrontierRow | None:
+        if await self._locked_is_paused():
+            return None  # rows stay 'queued' in the DB -- nothing here changes their status
         now = _now()
         cur = await self._conn.execute(
             """
@@ -476,6 +508,28 @@ class Frontier:
         counts_by_status() look like a mass relevance-gate rejection."""
         async with self._lock:
             await self._locked_mark_terminal(url, "mapped")
+
+    async def set_paused(self, paused: bool) -> None:
+        """Stops new claims without touching in-flight or queued rows --
+        see the 'control' table's schema comment for why this is a DB
+        flag, not a Python attribute: the caller pausing a run (the
+        server) is a different OS process than the one running claim()
+        (the crawl subprocess), and only the DB is shared between them.
+        In-flight fetches/extractions finish naturally either way (no
+        worker-loop change needed -- they already poll-and-sleep whenever
+        claim() returns None, same as "nothing queued right now").
+        Unpausing re-checks quiescence immediately, in case the answer
+        was simply blocked on this flag the whole time (see
+        _locked_check_quiescence)."""
+        async with self._lock:
+            await self._conn.execute("UPDATE control SET paused = ? WHERE id = 1", (int(paused),))
+            await self._conn.commit()
+            if not paused:
+                await self._locked_check_quiescence()
+
+    async def is_paused(self) -> bool:
+        async with self._lock:
+            return await self._locked_is_paused()
 
     @staticmethod
     def _escape_like(s: str) -> str:

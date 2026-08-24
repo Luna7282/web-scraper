@@ -57,7 +57,12 @@ not by accident.
 | `export/` | `export.py` | `-m export.export`: canonical.jsonl → training-format files (separate CLI) |
 | | `export_formats.py` | Pure schema projections + validate/dedup/split (no I/O) |
 | | `dataset_report.py` | `--dataset-report`: redundancy/duplicate diagnostics over a completed run |
-| (root) | `main.py` | Interactive crawl CLI + `--dry-run`/`--score-report`/`--query`/`--dataset-report` |
+| `server/` | `app.py` | Flask app + every route (`create_app()`) — localhost-only, no auth |
+| | `jobs.py` | `JobManager`: subprocess-launched, PID-file-tracked jobs (map/crawl/export runs) |
+| | `paths.py` | `run_dir_for()` — the one place a URL-supplied run_id is resolved to a filesystem path |
+| | `runs.py` | `list_runs`/`summarize_run` — run-history listing for `GET /runs` |
+| (root) | `server.py` | `uv run python server.py` — the control server's entry point |
+| | `main.py` | Interactive crawl CLI + `--dry-run`/`--score-report`/`--query`/`--dataset-report`/map-cancel-select-graph-live-status flags/`--headless-config` (non-interactive, server-launched) |
 | | `config.py` | All tunable constants — no config value hardcoded in the module that uses it |
 | | `llm_factory.py` | `get_llm()`, `LocalOllamaEmbeddings` (the one hard provider-routing invariant, below) |
 | | `progress_display.py` | Read-only Rich live view against the frontier |
@@ -404,6 +409,52 @@ rows, and the timestamp of the last change. Opens its own short-lived
 sqlite3 connection — safe to run from a different process against a
 `frontier.db` a crawl is actively writing to (WAL mode). No push mechanism
 yet (`ROADMAP.md` #43) — poll again for a fresh snapshot.
+
+**Pause** (`--pause`/`--unpause`, `Frontier.set_paused`/`is_paused`): a
+single-row `control` table (`paused` flag), not a Python attribute —
+pausing is initiated by a *different OS process* (the control server, see
+below) than the one running the claim loop, so only the DB is actually
+shared between them. `_locked_claim` checks it before claiming (returns
+`None`, rows stay `queued`); in-flight fetches/extractions are never
+aborted, only new claims stop. **`_locked_check_quiescence` explicitly
+checks paused first and returns immediately if set** — not just a
+corollary of the queued-count check below it, a deliberate, separate
+guard, because a paused run can genuinely reach `in_flight==0` (every
+in-flight page finishes naturally) while queued rows sit untouched, which
+is exactly quiescence's own trigger condition. This is the third instance
+of "a state nothing moves out of" breaking quiescence (`LESSONS_LEARNED.md`
+#44, and the cancellation work in #59) — caught and tested (`pause with
+queued rows and zero in-flight must not quiesce`) before it ever reached a
+live run, then confirmed against one anyway (#61): pausing mid-crawl froze
+`counts_by_status` completely across three `--live-status` polls, job
+stayed `running` the whole time, and unpausing resumed immediately.
+
+## Control server (`server/`)
+
+Local HTTP control layer — `uv run python server.py`, Flask,
+**localhost-only (`127.0.0.1`), no authentication**. Every mutating or
+LLM-touching operation launches as a separate `python main.py ...` /
+`python -m export.export ...` process (`server/jobs.py::JobManager`) —
+the server itself never runs crawl4ai, never opens the async `Frontier`,
+never touches chromadb, for the same event-loop-starvation reasons a crawl
+must never share a process with anything else that needs to stay
+responsive. Read-only endpoints call `crawl/graph.py`/`crawl/live_status.py`
+directly (already safe, already read-only, already used from other
+processes by design).
+
+Job tracking is a PID file per run (`data/<run_id>/job.json`) plus the
+process's real exit code, captured through a thin wrapper around every
+launched command rather than guessed from stdout shape — `_final_summary`
+tried sniffing for one specific JSON shape first and got it wrong the
+moment a second job kind (`export.py`, which prints an unrelated
+`dataset_card`) came along; see `LESSONS_LEARNED.md` #61 for the full
+incident list (five real bugs found only by running the actual headless
+demo, not by review). `JobManager` is genuinely stateless beyond that —
+every status query re-derives from the file + a live OS check
+(`tasklist`/`taskkill` on Windows), never from anything cached in memory,
+so state survives a server restart with no reconstruction step needed.
+
+See `README.md`'s "Control server" section for the full endpoint list.
 
 ## Event loop invariant: no blocking I/O, ever, in any `async def`
 

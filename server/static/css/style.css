@@ -1,0 +1,517 @@
+/* Stage 2: retro pixel-art strategy-game skin over stage 1's proven
+   functional layer. Palette: one accent (warm gold), muted moss/stone
+   neutrals, off-black/off-white (never pure #000/#fff) -- see
+   server/static/assets/sprites/LICENSE.md for the one sourced asset.
+   Motion is decoration throughout: every animation has a static,
+   equally-usable fallback under prefers-reduced-motion (see the guard
+   block near the bottom) -- the map must work with it off, not just
+   look worse. */
+
+:root {
+  --ink: #22221c;              /* off-black -- panel outlines, body text on light */
+  --parchment: #ece3c8;        /* off-white -- panel fill, text on dark */
+  --stone: #8a8577;            /* neutral mid -- borders, dim text */
+  --stone-dark: #4c4a40;
+  --moss: #5b7a52;             /* base "land" tile color */
+  --moss-dark: #395031;
+  --gold: #c99a2e;             /* the one accent -- CTAs, highlights, open gates */
+  --gold-dark: #8a6a1e;
+  --amber: #c9932a;            /* queued / pending */
+  --amber-dark: #8a6318;
+  --blue: #3d6b8c;             /* mapped */
+  --blue-dark: #274a61;
+  --green: #4a7c59;            /* done */
+  --green-dark: #325640;
+  --red: #a1453d;              /* failed */
+  --red-dark: #6e2f29;
+  --ash: #5c5a50;              /* cancelled / dead */
+  --ash-dark: #3a3830;
+  --panel-bg: #d8cca0;         /* lighter parchment for panels/table rows */
+  --link: #8a6a1e;
+
+  /* Stage 3 (map rework): a second accent, not a drift from "one accent" --
+     gold keeps its existing role (user actions: buttons, open gates);
+     mint is scoped entirely to "live system state" (in-flight progress,
+     the activity log, polling indicator) on the map's dark canvas. Two
+     roles, each locked to its own surface, not two accents competing on
+     the same surface. */
+  --mint: #6fcf97;
+  --mint-dark: #3c8f61;
+  --canvas-bg: #121a17;        /* dark map surface -- off-black, green-cast to sit next to mint/moss */
+  --canvas-line: #1e2b26;      /* dot-grid on the canvas */
+
+  --font-display: "Press Start 2P", ui-monospace, monospace;
+  --font-body: "VT323", ui-monospace, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: var(--font-body);
+  font-size: 1.15rem;
+  line-height: 1.35;
+  margin: 0;
+  padding: 0;
+  color: var(--ink);
+  background: var(--stone-dark);
+  background-image:
+    linear-gradient(var(--ink) 1px, transparent 1px),
+    linear-gradient(90deg, var(--ink) 1px, transparent 1px);
+  background-size: 24px 24px;
+  background-position: -1px -1px;
+  background-blend-mode: overlay;
+  background-color: var(--stone-dark);
+}
+
+header.topbar {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.9rem 1.25rem;
+  border-bottom: 4px solid var(--ink);
+  background: var(--moss-dark);
+  box-shadow: inset 0 -3px 0 var(--gold-dark);
+}
+
+header.topbar h1 {
+  font-family: var(--font-display);
+  font-size: 0.85rem;
+  margin: 0;
+  color: var(--gold);
+  text-shadow: 2px 2px 0 var(--ink);
+  letter-spacing: 1px;
+  display: flex;
+  align-items: center;
+}
+/* Decorative window-chrome dots -- the "app frame" read the reference
+   mock establishes. Purely cosmetic, no window controls behind them. */
+.frame-dots { display: inline-flex; gap: 5px; margin-right: 0.85rem; }
+.frame-dots i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.frame-dots i:nth-child(1) { background: var(--red); }
+.frame-dots i:nth-child(2) { background: var(--amber); }
+.frame-dots i:nth-child(3) { background: var(--mint-dark); }
+header.topbar nav a {
+  margin-right: 1rem;
+  color: var(--parchment);
+  text-decoration: none;
+  font-family: var(--font-display);
+  font-size: 0.65rem;
+  padding: 0.35rem 0.6rem;
+  border: 2px solid transparent;
+}
+header.topbar nav a:hover { border-color: var(--gold); color: var(--gold); }
+
+main { padding: 1.25rem; max-width: 1200px; margin: 0 auto; }
+/* Map page (stage 4): the canvas fills the window below the header, no
+   page scrollbar -- everything the treemap/node-link-tree stages needed
+   `main`'s centered/padded/max-width layout for was replaced by the
+   canvas's own full-bleed viewport. Scoped to `body.map-page` so the Runs
+   page's tables/forms keep the normal constrained layout unchanged. */
+body.map-page { height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+body.map-page header.topbar { flex-shrink: 0; }
+body.map-page main { flex: 1; min-height: 0; padding: 0; max-width: none; margin: 0; position: relative; overflow: hidden; }
+
+h2 {
+  font-family: var(--font-display);
+  font-size: 1rem;
+  margin: 1.5rem 0 0.75rem;
+  color: var(--parchment);
+  text-shadow: 2px 2px 0 var(--ink);
+}
+/* h2 inside a .panel sits on parchment, not the dark body -- the loose
+   dark-backdrop treatment above would blend the fill into the panel's
+   own background and leave only the shadow visible. */
+.panel h2 { color: var(--ink); text-shadow: none; }
+h3 {
+  font-family: var(--font-display);
+  font-size: 0.75rem;
+  margin: 1rem 0 0.6rem;
+  color: var(--ink);
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  background: var(--parchment);
+  border: 3px solid var(--ink);
+  box-shadow: 4px 4px 0 rgba(0,0,0,0.35), inset 0 0 0 2px var(--panel-bg);
+  margin-bottom: 1.25rem;
+}
+table th, table td {
+  text-align: left;
+  padding: 0.5rem 0.7rem;
+  border-bottom: 2px solid var(--stone);
+  font-size: 1.05rem;
+}
+table th {
+  background: var(--moss-dark);
+  color: var(--parchment);
+  font-family: var(--font-display);
+  font-size: 0.62rem;
+  letter-spacing: 0.5px;
+}
+table tr.clickable { cursor: pointer; }
+table tr.clickable:hover { background: #c4b688; }
+
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  font-family: var(--font-display);
+  font-size: 0.55rem;
+  border: 2px solid var(--ink);
+  box-shadow: 2px 2px 0 var(--ink);
+}
+.badge-running { background: var(--amber); color: var(--ink); }
+.badge-done { background: var(--green); color: var(--parchment); }
+.badge-failed, .badge-exited { background: var(--red); color: var(--parchment); }
+.badge-stopped { background: var(--stone); color: var(--ink); }
+.badge-none { background: var(--panel-bg); color: var(--stone-dark); }
+
+/* Frontier page-status badges -- distinct namespace from job-state above. */
+.badge-queued, .badge-pending_score { background: var(--amber); color: var(--ink); }
+.badge-in_progress { background: #dba54a; color: var(--ink); }
+.badge-mapped { background: var(--blue); color: var(--parchment); }
+.badge-skipped_extract, .badge-skipped_follow { background: var(--stone); color: var(--ink); }
+.badge-cancelled { background: var(--ash); color: var(--parchment); text-decoration: line-through; }
+
+.panel {
+  border: 3px solid var(--ink);
+  box-shadow: 4px 4px 0 rgba(0,0,0,0.35), inset 0 0 0 2px var(--panel-bg);
+  padding: 1rem;
+  margin-bottom: 1.25rem;
+  background: var(--parchment);
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.85rem 1rem;
+  align-items: end;
+}
+.form-grid label {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.95rem;
+  gap: 0.25rem;
+}
+.form-grid label span.field-name {
+  font-family: var(--font-display);
+  font-size: 0.55rem;
+  color: var(--moss-dark);
+}
+.form-grid input, .form-grid select, .form-grid textarea {
+  padding: 0.4rem 0.5rem;
+  border: 2px solid var(--ink);
+  background: var(--panel-bg);
+  font-size: 1.05rem;
+  font-family: var(--font-body);
+  color: var(--ink);
+}
+.form-grid input[type="checkbox"] { width: 1.1rem; height: 1.1rem; align-self: start; accent-color: var(--gold-dark); }
+.checkbox-label { flex-direction: row !important; align-items: center; gap: 0.4rem !important; }
+
+fieldset { border: 2px solid var(--stone); margin: 0.75rem 0; padding: 0.75rem; }
+legend {
+  font-family: var(--font-display);
+  font-size: 0.58rem;
+  padding: 0 0.4rem;
+  color: var(--moss-dark);
+}
+
+button {
+  padding: 0.5rem 1rem;
+  border: 2px solid var(--ink);
+  box-shadow: 3px 3px 0 var(--ink);
+  background: var(--gold);
+  color: var(--ink);
+  cursor: pointer;
+  font-family: var(--font-display);
+  font-size: 0.62rem;
+  transition: none;
+}
+button:hover:not(:disabled) { transform: translate(1px, 1px); box-shadow: 2px 2px 0 var(--ink); }
+button:active:not(:disabled) { transform: translate(3px, 3px); box-shadow: 0 0 0 var(--ink); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.secondary { background: var(--panel-bg); }
+button.secondary:hover:not(:disabled) { background: #c4b688; }
+button.danger { background: var(--red); color: var(--parchment); }
+button.danger:hover:not(:disabled) { background: var(--red-dark); }
+
+.btn-row { display: flex; gap: 0.6rem; margin: 0.6rem 0; flex-wrap: wrap; }
+
+.error-box {
+  background: var(--red);
+  border: 2px solid var(--ink);
+  color: var(--parchment);
+  padding: 0.7rem 0.9rem;
+  font-size: 1rem;
+  margin: 0.5rem 0;
+}
+.empty-state {
+  color: var(--stone);
+  padding: 1.5rem;
+  text-align: center;
+  border: 2px dashed var(--stone);
+  font-family: var(--font-body);
+  font-size: 1.1rem;
+}
+
+.status-counts { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.status-chip {
+  padding: 0.3rem 0.6rem;
+  border: 2px solid var(--ink);
+  font-size: 0.95rem;
+  background: var(--panel-bg);
+}
+.status-chip b { margin-left: 0.3rem; color: var(--moss-dark); }
+
+.in-flight-list { font-family: var(--font-body); font-size: 1.05rem; }
+.in-flight-list li { margin-bottom: 0.2rem; word-break: break-all; }
+
+textarea { resize: vertical; min-height: 3rem; }
+
+pre.report {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--panel-bg);
+  border: 2px solid var(--ink);
+  padding: 0.75rem;
+  font-family: var(--font-body);
+  font-size: 1rem;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.hint { color: var(--stone); font-size: 0.95rem; margin-top: 0.15rem; }
+
+a.back-link { color: var(--link); text-decoration: none; font-size: 1rem; }
+a.back-link:hover { text-decoration: underline; }
+
+/* --- Map page (stage 4): n8n-style pannable/zoomable world canvas,
+   floating panels, edge-docked gates. Replaces stage 3's fixed-box
+   node-link tree + permanent side column entirely. --- */
+
+.canvas-viewport {
+  position: absolute; inset: 0; overflow: hidden; cursor: grab;
+  user-select: none; -webkit-user-select: none;
+  background-color: var(--canvas-bg);
+  background-image: radial-gradient(var(--canvas-line) 1.6px, transparent 1.6px);
+  background-size: 22px 22px;
+  /* background-position is pushed in JS to track camera pan, 1:1 with the
+     .world transform -- the dot grid pans with the content instead of
+     staying fixed, reinforcing that this is one large surface being
+     panned under a window, not a static backdrop behind a moving tree. */
+}
+.canvas-viewport.panning { cursor: grabbing; }
+
+.world {
+  position: absolute; top: 0; left: 0; width: 0; height: 0;
+  transform-origin: 0 0;
+}
+
+/* Every node/edge lives directly under .world in real "world" pixel
+   coordinates (assigned once at layout time, in placeChildrenRow()/
+   placeRoot()); panning/zooming is ONE transform on .world, so nothing
+   downstream needs to know about the camera at all. */
+.world-node {
+  position: absolute;
+  background: var(--parchment);
+  border: 3px solid var(--ink);
+  border-radius: 7px;
+  box-shadow: 3px 3px 0 rgba(0,0,0,0.4);
+  padding: 0.45rem 0.7rem;
+  min-width: 84px;
+  max-width: 260px;
+  text-align: center;
+  cursor: pointer;
+  font-family: var(--font-body);
+  transition: opacity 0.25s, filter 0.25s;
+}
+/* Content-sized labels, deliberately truncated rather than wrapped --
+   ellipsis + a native title tooltip for the full name, which is also
+   always available in the Node Detail panel. "installa\ntion.htm\nl"
+   (stage 3's mid-word wrap) was the bug this replaces, not a style
+   choice to preserve. */
+.world-node-label {
+  font-size: 1.05rem; color: var(--ink); line-height: 1.2;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.world-node-count { font-size: 0.82rem; color: var(--stone-dark); margin-top: 0.1rem; }
+.world-node-dot {
+  position: absolute; top: -6px; right: -6px; width: 13px; height: 13px;
+  border-radius: 50%; border: 2px solid var(--ink);
+}
+.world-node:hover { border-color: var(--mint-dark); box-shadow: 3px 3px 0 var(--mint-dark); }
+.world-node.selected { border-color: var(--mint-dark); box-shadow: 3px 3px 0 var(--mint-dark); }
+.world-node.cancelled-full { background: var(--ash); }
+.world-node.cancelled-full .world-node-label,
+.world-node.cancelled-full .world-node-count { color: var(--parchment); }
+.world-node-root { border-color: var(--gold-dark); box-shadow: 3px 3px 0 var(--gold-dark); cursor: default; }
+.world-node-root:hover { border-color: var(--gold-dark); box-shadow: 3px 3px 0 var(--gold-dark); }
+.node-dead-mark { position: absolute; top: -9px; right: -9px; pointer-events: none; }
+
+/* Per-element dim, not a group-wide one -- see map.js's descendInto():
+   the promoted node has to stay at full opacity while its old siblings
+   and old root fade, and CSS opacity on an ancestor can't be un-applied
+   by a descendant, so each element that should dim gets this class
+   individually rather than wrapping the whole outgoing level in one
+   dimmed container. */
+.world-dimmed { opacity: 0.3; filter: saturate(0.5); pointer-events: none; }
+
+.world-edge-layer { position: absolute; top: 0; left: 0; width: 1px; height: 1px; overflow: visible; pointer-events: none; }
+.edge-casing { fill: none; stroke: var(--stone-dark); stroke-width: 9; stroke-linecap: round; transition: opacity 0.25s; }
+.edge-inner { fill: none; stroke: var(--panel-bg); stroke-width: 4; stroke-linecap: round; opacity: 0.5; transition: opacity 0.25s; }
+.edge-fill { fill: none; stroke: var(--mint); stroke-width: 4; stroke-linecap: round; }
+.edge-pct {
+  font-family: var(--font-display); font-size: 9px; fill: var(--mint);
+  paint-order: stroke; stroke: var(--canvas-bg); stroke-width: 3px;
+}
+.dead-mark { pointer-events: none; }
+
+/* --- Canvas chrome: toolbar, breadcrumbs, gates -- all screen-fixed,
+   never move with pan/zoom. --- */
+
+.canvas-toolbar {
+  position: fixed; right: 16px; bottom: 16px; z-index: 20;
+  display: flex; flex-direction: column; gap: 0.35rem;
+}
+.canvas-toolbar button {
+  width: 2.4rem; height: 2.4rem; padding: 0; font-size: 0.9rem; line-height: 1;
+}
+
+.breadcrumb-bar {
+  position: fixed; top: 66px; left: 16px; z-index: 20;
+  display: flex; align-items: center; gap: 0.3rem; flex-wrap: wrap;
+  font-family: var(--font-body); font-size: 1.15rem;
+  background: rgba(18, 26, 23, 0.82); border: 2px solid var(--ink);
+  padding: 0.35rem 0.6rem; color: var(--parchment); max-width: 60vw;
+}
+.breadcrumb-bar .crumb { color: var(--mint); cursor: pointer; }
+.breadcrumb-bar .crumb:hover { text-decoration: underline; }
+.breadcrumb-bar .sep { color: var(--stone); }
+
+.live-pill {
+  font-family: var(--font-display); font-size: 0.55rem; padding: 0.3rem 0.5rem;
+  border: 2px solid var(--mint-dark); color: var(--mint); background: rgba(111,207,151,0.12);
+  position: fixed; top: 66px; right: 16px; z-index: 20;
+}
+.live-pill.static { border-color: var(--stone); color: var(--stone); background: rgba(18,26,23,0.82); }
+
+/* Gates as boundary markers on the canvas edge, not a floating card --
+   thin tabs biting into the right edge of the viewport itself, each an
+   "exit ramp": an arrow for open, a barred glyph for shut. */
+.gates-dock {
+  position: fixed; top: 50%; right: 0; transform: translateY(-50%); z-index: 15;
+  display: flex; flex-direction: column; gap: 6px; align-items: flex-end;
+}
+.gate-tab {
+  border: 2px solid var(--ink); border-right: none;
+  background: var(--gold); color: var(--ink);
+  padding: 0.4rem 0.6rem; font-family: var(--font-body); font-size: 0.85rem;
+  cursor: pointer; text-align: right; max-width: 160px;
+  border-radius: 6px 0 0 6px;
+  box-shadow: -3px 3px 0 rgba(0,0,0,0.35);
+}
+.gate-tab .gate-host { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gate-tab .gate-status { font-family: var(--font-display); font-size: 0.5rem; display: flex; align-items: center; justify-content: flex-end; gap: 0.3rem; margin-top: 0.2rem; }
+.gate-tab .gate-arrow { font-family: var(--font-display); }
+.gate-tab.shut { background: var(--ash); color: var(--parchment); cursor: default; }
+
+.sprite-frame { image-rendering: pixelated; image-rendering: crisp-edges; }
+
+/* --- Floating panels: draggable by header, collapsible, position
+   remembered per browser (localStorage) -- see makeFloatingPanel(). --- */
+.float-panel {
+  position: fixed; z-index: 25;
+  width: 300px; max-height: 70vh;
+  border: 3px solid var(--ink);
+  box-shadow: 4px 4px 0 rgba(0,0,0,0.35), inset 0 0 0 2px var(--panel-bg);
+  background: var(--parchment);
+  display: flex; flex-direction: column;
+}
+.float-panel-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0.4rem 0.6rem; background: var(--moss-dark);
+  cursor: grab; touch-action: none; flex-shrink: 0;
+}
+.float-panel-header:active { cursor: grabbing; }
+.float-panel-title { font-family: var(--font-display); font-size: 0.6rem; color: var(--parchment); }
+.float-panel-toggle {
+  padding: 0.1rem 0.5rem; font-size: 0.75rem; box-shadow: 2px 2px 0 var(--ink);
+  line-height: 1.2;
+}
+.float-panel-body { padding: 0.75rem; overflow: auto; font-size: 1.05rem; }
+.float-panel.collapsed .float-panel-body { display: none; }
+.float-panel.collapsed { max-height: none; }
+
+.float-panel .field-block { display: flex; flex-direction: column; gap: 0.25rem; margin-bottom: 0.6rem; }
+.float-panel .field-block .field-name { font-family: var(--font-display); font-size: 0.55rem; color: var(--moss-dark); }
+.float-panel .radio-group { display: flex; gap: 0.9rem; }
+.float-panel .radio-pair { display: inline-flex; align-items: center; gap: 0.3rem; white-space: nowrap; }
+.float-panel .radio-pair label { margin: 0; }
+.float-panel label.checkbox-row { display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.6rem; }
+.map-stats { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+
+#side-panel h3 { margin-top: 0; word-break: break-all; }
+#side-panel dl { margin: 0; }
+#side-panel dt { font-family: var(--font-display); font-size: 0.55rem; margin-top: 0.5rem; color: var(--moss-dark); }
+#side-panel dd { margin: 0.15rem 0 0.2rem; word-break: break-all; }
+.float-panel-close {
+  background: var(--red); color: var(--parchment); box-shadow: 2px 2px 0 var(--ink);
+  padding: 0.1rem 0.5rem; font-size: 0.7rem;
+}
+
+.terminal-log {
+  background: var(--canvas-bg); color: var(--mint);
+  font-family: var(--font-body); font-size: 0.95rem; line-height: 1.3;
+  padding: 0.5rem 0.6rem; height: 210px; overflow-y: auto;
+  border: 2px solid var(--ink);
+}
+.terminal-log .log-line { white-space: pre-wrap; word-break: break-all; }
+.terminal-log .log-line.status-failed { color: var(--red); }
+.terminal-log .log-line.status-cancelled { color: var(--stone); }
+.terminal-log .log-line.status-skipped_extract,
+.terminal-log .log-line.status-skipped_follow { color: var(--amber); }
+.terminal-log .log-line.status-system { color: var(--parchment); }
+.terminal-log .log-empty { color: var(--stone); }
+
+/* Wide-region list fallback (>60 items) -- must survive every rework of
+   the map's rendering technology, not just the one that introduced it;
+   see LESSONS_LEARNED.md #62/#63. Floats as a panel over the canvas now,
+   same as everything else. */
+.wide-region-panel { position: fixed; top: 66px; left: 50%; transform: translateX(-50%); z-index: 18; width: 640px; max-width: 80vw; }
+.wide-region-panel .float-panel-body { max-height: 60vh; }
+.wide-region-panel table td { font-family: var(--font-body); font-size: 1.05rem; }
+
+/* --- Motion: decoration only, gated behind prefers-reduced-motion --- */
+@media (prefers-reduced-motion: no-preference) {
+  .sprite-wiggle { animation: sprite-wiggle 1.6s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+  @keyframes sprite-wiggle {
+    0%, 100% { transform: rotate(-6deg); }
+    50% { transform: rotate(6deg); }
+  }
+  /* Edge fill pulses gently -- reads as "live traffic on this pipe"
+     without being a distracting strobe (opacity range kept narrow). */
+  .edge-fill { animation: edge-pulse 1.4s ease-in-out infinite; }
+  @keyframes edge-pulse {
+    0%, 100% { opacity: 0.7; }
+    50% { opacity: 1; }
+  }
+  .world-node, .gate-tab { transition: border-color 0.1s, box-shadow 0.1s, opacity 0.25s, filter 0.25s; }
+  button { transition: transform 0.06s, box-shadow 0.06s; }
+  .live-pill:not(.static) { animation: live-blink 1.8s ease-in-out infinite; }
+  @keyframes live-blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+  }
+  /* Fresh nodes/edges (a level just entered via descend/ascend) ease in
+     rather than pop -- camera movement itself is animated separately in
+     JS (animateCameraTo), skipped there under reduced motion the same
+     way this class is skipped here (see prefersReducedMotion() gates in
+     both places). */
+  .world-enter { animation: world-enter 0.22s ease-out; }
+  @keyframes world-enter {
+    from { opacity: 0; transform: scale(0.85); }
+    to { opacity: 1; transform: scale(1); }
+  }
+}

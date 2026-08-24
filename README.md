@@ -247,6 +247,44 @@ Every export writes `dataset_card.json` (sites, dates, intent, model, row
 counts, license signals observed). `--semantic-dedup` alone also writes
 `semantic_dedup_report.json` when `--semantic-dedup-report` is passed.
 
+### Map mode, cancellation, graph projections, live status
+
+Backend-only capabilities added ahead of the control server (below) —
+each is its own CLI flag, independently usable without the server running.
+See `CLAUDE.md`'s "Map mode, cancellation, graph projections, live feed"
+section for the design reasoning.
+
+- **`--map URL`** — interactive, like the main crawl, but fetch-and-discover
+  only: no relevance scoring, no LLM calls, no chunking. Pages land as a
+  `mapped` status, kept distinct from `skipped_extract` since no gate ever
+  ran. Resumable into a real crawl (see `--select` below).
+- **`--cancel URL [--cancel-db DB]`** / **`--cancel-prefix PREFIX [--cancel-db DB]`**
+  — cancels a node (or everything under a URL prefix) and its descendants,
+  one transaction. A page already `in_progress` finishes naturally (no
+  abort mechanism exists); its own children are blocked from ever entering
+  the frontier once it's marked cancelled.
+- **`--select URL [--select-db DB]`** / **`--select-prefix PREFIX [--select-db DB]`**
+  — promotes a previously-`mapped` node (or prefix) back to `queued`, so
+  the next crawl run against that `frontier.db` actually extracts it.
+  Content isn't persisted from a map pass, so this means a re-fetch, not a
+  resume from saved text.
+- **`--pause FRONTIER_DB`** / **`--unpause FRONTIER_DB`** — stops/resumes new
+  claims on a running crawl or map (a different process) without touching
+  in-flight work; in-flight pages finish normally either way.
+- **`--graph {discovery,path-tree} --graph-db DB [--graph-root URL_OR_PREFIX] [--graph-max-depth N] [--graph-out PATH]`**
+  — prints a JSON graph projection. `discovery` = edges are `parent_url` (the
+  literal first-discoverer shape the crawl found things in); `path-tree` =
+  grouped by URL path segments ("what a site looks like"). Both support a
+  subtree-scoped, depth-limited query for progressive loading at scale.
+  Offline, no crawl, no LLM calls.
+- **`--live-status --live-status-db DB`** — one JSON snapshot: counts by
+  status, in-flight URLs (with parent + elapsed seconds), recently
+  completed, last-change timestamp. Read-only, safe against a `frontier.db`
+  a crawl is actively writing to. Poll by re-running.
+- **`--discover-json URL`** / **`--headless-config CONFIG_JSON`** — the
+  non-interactive equivalents of the interactive prompts, meant for the
+  control server (below) to drive as subprocesses, not for typing by hand.
+
 ## Architecture
 
 ```mermaid
@@ -325,6 +363,68 @@ nothing currently reads.
 There is no crawl-time per-section split — `canonical.jsonl` is always one
 unified file. Per-section splitting happens only at export time
 (`plain-jsonl` packaging's `manifest.json` + `sections/*.jsonl`).
+
+## Control server
+
+```bash
+uv run python server.py --port 8420   # default port 8420
+```
+
+A local HTTP control layer over everything above — the thing a future UI
+will drive, usable entirely on its own via curl or any HTTP client first.
+**Localhost only (binds `127.0.0.1`), no authentication.** Every endpoint
+can start a crawl, cancel work, or read run data with zero access control —
+do not change the host binding without adding real auth first. Flask's dev
+server runs `threaded=True` so one slow request (there shouldn't be any —
+see below) can't block a UI's continuous status polling.
+
+**Nothing crawl4ai-, chromadb-, or Frontier-touching ever runs inside the
+server process.** Every mutating or LLM-touching operation is launched as
+`python main.py ...` / `python -m export.export ...` in a separate OS
+process — the same event-loop-starvation history documented in `CLAUDE.md`
+is exactly why a crawl must never share a process (let alone a process
+that also needs to stay responsive to HTTP requests for hours). Read-only
+endpoints call the already-safe sync modules directly (`crawl/graph.py`,
+`crawl/live_status.py` — a fresh sqlite3 connection per call, WAL mode,
+never disturbs a running crawl).
+
+**Process tracking survives a server restart** via a PID file per run
+(`data/<run_id>/job.json`) — every status query re-derives from that file
+plus a live OS check (`tasklist`/`taskkill` on Windows), never from
+anything held in memory. A launched job's real exit code is captured
+through a thin wrapper (not by guessing from stdout shape — export and a
+crawl print differently-shaped JSON, or none at all), so `done` vs `failed`
+vs `exited` (crashed hard enough to take the wrapper down too) is always
+accurate. **Pause** is a DB flag (`frontier.control.paused`, checked by
+`claim()`), not a process signal — Windows has no clean suspend-without-
+freezing-in-flight-work equivalent, and this way in-flight pages finish
+normally. Quiescence explicitly ignores the paused case (see `CLAUDE.md`) —
+a paused run with queued rows must never look like a finished one.
+
+### Endpoints
+
+| Method & path | Purpose |
+|---|---|
+| `GET /health` | Liveness check for the server itself. |
+| `GET /runs` | List every run in `data/`, summarized (mode, root URL, pages fetched/discovered, pair count, job state). |
+| `GET /runs/<id>` | One run's summary + current job + persisted config. |
+| `GET /runs/<id>/job` | Just the job status (poll this while a run/export is in flight). |
+| `POST /runs/discover` | `{root_url}` → branch discovery as JSON (category, urls, host, prefix) — the data a UI needs to offer branch selection before starting a run. |
+| `POST /runs/start` | `{mode: "map"\|"crawl", root_url, categories: "all"\|[...], max_pages, max_depth, crawl_workers, extract_workers, extract_threshold, follow_threshold, intent, provider, model, build_rag, run_id?}` → discovers, resolves seeds/scope, launches the job. Returns 202 + job info immediately. |
+| `POST /runs/<id>/resume` | Re-launches the persisted config as-is, or with body overrides — `{"mode": "crawl", ...}` on a mapped run is how "map, select a subtree, then really crawl it" actually works (same `run_dir`, not a new run). |
+| `POST /runs/<id>/stop` | Kills the job's process. A no-op status change if it already finished on its own (reports the real `done`/`failed`, not a false `stopped`). |
+| `POST /runs/<id>/pause` / `POST /runs/<id>/unpause` | Toggles the DB pause flag. |
+| `POST /runs/<id>/cancel` | `{url}` or `{prefix}` → cancels a subtree. |
+| `POST /runs/<id>/select` | `{url}` or `{prefix}` → promotes a mapped subtree back to `queued`. |
+| `GET /runs/<id>/graph` | `?type=discovery\|path-tree&root=...&max_depth=N` → a graph projection. |
+| `GET /runs/<id>/live-status` | One status snapshot (counts, in-flight, recently completed, last change). |
+| `GET /runs/<id>/dataset-report` | Redundancy/duplication report over that run's `canonical.jsonl`. |
+| `POST /runs/<id>/query` | `{question}` → RAG query against that run's own Chroma index (404 if `build_rag` was off). |
+| `POST /runs/<id>/export` | `{schema, framework, ...same flags as the export CLI}` → launches export as a job (can run long over a large `canonical.jsonl`). Returns a `job_dir` key to poll. |
+| `GET /runs/<id>/export/<job_dir>/job` | Export job status. |
+
+Every error response is structured JSON (`{"error": "...", "detail": "..."}`)
+with a real HTTP status code — never a raw traceback.
 
 ## Configuration reference
 

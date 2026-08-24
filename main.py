@@ -117,6 +117,201 @@ async def dry_run(root_url: str):
         console.print()
 
 
+async def discover_command(root_url: str) -> dict:
+    """The non-interactive core of main()'s branch-discovery step, as
+    plain data instead of a Rich table -- the server's /runs/discover
+    endpoint calls this directly (one bounded page-fetch, a few seconds,
+    run via a subprocess -- see server/jobs.py -- never inside the
+    server's own process, same "no crawl4ai browser in the long-lived
+    server loop" discipline as the crawl/map pipeline itself). Also
+    reachable from the CLI via --discover-json for curl-testability
+    without the server running at all.
+
+    Each branch's full url list is included (not just a count) --
+    starting a run needs the actual seed urls, and discovery is the only
+    place that ever fetches the root page to get them; a headless
+    start-run call takes them as already-resolved input (see
+    headless_map/headless_crawl) rather than re-discovering on every
+    start, resume, or retry.
+    """
+    branches = await discover_branches(root_url)
+    result = {"root_url": root_url, "branches": []}
+    for category, urls in branches.items():
+        prefix_result = derive_prefix(urls)
+        result["branches"].append({
+            "category": category,
+            "urls": sorted(urls),
+            "url_count": len(urls),
+            "host": prefix_result.host,
+            "prefix": prefix_result.prefix,
+            "degenerate": prefix_result.degenerate,
+            "note": prefix_result.note,
+        })
+    return result
+
+
+def _resolve_llm(cfg: dict):
+    provider_name = cfg.get("provider", "openai")
+    model_name = cfg.get("model") or {
+        "nvidia": "meta/llama3-70b-instruct", "ollama": "llama3",
+        "ollama_cloud": "deepseek-v4-flash", "openai": "gpt-4o-mini",
+    }[provider_name]
+    llm, embeddings = get_llm(provider_name, model_name)
+    return provider_name, model_name, llm, embeddings
+
+
+async def headless_map(cfg: dict) -> dict:
+    """Non-interactive equivalent of map_main() -- same worker wiring,
+    same 'mapped' terminal status, just no Prompt.ask calls. Takes
+    already-resolved seeds/host_prefix_pairs (see discover_command's
+    docstring for why) rather than re-discovering. This is what
+    --headless-config dispatches to for `"mode": "map"`; the server never
+    imports or calls this directly -- it always goes through a subprocess
+    (see server/jobs.py), same reasoning as discover_command's docstring.
+    """
+    run_dir = cfg["run_dir"]
+    os.makedirs(run_dir, exist_ok=True)
+    db_path = os.path.join(run_dir, "frontier.db")
+
+    seeds = [(u, l) for u, l in cfg["seeds"]]
+    host_prefix_pairs = [(h, p) for h, p in cfg["host_prefix_pairs"]]
+    scope_check = _make_scope_check(host_prefix_pairs)
+
+    frontier = Frontier(db_path, max_pages=cfg.get("max_pages"), max_depth=cfg.get("max_depth"))
+    await frontier.open()
+    await frontier.recover_crashed()
+    await frontier.seed(seeds)
+
+    robots_cache = RobotsCache(_http_get_text)
+    crawl_workers_n = cfg.get("crawl_workers", 5)
+
+    async with AsyncWebCrawler() as crawler:
+        fetch_fn = _make_fetch_fn(crawler)
+        content_queue = asyncio.Queue(maxsize=max(4, crawl_workers_n * 2))
+        politeness = HostPoliteness(
+            max_concurrent_per_host=config.MAX_CONCURRENT_REQUESTS_PER_HOST,
+            default_delay_seconds=config.DEFAULT_POLITENESS_DELAY_SECONDS,
+        )
+        fatal_errors: list[str] = []
+        tasks = [
+            asyncio.create_task(
+                crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness,
+                             fatal_error_sink=fatal_errors)
+            )
+            for _ in range(crawl_workers_n)
+        ] + [asyncio.create_task(map_worker(frontier, content_queue)) for _ in range(2)]
+
+        await frontier.quiescent.wait()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    counts = await frontier.counts_by_status()
+    await frontier.close()
+    return {"mode": "map", "counts_by_status": counts, "fatal_errors": fatal_errors}
+
+
+async def headless_crawl(cfg: dict) -> dict:
+    """Non-interactive equivalent of main() -- same worker wiring, same
+    RAG/threshold/provider logic, just no Prompt.ask calls. See
+    headless_map's docstring for the seeds/host_prefix_pairs contract and
+    why this is always subprocess-launched, never called in-process by
+    the server."""
+    run_dir = cfg["run_dir"]
+    os.makedirs(run_dir, exist_ok=True)
+    db_path = os.path.join(run_dir, "frontier.db")
+    canonical_path = os.path.join(run_dir, "canonical.jsonl")
+
+    seeds = [(u, l) for u, l in cfg["seeds"]]
+    host_prefix_pairs = [(h, p) for h, p in cfg["host_prefix_pairs"]]
+    scope_check = _make_scope_check(host_prefix_pairs)
+    intent = cfg.get("intent") or None
+
+    provider_name, model_name, llm, embeddings = _resolve_llm(cfg)
+
+    frontier = Frontier(db_path, max_pages=cfg.get("max_pages"), max_depth=cfg.get("max_depth"))
+    await frontier.open()
+    await frontier.recover_crashed()
+    await frontier.seed(seeds)
+
+    embed_fn = _make_embed_fn(embeddings)
+    intent_embedding = await embed_fn(intent) if intent else None
+    score_fn = make_score_fn(intent_embedding, embed_fn)
+    extract_fn = _make_extract_fn(llm)
+    extraction_units_fn = make_extraction_units_fn(
+        config.EXTRACTION_STRATEGY, embed_fn=embed_fn, intent_embedding=intent_embedding,
+    )
+    robots_cache = RobotsCache(_http_get_text)
+
+    chunk_fn = None
+    chroma_upsert_fn = None
+    if cfg.get("build_rag"):
+        import chromadb
+        chroma_client = chromadb.PersistentClient(path=os.path.join(run_dir, "chroma_db"))
+        collection = get_or_create_collection(
+            chroma_client, config.CHROMA_COLLECTION_NAME, EMBEDDING_MODEL_NAME, EMBEDDING_DIM
+        )
+        chunk_store = ChunkStore(collection, embed_fn)
+
+        def chunk_fn(content: str) -> list[dict]:
+            pairs = split_into_parent_child_chunks(
+                content, config.PARENT_CHUNK_SIZE, config.PARENT_CHUNK_OVERLAP,
+                config.CHILD_CHUNK_SIZE, config.CHILD_CHUNK_OVERLAP,
+            )
+            return [{"text": child, "parent_text": parent} for child, parent in pairs]
+
+        async def chroma_upsert_fn(url: str, chunks: list[dict]) -> None:
+            for c in chunks:
+                await chunk_store.add_or_merge_chunk(c["text"], url, c["parent_text"])
+
+    writer = Writer(canonical_path, chroma_upsert_fn=chroma_upsert_fn)
+    crawl_workers_n = cfg.get("crawl_workers", 5)
+    extract_workers_n = cfg.get("extract_workers", 2)
+
+    async with AsyncWebCrawler() as crawler:
+        fetch_fn = _make_fetch_fn(crawler)
+        content_queue = asyncio.Queue(maxsize=max(4, crawl_workers_n * 2))
+        results_queue = asyncio.Queue(maxsize=max(4, extract_workers_n * 2))
+        politeness = HostPoliteness(
+            max_concurrent_per_host=config.MAX_CONCURRENT_REQUESTS_PER_HOST,
+            default_delay_seconds=config.DEFAULT_POLITENESS_DELAY_SECONDS,
+        )
+        fatal_errors: list[str] = []
+        tasks = [
+            asyncio.create_task(
+                crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness,
+                             fatal_error_sink=fatal_errors)
+            )
+            for _ in range(crawl_workers_n)
+        ] + [
+            asyncio.create_task(
+                extract_worker(frontier, content_queue, results_queue, score_fn, extract_fn,
+                                cfg.get("extract_threshold", 0.0), cfg.get("follow_threshold", 0.0),
+                                chunk_fn=chunk_fn, extraction_units_fn=extraction_units_fn,
+                                generation_model=model_name, extraction_strategy=config.EXTRACTION_STRATEGY.value,
+                                section_depth=config.SECTION_DEPTH, seed_prefixes=host_prefix_pairs)
+            )
+            for _ in range(extract_workers_n)
+        ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
+
+        await frontier.quiescent.wait()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    counts = await frontier.counts_by_status()
+    await frontier.close()
+    return {"mode": "crawl", "counts_by_status": counts, "fatal_errors": fatal_errors}
+
+
+async def headless_run(cfg: dict) -> dict:
+    if cfg["mode"] == "map":
+        return await headless_map(cfg)
+    if cfg["mode"] == "crawl":
+        return await headless_crawl(cfg)
+    raise ValueError(f"unknown headless mode: {cfg['mode']!r}")
+
+
 async def map_main(root_url: str):
     """Map-only crawl: fetch pages, discover + scope-filter links, record
     them in the frontier -- no relevance scoring, no LLM extraction, no
@@ -344,23 +539,27 @@ async def dataset_report_command(canonical_path: str, frontier_db_path: str | No
     console.print(build_dataset_report(records, scores=scores))
 
 
-async def query_command(question: str):
+async def query_command(question: str, chroma_dir: str | None = None):
     """Embeds the question, searches the persisted Chroma index, prints
     each result's parent text and sources -- the proof the RAG index
-    stops being write-only (ROADMAP.md #3)."""
+    stops being write-only (ROADMAP.md #3). chroma_dir defaults to the
+    single-run CHROMA_PERSIST_DIR for backward compatibility; the server
+    passes a specific run's own chroma_db explicitly (data/run-*/ can
+    hold many runs, each with its own index) -- see server/app.py."""
     import chromadb
     from llm_factory import LocalOllamaEmbeddings
 
+    chroma_dir = chroma_dir or config.CHROMA_PERSIST_DIR
     embeddings = LocalOllamaEmbeddings(model_name=EMBEDDING_MODEL_NAME)
     embed_fn = _make_embed_fn(embeddings)
 
-    client = chromadb.PersistentClient(path=config.CHROMA_PERSIST_DIR)
+    client = chromadb.PersistentClient(path=chroma_dir)
     try:
         collection = client.get_collection(config.CHROMA_COLLECTION_NAME)
     except Exception:
         console.print(
             f"[red]No collection {config.CHROMA_COLLECTION_NAME!r} found in "
-            f"{config.CHROMA_PERSIST_DIR} -- run a crawl with RAG enabled first.[/red]"
+            f"{chroma_dir} -- run a crawl with RAG enabled first.[/red]"
         )
         sys.exit(1)
 
@@ -685,9 +884,17 @@ if __name__ == "__main__":
         "--query",
         metavar="QUESTION",
         help="Embed QUESTION, search the persisted Chroma index "
-             f"({config.CHROMA_PERSIST_DIR}), print each result's parent text "
-             "and sources. Requires a prior run with RAG enabled. One live "
-             "embedding call.",
+             f"({config.CHROMA_PERSIST_DIR} unless --query-chroma-dir is "
+             "given), print each result's parent text and sources. "
+             "Requires a prior run with RAG enabled. One live embedding call.",
+    )
+    parser.add_argument(
+        "--query-chroma-dir",
+        metavar="DIR",
+        default=None,
+        help="Chroma persist dir to search (default: the single-run "
+             f"{config.CHROMA_PERSIST_DIR}) -- e.g. data/run-X/chroma_db "
+             "for a specific named run.",
     )
     parser.add_argument(
         "--dataset-report",
@@ -789,11 +996,59 @@ if __name__ == "__main__":
     )
     parser.add_argument("--live-status-db", metavar="FRONTIER_DB", default=FRONTIER_DB_PATH,
                          help="Frontier DB to read (default: %(default)s).")
+    parser.add_argument(
+        "--discover-json",
+        metavar="URL",
+        help="Fetch URL, derive scope per discovered branch, print the "
+             "result as JSON (category, urls, host, prefix) instead of "
+             "--dry-run's human-readable accept/reject listing. One "
+             "bounded page-fetch, no LLM calls -- what the server's "
+             "discover endpoint runs as a subprocess.",
+    )
+    parser.add_argument(
+        "--headless-config",
+        metavar="CONFIG_JSON",
+        help="Run a map or full crawl non-interactively from a resolved "
+             "JSON config file (mode, run_dir, seeds, host_prefix_pairs, "
+             "and the same tunables the interactive prompts ask for) -- "
+             "no stdin prompts, so this is what the server launches as a "
+             "subprocess for both starting and resuming a run. Prints the "
+             "final counts_by_status as JSON on completion.",
+    )
+    parser.add_argument("--pause", metavar="FRONTIER_DB",
+                         help="Stop a running crawl/map from claiming new work; in-flight pages finish normally.")
+    parser.add_argument("--unpause", metavar="FRONTIER_DB",
+                         help="Undo --pause -- claiming resumes on the next poll, no restart needed.")
     args = parser.parse_args()
 
     try:
         if args.dry_run:
             asyncio.run(dry_run(args.dry_run))
+        elif args.discover_json:
+            print(json.dumps(asyncio.run(discover_command(args.discover_json))))
+        elif args.headless_config:
+            with open(args.headless_config, encoding="utf-8") as f:
+                cfg = json.load(f)
+            result = asyncio.run(headless_run(cfg))
+            print(json.dumps(result))
+            if result.get("fatal_errors"):
+                sys.exit(1)
+        elif args.pause:
+            async def _pause():
+                f = Frontier(args.pause)
+                await f.open()
+                await f.set_paused(True)
+                await f.close()
+            asyncio.run(_pause())
+            console.print(f"[yellow]Paused {args.pause}[/yellow]")
+        elif args.unpause:
+            async def _unpause():
+                f = Frontier(args.unpause)
+                await f.open()
+                await f.set_paused(False)
+                await f.close()
+            asyncio.run(_unpause())
+            console.print(f"[green]Unpaused {args.unpause}[/green]")
         elif args.map:
             asyncio.run(map_main(args.map))
         elif args.cancel or args.cancel_prefix:
@@ -813,7 +1068,7 @@ if __name__ == "__main__":
         elif args.score_report:
             asyncio.run(score_report_command(args.score_report))
         elif args.query:
-            asyncio.run(query_command(args.query))
+            asyncio.run(query_command(args.query, chroma_dir=args.query_chroma_dir))
         elif args.dataset_report:
             asyncio.run(dataset_report_command(args.dataset_report, args.dataset_report_frontier_db))
         else:
