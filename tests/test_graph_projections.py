@@ -254,8 +254,21 @@ class TestScaleAgainstRealPhase2Frontier(unittest.TestCase):
         tree_elapsed = time.perf_counter() - t0
 
         self.assertEqual(disc["node_count"], 2039)
-        self.assertFalse(disc["edges_tracked"])  # predates discovery_edges
-        self.assertIsNone(disc["multi_inbound_link_count"])
+        # edges_tracked reflects whether THIS real file's discovery_edges
+        # table exists right now -- it was False when this test was
+        # written (the file predated that table) but flipped True at some
+        # point since, because Frontier.open() creates the table via
+        # CREATE TABLE IF NOT EXISTS on every open, including a later
+        # session's read against this same file. Asserting a fixed
+        # historical value here was asserting a fact about this ambient,
+        # mutable fixture's past, not a real invariant of the code -- it
+        # was always going to go stale the next time anything touched this
+        # file. The actual invariant crawl/graph.py guarantees (see
+        # discovery_graph: multi_inbound = ... if edges_tracked else None)
+        # is that the two fields agree; assert THAT instead, which holds
+        # regardless of which state this file is in today AND still fails
+        # if a future change breaks the real relationship between them.
+        self.assertEqual(disc["edges_tracked"], disc["multi_inbound_link_count"] is not None)
         print(
             f"\n[scale check] discovery_graph: {disc_elapsed:.3f}s, "
             f"path_tree: {tree_elapsed:.3f}s, node_count={disc['node_count']}"

@@ -58,6 +58,26 @@ CRITICAL RULES:
 Format your output EXACTLY as a JSON array of objects, where each object has an "instruction" key and a "response" key."""
 
 
+# Same instruction/response JSON contract as QA_EXTRACTION_SYSTEM_PROMPT
+# (parse_qa_json below needs no changes) -- only what counts as a good
+# pair changes: a runnable code example should produce an instruction to
+# write/do that code and the code itself as the answer, not prose
+# commentary about it, since this run's output is training data for code
+# generation.
+CODE_QA_EXTRACTION_SYSTEM_PROMPT = """You are an expert training data generator. Your task is to read the provided text and generate diverse, high-quality instruction-response pairs for fine-tuning a Large Language Model that writes code.
+
+CRITICAL RULES:
+1. If the text contains a runnable code example (a fenced code block showing real, executable code -- not a bare API signature), generate one instruction-response pair per distinct code example where the 'instruction' is a specific task description of what the code should do or accomplish (e.g. "Write a Manim scene that ...") and the 'response' is the code itself, reproduced exactly as it appears in the text (same formatting, same fenced code block). Do not paraphrase or describe the code in prose -- the code IS the answer.
+2. If the text contains a table, list, or enumeration of distinct named items (parameters, attributes, methods, classes, etc.) with no runnable example, generate one pair per item that has real descriptive content -- do not skip an item just because its description is short, as long as it says something real about that item.
+3. For all other prose content with no code example, generate one pair per genuinely distinct fact or concept -- not a fixed count. Thin content that only supports one or two real questions should produce only one or two pairs; do not pad with restatements to reach a target number.
+4. Never generate two pairs that ask about the same underlying fact or the same code example from a different angle. Before adding a pair, check it against the ones you've already written -- if it's really the same question reworded, skip it instead.
+5. The 'instruction' must be specific enough that a user asking it would expect exactly this code or this fact back, and MUST be entirely self-contained -- never use pronouns like "he", "it", or "this company".
+6. For non-code pairs, the 'response' must be accurate, detailed, and derived ONLY from the provided text.
+7. If the text is just a navigation menu or footer with no real content, return an empty list.
+
+Format your output EXACTLY as a JSON array of objects, where each object has an "instruction" key and a "response" key."""
+
+
 class MalformedExtractionError(Exception):
     pass
 

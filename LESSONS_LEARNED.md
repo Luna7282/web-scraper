@@ -4184,3 +4184,525 @@ reliably emit the `pointermove` events this UI's drag handling listens
 for," not as a bug in the panel-dragging code -- confirmed by the fact
 that the identical drag gesture, dispatched as real pointer events,
 worked on the first try.
+
+## 2026-08-25 — Code-integrity prep for the manim crawl: fence-aware chunking measured and fixed, code-focused prompt tested offline, not yet applied
+
+### 66. `chunk_text`'s character-limit splitting cut fenced code blocks in half often enough to matter -- measured before fixing, not assumed
+
+Measured against the archived manim baseline crawl's real `source_chunk`
+values (`archive/step6-manim-baseline/canonical.jsonl`, 78 unique chunks):
+38 chunks contained a code fence marker, and 6 of those (15.8%) had an odd
+(unbalanced) fence count -- meaning the chunk boundary landed inside a
+fenced block, so `per_chunk` extraction was generating pairs about half a
+code example. Fixed at the one shared root (`content/relevance.py::
+chunk_text`, the only chunker in the codebase -- `chunk_store.py`'s
+parent/child split and `extraction_units.py`'s per-chunk selection both
+call through it, so the fix applies everywhere without touching either
+caller): fenced blocks (`^```...^```$`) are now carved out and appended as
+one atomic piece between normal `RecursiveCharacterTextSplitter` splits of
+the surrounding prose, instead of being fed through the splitter's own
+separators. A block bigger than `chunk_size` overflows its chunk rather
+than being cut -- verified directly (a 500-char block cut against
+`chunk_size=100` comes back as one 500-char chunk, and no chunk in a mixed
+prose+code fixture, down to `chunk_size=50`, ever has an odd `` ``` ``
+count). Real cost, not hidden: chunk-boundary overlap (`PARENT_CHUNK_
+OVERLAP`/`CHILD_CHUNK_OVERLAP`) is not applied across a code block's
+edges -- duplicating text into or out of an atomic fenced block would
+undo the same guarantee this exists for, so a code block's neighboring
+prose chunks get zero overlap with it on that side. Not measured against
+a second corpus (only manim) or against nested/four-backtick fences --
+those aren't known to occur in this corpus's real content, not verified
+absent.
+
+### 67. Code-focused extraction prompt variant: offline test against real cached chunks surfaced a 3B model's actual failure mode before any crawl spent money on it
+
+Added `CODE_QA_EXTRACTION_SYSTEM_PROMPT` (`content/extraction.py`) and
+`config.ExtractionPromptVariant` (`STANDARD`/`CODE_FOCUSED`, default kept
+at `STANDARD` -- this is a config knob added, not a default changed).
+`main.py::_make_extract_fn` now takes an optional variant override and
+otherwise reads `config.EXTRACTION_PROMPT_VARIANT`, so nothing about a
+real run changes until that default is deliberately flipped.
+
+Tested offline, per instruction, before touching the default: two real
+chunks from the archived manim `source_chunk` data (one containing an
+actual runnable `VGroup`/`ArcShapeIris` example, one pure API-signature
+prose with no code) through both prompts, local Ollama (`qwen2.5-coder:
+3b-instruct-q4_K_M` -- free, no billing; `llama3.1` 8B failed to load
+locally, out of memory). Findings, not just "it ran":
+- On the prose-only chunk (no code fence at all), `STANDARD` correctly
+  stayed prose Q&A. `CODE_FOCUSED` fabricated a Python function that
+  never appeared in the source text (rule 6, "derived ONLY from the
+  provided text," was not followed by this model) and wrapped it in a
+  Python triple-quoted string inside the JSON, which is invalid JSON --
+  confirmed `parse_qa_json` raises `MalformedExtractionError` on it, not
+  a silent empty-list pass.
+- On the code-containing chunk, `CODE_FOCUSED` produced an
+  instruction-code pair, but the "code" was a new, different scene the
+  model invented rather than the actual `ArcShapeIris` example reproduced
+  verbatim (rule 1's "reproduced exactly as it appears in the text" was
+  not followed either).
+- Both failures are the same underlying pattern: a 3B model treats
+  "write code for this instruction" as license to generate new code
+  rather than transcribe the given example, even when the prompt says
+  not to. Not yet checked against a larger/different model -- this run
+  only establishes that the prompt variant's correctness is model-
+  dependent and must be re-verified against whatever model an actual
+  crawl would use before `EXTRACTION_PROMPT_VARIANT` is ever flipped to
+  `CODE_FOCUSED` for a real run.
+
+## 2026-08-25 — LLM-assisted branch selection built and tested against two real archived maps; a provider-default audit and a process-kill mistake, both found along the way
+
+### 68. Branch selection works reliably on a docs site, degrades on a blog for a structural reason -- confirmed on two real archived maps, not assumed from one
+
+`crawl/branch_select.py` (new): classifies each `path_tree` branch
+(select/reject/uncertain + one-line reason) against a user intent, one
+LLM call, proposes only -- nothing here mutates a frontier.db.
+`extract_branches()` auto-detects the site's "effective root" by
+descending through single-child/no-own-page path segments (same logic
+`map.js`'s `findEffectiveRoot()` already used client-side, independently
+confirmed matching once both were run against the same real map).
+
+Tested against `data/run-map-docs.manim.community-20260823-155748/
+frontier.db` (16 real branches) and `data/run/frontier.db` (blog.
+cloudflare.com, 2039 pages) with `meta/llama-3.3-70b-instruct` via NVIDIA:
+
+- **Manim, intent "how do I use this library"**: correctly rejected
+  `changelog/`, `changelog.html`, `contributing/`, `conduct.html`;
+  selected `reference/`, `tutorials/`, `guides/`, `installation/`,
+  `faq/`, `examples.html`; abstained on ambiguous bare index pages
+  (`reference.html`, `plugins.html`) instead of guessing.
+- **Manim, intent "what changed between versions"**: correctly inverted
+  -- selected only `changelog/` + `changelog.html`, rejected everything
+  else including `reference/`. Same model, same branches, opposite
+  intent, opposite (correct) decisions -- proves it's reading the intent,
+  not pattern-matching branch names.
+- **A smaller local model (`llama3.2:3b` via Ollama) failed outright** on
+  the same manim/intent-A case: selected all 16 branches unconditionally,
+  including `changelog/` and `conduct.html`, with generic reasoning. Model
+  size matters for this task the same way it did for #67's code-focused
+  extraction prompt -- a second, independent confirmation of that pattern,
+  not a coincidence.
+- **Cloudflare structural finding, before any classification was run at
+  all**: `extract_branches()` on blog.cloudflare.com returns **1132
+  branches**, of which **1130 are individual posts** (`page_count==1`)
+  sitting directly at the root -- only `/author` (663) and `/tag` (234)
+  are real multi-page branches. The full classification prompt over all
+  1132 would be ~172K chars (~43K tokens) -- nowhere near "one cheap
+  call," so it was never sent. Tested a 22-branch representative subset
+  (both real branches + 20 posts sampled evenly by prefix) instead.
+- **Cloudflare classification, subset**: `/author`/`/tag` correctly
+  rejected for both intents tried. Individual posts stayed plausible for
+  a narrow intent ("security research, incident reports, and threat
+  intelligence") but **degraded to selecting 18/20 for a broad intent**
+  ("how to use Cloudflare products and APIs"), with generic reasoning
+  ("could contain relevant information...") on posts that were actually
+  vulnerability writeups or hiring announcements. Root cause identified,
+  not just observed: a single-page branch's `sample_urls` is literally
+  the same one URL the `prefix` already is -- no additional signal beyond
+  the slug, unlike a directory branch's 3-5 real URLs revealing an actual
+  pattern. This is a data-availability gap (see `ROADMAP.md` #46's
+  proposed fix -- store `page_title` during `map_worker`, free since the
+  map already fetches the page), not a prompt-quality problem; re-tuning
+  the prompt wouldn't have fixed it.
+- **Verdict, stated plainly per the "if unreliable, say so" instruction**:
+  reliable on docs-site-shaped structures. Not reliable as shipped on a
+  flat/blog-shaped site's individual-post branches, especially for a
+  broad intent -- known limitation, documented, not silently shipped as
+  if it worked everywhere.
+
+UI verified live (not just by reading the diff): started `server.py`,
+loaded `/map?run=...` in a real browser, confirmed the branch nodes
+matched `extract_branches()`'s own output exactly, stubbed `Api.
+suggestSelection`+`window.prompt` via `javascript_tool` to exercise the
+click-through path fast (real 70B calls take minutes, not worth waiting
+on for a DOM check), and confirmed the highlight stripe classes
+(`suggest-select`/`-reject`/`-uncertain`) landed on the right nodes and
+that clicking one showed the reason in the detail panel. Caught a real
+bug this way, not by review: the server endpoint's `run_bounded` timeout
+was 120s (copied from `/query`, which is embedding-only and fast); a real
+70B classification call takes ~5 minutes and got killed mid-flight.
+Fixed by reusing `config.LLM_EXTRACT_TIMEOUT_SECONDS` (600s, the same
+budget the LLM client itself is configured with) instead of a new guess.
+
+### 69. Provider-default audit, prompted by the NVIDIA 404 above -- one more stale default found, one account-billing block found, neither guessed around
+
+Checked every provider's hardcoded default model
+(`main.py::_DEFAULT_MODEL_BY_PROVIDER`, previously duplicated a second
+time verbatim in the interactive `main()` prompt -- now the same
+constant, one place):
+- **nvidia**: `meta/llama3-70b-instruct` confirmed 404 via `GET /v1/
+  models`. Replaced with `meta/llama-3.3-70b-instruct`, verified against
+  4 real successful chat-completion calls (see #68), not just a
+  models-list check -- a model can be *listed* and still not actually
+  serve requests.
+- **ollama (local)**: `llama3` confirmed still resolvable (`registry.
+  ollama.ai` manifest lookup, 200) -- old, superseded by 3.1/3.2/3.3, but
+  not stale/broken. Left as-is.
+- **ollama_cloud**: `deepseek-v4-flash` was confirmed working 2026-08-18
+  (#10-11). As of 2026-08-25 it 403's: "this model requires a
+  subscription, upgrade for access." Tried three other real cloud models
+  (`gpt-oss:20b`, `gpt-oss:120b`, `nemotron-3-nano:30b`) to find a working
+  replacement -- all three 403 differently: **"your subscription payment
+  is past due."** This is an account billing problem, not a model-catalog
+  one, and not something to work around in code -- no replacement default
+  was picked, because there's currently no way to verify one actually
+  works on this account. Left as-is with the finding documented in the
+  constant's own comment; re-verify once billing is resolved.
+- **openai**: `gpt-4o-mini` not verified live (no `OPENAI_API_KEY` in this
+  environment). Not known-deprecated, but unverified is not verified --
+  said so rather than reporting it as checked.
+
+This directly blocked the user's ask to re-run the manim intent-inversion
+test on Ollama Cloud with a large model (to isolate "model size" from
+"provider" as the variable behind #68's small-model failure, since all
+three NVIDIA problems that day were provider-specific quirks) -- couldn't
+be done with this account in its current billing state; reported rather
+than substituted with NVIDIA again, which would have defeated the point
+of the isolation the user was asking for.
+
+### 70. Process-kill by broad filter took down 8 processes instead of 1 -- including ones from before this session, with no way to know what they were doing
+
+Cleaning up 3 backgrounded LLM calls that had hung (see #68/#69's NVIDIA
+concurrency/model issues), a PowerShell `Get-CimInstance ... | Where-
+Object { $_.CommandLine -like '*server.py*' }` filter was used to find
+and kill a control-server process started earlier in the session for UI
+testing. It matched 8 processes, not 1 -- including some with 11-40 hour
+uptimes, i.e. started before this session existed. There is no way after
+the fact to know what those were doing or whether killing them cost
+anything. See `CLAUDE.md`'s new working-convention bullet: kill by a PID
+captured at the specific launch you made, never by a pattern that matches
+"looks like the thing," the same failure shape as the `uv sync --active`
+`.venv` incident (#6) -- both times the blast radius landed outside the
+task the command was actually trying to accomplish.
+
+## 2026-09-22 — System One decision models (Jev/Laya) + Gemini: research and config landed, deliberately stopped before the decision interface itself
+
+### 71. Step 0/Step 1 of a larger System One integration: primary-source research written up, Gemini wired as a fifth provider, System One config validated at startup -- decision interface (Step 3) intentionally not started
+
+Full research in `SYSTEM_ONE_MODELS.md` (Jev's exact request/response
+schema pulled from `docs.typesafe.ai/api.md`/`quickstart`/`primitives`,
+not just the marketing blog post; Laya's checkpoints/Router/token-budget
+math/Honest-Limits section from its HF card + GitHub README; Gemini's
+OpenAI-compat endpoint + embeddings support from `ai.google.dev`'s current
+docs). Key findings that shape what Step 3 will actually need to build:
+- Jev and Laya are **not** `ChatOpenAI`-shaped -- neither returns chat
+  completions, both return typed decisions (`choice`/`score`/`noul`).
+  They don't belong in `llm_factory.py`'s provider-routing pattern at
+  all; they're a different kind of backend (decision, not chat) and need
+  their own interface (Step 3), not a `get_llm()` branch.
+- Gemini **is** `ChatOpenAI`-shaped (confirmed:
+  `base_url="https://generativelanguage.googleapis.com/v1beta/openai/"`)
+  and slots into the existing pattern with zero new client code -- added
+  as `LLMProvider.GEMINI` in `config.py`, `get_llm_config()` branch, and
+  `main.py::_DEFAULT_MODEL_BY_PROVIDER["gemini"] = "gemini-2.5-flash"`
+  (picked from current docs, explicitly **not** live-verified -- no
+  `GEMINI_API_KEY` in this environment; every other provider default in
+  this dict now carries the same honesty distinction after #69's audit).
+- Gemini has a real, working, free-tier embeddings endpoint
+  (`gemini-embedding-2`) -- noted per instruction, deliberately **not**
+  wired into `EMBEDDING_CAPABLE_PROVIDERS`'s live behavior (that set is
+  documentation-only today anyway -- `get_llm()` hardcodes
+  `LocalOllamaEmbeddings` regardless of provider, confirmed by reading
+  the code, not assumed) or into any actual routing. Switching embeddings
+  off local Ollama is a separate decision, explicitly not made here.
+- `laya` is not a current dependency and would be the **first**
+  ML-inference dependency this project has ever had (`torch`,
+  `transformers`, `huggingface_hub` -- there is no torch/transformers in
+  `pyproject.toml` today). Flagged, not installed: `torch>=2.14`/
+  `transformers>=5` are recent enough that a conflict with this project's
+  load-bearing `numpy<2` pin (`LESSONS_LEARNED.md` #1) is a real risk, not
+  a hypothetical -- needs `uv add laya --dry-run` and an explicit ask
+  before installing, per `CLAUDE.md`'s existing conventions on both
+  counts.
+
+`config.py::validate_system_one_config()` (new, tested --
+`tests/test_system_one_config.py`, 6 cases) fails loudly at startup on
+`USE_SYSTEM_ONE=true` with a bad/missing provider, a missing
+`TYPESAFE_API_KEY` for `jev`, or a missing `laya` package for `laya` --
+wired into every entry point that currently makes a decision (`main()`,
+`headless_crawl()`, `suggest_selection_command()`), not into read-only
+commands (`--graph`, `--live-status`, etc.) that never reach a decision
+point regardless of this config. Verified all three failure paths plus
+the pass-through case directly, not just by reading the code.
+
+**Deliberately stopped here**, per the user's own explicit instruction
+("update `.env.example`... then STOP and tell me. I'll paste the real
+keys into `.env` before anything gets tested"): Step 2 (audit every
+decision point), Step 3 (the actual traditional/Jev/Laya interface, the
+part that would make `USE_SYSTEM_ONE=true` do anything beyond passing
+validation), and Step 4 (failure/traceability wiring) are specified but
+**not started** -- `USE_SYSTEM_ONE=true` today only proves the config is
+internally consistent; every call site still runs the traditional path
+regardless, same as before this change. Step 5 (prove it against real
+keys, three ways, on the known-good manim intent-inversion case) can't
+start until real keys land in `.env` -- also blocked separately by #69's
+finding that this account's Ollama Cloud subscription has billing issues,
+independent of anything System-One-specific.
+
+### 72. Steps 2-4 built and tested entirely against stubs, as instructed -- one interface, four real decision points wired, traditional behavior byte-for-byte preserved throughout
+
+**Laya dependency check, before anything else touched it (per instruction)**:
+`uv pip install laya --dry-run` resolved cleanly -- `torch==2.14.0`,
+`transformers==5.17.0`, no numpy touched at all. Verified against PyPI
+metadata directly too, not just trusting the resolver: `torch==2.14.0`
+declares no numpy pin in `requires_dist`; `transformers==5.17.0` declares
+`numpy>=1.17`, comfortably inside this project's `numpy<2` pin (1.26.4
+installed). No conflict -- the sidecar-venv design was proposed
+conditionally and never needed; Laya is built as a normal in-process
+`DecisionBackend`, not installed yet (Step 3 was built and tested against
+stubs, per instruction -- the real `pip install laya` is still a separate
+ask for whenever it's actually run for real).
+
+**Step 2 (audit)**: delegated to a research subagent, cross-checked
+against this project's own docs (`config.py`, `CLAUDE.md`,
+`SYSTEM_ONE_MODELS.md` already named the same four points). Confirmed:
+branch selection (`crawl/branch_select.py`), the relevance gate (both
+`extract_threshold`/`follow_threshold`, `crawl/pipeline.py::extract_
+worker` lines 201/204, scored by `content/relevance.py::score_headings`),
+semantic dedup (`export/export_formats.py::semantic_dedup`, actually
+string-similarity via `difflib`, not embeddings despite the name), and
+sample quality scoring (confirmed genuinely unimplemented -- only
+`validate_records`'s well-formedness checks exist). Two more found and
+explicitly scoped out: extraction-unit top-k selection and RAG top-k
+retrieval are both pure embedding nearest-neighbor ranking, not a
+yes/no/score judgment Jev/Laya would improve -- noted, not built.
+
+**Step 3 (the interface)**: `decisions/` package -- `NoulAnswer`/
+`ChoiceAnswer`/`ScoreAnswer` (uniform shape regardless of which backend
+answered), `DecisionBackend` (only `noul` is required; `choice`/`score`
+exist on the interface since Jev/Laya support them, but nothing wired up
+today needs them, so they're not forced filler), `JevBackend` (plain
+`requests`, no new SDK dependency -- exact request/response schema from
+`docs.typesafe.ai/api.md`, not memory; 429/529 raise the *existing*
+`crawl.pipeline.RateLimitError`, reusing the already-tested backoff
+contract instead of inventing a second one), `LayaBackend` (lazy `laya`
+import, `Router(preload=True)`, `asyncio.to_thread`-wrapped per the event
+loop invariant), `LLMTraditionalBackend` (generic, batches N items into
+one chat completion -- used only where no prior method exists), and
+`get_backend()` (the one function reading `config.USE_SYSTEM_ONE`/
+`SYSTEM_ONE_PROVIDER`, with module-level Jev/Laya singletons so multiple
+decision points in one run share one resident Laya `Router`, not one
+per decision point). 17 tests against stubs, zero real keys, zero `laya`
+installed.
+
+**A real design correction made mid-build, worth recording**: the first
+draft made `noul_many` (many questions, one shared `state`) the abstract
+primitive, matching Jev's own request shape literally. It doesn't fit
+branch selection, which needs *each branch's own sample URLs as its own
+state* -- the user's own wording ("its sample URLs as state", not "a
+state shared across every branch"). Flipped the primitive: single-item
+`noul(state, instructions, criteria)` is what every backend must
+implement (mirrors Jev/Laya's real one-state-per-request shape exactly,
+since a "batch" is never really one HTTP call for these two anyway once
+each item has its own state); `noul_many` is a concrete default on the
+base class that just gathers individual `noul()` calls concurrently --
+correct for Jev/Laya, whose whole value proposition is that one call is
+already cheap. Only `LLMTraditionalBackend` overrides `noul_many`, because
+batching many questions into one chat completion is the one place where
+fewer real network calls actually matters.
+
+**Four decision points wired, all four with traditional's own existing
+method preserved exactly** (verified by re-running every pre-existing
+test unchanged, not just claimed):
+- **Branch selection**: `TraditionalBranchDecisionBackend` wraps the
+  exact prior prompt/parsing (`BRANCH_CLASSIFICATION_SYSTEM_PROMPT`,
+  `build_classification_prompt`, `parse_branch_classification`)
+  unchanged, captured via closure rather than reconstructed from the
+  generic per-item shape (reconstructing would risk feeding the LLM
+  subtly different information -- not a behavior-preserving refactor).
+  All 14 pre-existing tests pass unmodified. System One path: one noul
+  per branch, sample URLs as state, collapsed back to select/reject/
+  uncertain via new `config.SYSTEM_ONE_NOUL_SELECT_THRESHOLD`/`_REJECT_
+  THRESHOLD` (0.7/0.3) -- chosen so traditional's own exact-1.0/0.0/0.5
+  encoding round-trips to identical output, not yet tuned against a real
+  Jev/Laya probability distribution.
+- **Relevance gate**: `TraditionalRelevanceDecisionBackend` wraps
+  `score_headings`'s embedding cosine similarity unchanged.
+  `content/relevance.py::gate_state()` is a new shared state-prep step
+  (headings if present, else truncated content) used by *every* backend,
+  not just traditional -- directly because Jev's own docs warn "accuracy
+  drops as the state fills with irrelevant content, filter before
+  sending" (this project's original Step-0 research pointer, now acted
+  on). `extract_worker`'s own signature is untouched -- `ScoreFn` still
+  returns a bare float, zero blast radius on that heavily-tested worker.
+  `make_score_fn` gained a leading `intent: str` parameter (needed for
+  System One's question text, unused by traditional) -- both real call
+  sites in `main.py` updated.
+- **Semantic dedup**: `TraditionalDedupDecisionBackend` wraps
+  `SequenceMatcher.ratio()` unchanged -- already exactly 0.0-1.0, no
+  transformation needed. `find_near_duplicates()`'s O(n^2) quick_ratio
+  prefilter is untouched and still runs first; only the candidate pairs
+  it returns get a real `noul()` call, keeping System One's per-pair cost
+  bounded the same way the prefilter already bounds traditional's cost.
+  `export_formats.py`'s own "nothing here touches the network" design
+  stays true on the outside -- `semantic_dedup()` is still a plain sync
+  function, wrapping its one async backend call in `asyncio.run()`
+  internally (safe here specifically because `export.py`'s whole call
+  chain is sync end to end, never inside an already-running loop).
+- **Sample quality scoring**: genuinely new -- `content/sample_quality.py`,
+  `LLMTraditionalBackend` as its traditional method (per step 3's "no
+  prior method -> traditional is an LLM call" instruction). Opt-in
+  (`quality_backend=None` by default in `extract_worker`, a new
+  `enable_quality_scoring` prompt/config field) specifically so it
+  doesn't silently add a mandatory extra LLM call (cost/latency) to
+  every existing crawl -- that would itself be the kind of default
+  behavior change "traditional stays the default" rules out, even though
+  this decision point has no *prior* traditional behavior to preserve.
+  `storage/canonical.py` gained two new optional fields (`quality_score`,
+  `quality_decision_method`, default `None`) -- all 8 pre-existing
+  canonical tests pass unmodified. A `DecisionError`/`RateLimitError`
+  from the quality call is deliberately NOT caught in `extract_worker`'s
+  new code -- it falls through to the *existing* exception handling that
+  already fails the row loudly (`mark_extract_outcome(..., 'failed',
+  reason)`), satisfying step 4's "fail loudly, don't silently fall back"
+  for free, with zero new exception-handling code.
+
+**Step 4 (failure/traceability)**: failure handling turned out to need
+no new code at all -- every backend raises `DecisionError` or the
+existing `RateLimitError` on failure, and every call site already has
+exception handling (extract_worker's existing try/except, export.py's
+existing exit-on-exception CLI behavior) that fails loudly rather than
+swallowing. Traceability: `decision_method` on branch-selection results,
+`quality_decision_method`/`quality_score` on canonical records,
+`_dedup_method` on dropped-duplicate records, and a new `decision_mode`
+field on `--live-status`/`GET /runs/<id>/live-status` (reads the
+*polling process's own* `config.USE_SYSTEM_ONE`, not something persisted
+per-run -- a real, documented caveat: a `--live-status` call from a
+different environment than the one the crawl started in could
+misreport; per-pair/per-decision traceability on the actual records is
+the authoritative source, not this field). Map UI shows the same mode as
+a small badge in the stats panel.
+
+**Bypass prevention**: `tests/test_decision_interface_ownership.py`,
+AST-based (not source-text grep -- several of these modules' own
+docstrings *explain* that they don't read `config.USE_SYSTEM_ONE`
+directly, which a naive text search flagged as a false positive on the
+first attempt) -- fails if any decision-point module ever references
+`config.USE_SYSTEM_ONE`/`SYSTEM_ONE_PROVIDER`/`SystemOneProvider`
+directly instead of going through `decisions.get_backend()`, and a
+second test confirms the check isn't vacuous (dispatch.py itself must
+still reference them).
+
+**Full regression check**: 396 passed, 5 skipped (pre-existing,
+unrelated -- a real `frontier.db` fixture's `discovery_edges` schema
+predates that table, same finding as every previous session this
+checkout has seen), 1 failed (the same pre-existing, unrelated
+`edges_tracked` assertion against that same old fixture -- not caused by
+this change, confirmed by checking it was already failing before this
+session touched anything).
+
+**Still open, stated plainly rather than left implicit**: Step 5 (prove
+it against real Jev/Laya calls) still needs real keys -- nothing in
+steps 2-4 changes that. The 0.7/0.3 System One noul thresholds are a
+reasoned default, not a measured one. `LayaBackend`/`JevBackend`'s
+`choice`/`score` primitives are unimplemented (`NotImplementedError`) --
+no decision point wired up today needs them; add when one does, not
+speculatively. Laya itself is still not installed in this environment.
+
+### 73. Step 5: real three-way comparison run -- Jev matches the known-good 70B answer closely on branch selection, Laya doesn't; both real decision models beat string similarity on dedup's known-hard cases, but not uniformly
+
+**Before any of this ran, two real problems found and fixed:**
+- `pytest` on this machine's PATH resolves to a **global** Python, not
+  this project's `.venv` -- the entire session's prior "all tests pass"
+  claims were against an environment silently missing `laya`/`torch`/
+  `transformers` (once installed) and excluding `test_main_wiring.py`/
+  `test_server_app.py` outright (missing `flask`/`crawl4ai`). Re-run via
+  `uv run python -m unittest discover`, the real environment: 465 tests,
+  460 passed + 5 skipped, 0 failed -- more coverage than anything
+  verified all session, and it caught two tests passing for the wrong
+  reason (see below).
+- **Real secrets were pasted into `.env.example`** (git-tracked, unlike
+  `.env`) -- `NVIDIA_API_KEY`/`OLLAMA_API_KEY` sitting in an uncommitted
+  working-tree diff, one `git add` away from leaking into history.
+  Scrubbed back to empty-value template form immediately, before
+  anything else. Separately, that same `.env` edit **dropped the
+  previously-working `NVIDIA_API_KEY`/`OLLAMA_API_KEY` values** (now
+  empty) -- flagged to the user, not silently worked around; the values
+  themselves were never recoverable (only their lengths had ever been
+  logged, never the actual keys).
+
+**The pre-existing failing test**: fixed at the root cause, not the
+assertion. `data/run/frontier.db` (a real, mutable, non-versioned file)
+had gained a `discovery_edges` table since the test was written --
+`Frontier.open()` runs `CREATE TABLE IF NOT EXISTS` on every open,
+including a later session's read against the same file, so the test's
+hardcoded "this file predates that table" premise was always going to
+rot. Now asserts the actual invariant the code guarantees
+(`edges_tracked == (multi_inbound_link_count is not None)`) instead of a
+frozen historical fact about this one file.
+
+**Laya installed for real** (`uv add laya`) -- numpy confirmed untouched
+(1.26.4) after install, matching the dry-run. This also flipped two
+tests that had been "passing" only because the wrong Python never had
+`laya` at all -- fixed to simulate absence via `sys.modules["laya"] =
+None` / a patched `importlib.util.find_spec`, so they stay meaningful
+regardless of what's actually installed.
+
+**Gemini default was wrong, exactly like NVIDIA's was**: `gemini-2.5-
+flash` (picked from docs, Step 1) 404'd on the very first real call --
+"no longer available to new users... use models/gemini-3.6-flash". That
+model, confirmed via a real successful call, is now the default. Third
+default in this project now proven wrong by an actual call after being
+picked from docs/memory (NVIDIA's was the first, this session's #69) --
+the standing rule holds: only a real call counts as verified.
+
+**Branch selection, three ways, both intents (manim, 16 branches, same
+map used for the known-good 70B run)**. Exact-match rate against
+traditional's already-established-correct decisions:
+- **Jev: 11/16 (intent 1), 16/16 (intent 2) -- 27/32 overall (84%).**
+  Intent 2 ("what changed between versions") is a **perfect** match --
+  every single branch, including six branches Laya confidently got
+  backwards. Intent 1 misses are mostly Jev landing on "uncertain"
+  where 70B confidently selected (`reference/` 0.57, `installation/`
+  0.62, `installation.html` 0.49) -- under-confident, not wrong-signed;
+  the safer kind of miss by this project's own design philosophy (an
+  honest uncertain costs one glance, a wrong guess costs hours).
+- **Laya: 9/16 (intent 1), 2/16 (intent 2) -- 11/32 overall (34%).**
+  Intent 2 is a near-total failure: 13 of 16 branches selected
+  regardless of relevance, `reference/` (0.90) scored *higher* than
+  `changelog/` (0.85) on an intent specifically about changelogs -- no
+  threshold fixes an ordering that's backwards. Matches Laya's own
+  documented Honest Limit #1 (base checkpoints near chance zero-shot on
+  typed decisions) exactly -- a live confirmation, not a surprise.
+  Intent 1 misses split into two kinds: `examples.html` (0.69 vs the
+  0.70 select cutoff) and `changelog.html` (0.32 vs the 0.30 reject
+  cutoff) are genuine threshold artifacts, the raw signal is right;
+  `contributing/` (0.89, should be low) and `installation.html` (0.35,
+  should be high) are not fixable by any threshold -- the model's
+  judgment itself is wrong there, confidently so.
+
+**Dedup, three ways, on the two specific known-hard false positives from
+#40** (SceneInteractRerun/Continue -- structurally parallel classes,
+templated phrasing; Debian/Fedora TeX Live commands -- structurally
+parallel OS instructions), real production classes
+(`TraditionalDedupDecisionBackend`, `JevBackend`, `LayaBackend`):
+
+| Pair | Traditional | Laya | Jev |
+|---|---|---|---|
+| SceneInteract (not-dup) | 0.687 -- **wrong**, flagged | 0.376 -- correct | **0.160** -- correct, most confidently |
+| Debian/Fedora (not-dup) | 0.506 -- **wrong**, flagged | 0.447 -- still wrong, closer | **0.820** -- **wrong, more confidently than traditional** |
+
+Not a clean "System One wins" result, stated honestly: Jev was the best
+performer on SceneInteract and the *worst* on Debian/Fedora -- worse
+than plain string similarity, on the exact kind of case (two real,
+factually-distinct, structurally-parallel technical facts) this
+decision point exists to get right. Two data points isn't enough to
+generalize a cause, but it's enough to say plainly: Jev is not yet a
+safe default for the dedup decision point specifically, even though it
+was the clear best performer on branch selection in the same session.
+Different decision points, different reliability -- worth remembering
+before assuming a model that wins on one judgment task wins on all of
+them.
+
+**Bottom line for `SYSTEM_ONE_PROVIDER` defaults, stated plainly**: on
+this evidence, Jev is a strong candidate for branch selection (84%
+exact match, and its misses are safe ones) but not yet trustworthy for
+dedup. Laya is not yet trustworthy for either, consistent with its own
+documented zero-shot limits -- "a fast base to specialise," not a
+drop-in replacement, exactly as its docs said before any of this ran.
+`config.SYSTEM_ONE_NOUL_SELECT_THRESHOLD`/`_REJECT_THRESHOLD` (0.7/0.3)
+were reasoned defaults, never measured -- this run's Jev intent-1 misses
+(0.57, 0.62, 0.49, all landing in the uncertain band) suggest those
+thresholds are roughly sound for Jev specifically, whereas Laya's
+distribution suggests its own thresholds would need separate
+calibration, not the same numbers reused unchanged.

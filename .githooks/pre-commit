@@ -1,0 +1,41 @@
+#!/bin/sh
+# Blocks a commit that stages .env itself, or that stages any line
+# shaped like a real API key/secret -- the guardrail for the incident in
+# LESSONS_LEARNED.md's Step 5 entry (real NVIDIA/Ollama keys pasted into
+# the git-tracked .env.example, caught only because a human happened to
+# read the diff). tests/test_env_example_no_secrets.py catches the same
+# class of mistake for .env.example specifically, in the normal test
+# suite; this hook is the version that runs on every commit, for every
+# file, before the mistake ever reaches a commit at all.
+#
+# Not installed automatically -- activate once per clone:
+#   git config core.hooksPath .githooks
+
+set -eu
+
+blocked=0
+
+# .env must never be tracked, full stop. .gitignore already keeps it out
+# of a plain `git add .`; this covers `git add -f` too.
+if git diff --cached --name-only | grep -qx '\.env'; then
+    echo "pre-commit: refusing to commit .env -- it must never be tracked." >&2
+    blocked=1
+fi
+
+# Common real-key shapes (NVIDIA's nvapi-..., OpenAI-style sk-...,
+# Google's AIza..., Ollama's id.secret pairing), scanned only in ADDED
+# lines of the staged diff -- so a pattern already present in the repo
+# before this hook existed doesn't retroactively block an unrelated
+# commit; only NEW additions trip it.
+pattern='nvapi-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{32,}\.[A-Za-z0-9_-]{16,}'
+hits=$(git diff --cached -U0 -- . | grep -E '^\+' | grep -vE '^\+\+\+' | grep -Ei "$pattern" || true)
+if [ -n "$hits" ]; then
+    echo "pre-commit: a staged line looks like a real API key/secret:" >&2
+    echo "$hits" | sed 's/^/  /' >&2
+    echo "If this is a false positive, review carefully before committing with --no-verify." >&2
+    blocked=1
+fi
+
+if [ "$blocked" -ne 0 ]; then
+    exit 1
+fi

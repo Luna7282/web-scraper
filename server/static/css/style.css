@@ -283,6 +283,7 @@ pre.report {
 }
 
 .hint { color: var(--stone); font-size: 0.95rem; margin-top: 0.15rem; }
+.decision-mode-jev, .decision-mode-laya { color: var(--gold-dark); font-weight: bold; }
 
 a.back-link { color: var(--link); text-decoration: none; font-size: 1rem; }
 a.back-link:hover { text-decoration: underline; }
@@ -349,6 +350,22 @@ a.back-link:hover { text-decoration: underline; }
 .world-node-root { border-color: var(--gold-dark); box-shadow: 3px 3px 0 var(--gold-dark); cursor: default; }
 .world-node-root:hover { border-color: var(--gold-dark); box-shadow: 3px 3px 0 var(--gold-dark); }
 .node-dead-mark { position: absolute; top: -9px; right: -9px; pointer-events: none; }
+
+/* "Suggest selection (AI)" pre-highlight -- a left-edge stripe, not a
+   border-color override, so it never fights with .selected/.world-node-
+   root's own border-color state; both can be true on the same node at
+   once (a suggested branch you've also clicked into) and both stay
+   visible. Proposal only -- see crawl/branch_select.py -- so this is
+   purely decorative, no click behavior attached. */
+.world-node.suggest-select { border-left: 7px solid var(--green); }
+.world-node.suggest-reject { border-left: 7px solid var(--red); }
+.world-node.suggest-uncertain { border-left: 7px solid var(--amber); }
+
+.suggestion-banner { border: 2px solid var(--ink); border-radius: 6px; padding: 0.5rem 0.6rem; margin: 0 0 0.6rem; }
+.suggestion-banner p { margin: 0.3rem 0 0; font-size: 0.85rem; }
+.suggestion-banner.suggestion-select { background: var(--green); color: var(--parchment); }
+.suggestion-banner.suggestion-reject { background: var(--red); color: var(--parchment); }
+.suggestion-banner.suggestion-uncertain { background: var(--amber); color: var(--ink); }
 
 /* Per-element dim, not a group-wide one -- see map.js's descendInto():
    the promoted node has to stay at full opacity while its old siblings

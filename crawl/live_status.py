@@ -17,6 +17,8 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
+import config
+
 _RECENT_STATUSES = ("done", "failed", "skipped_extract", "skipped_follow", "mapped", "cancelled")
 
 
@@ -79,6 +81,18 @@ def read_live_status(db_path: str, recent_limit: int = 20, in_flight_limit: int 
             "last_change_at": last_change_at,
             "queried_at": now.isoformat(),
             "query_seconds": round(time.perf_counter() - started, 4),
+            # Step 4 traceability: which decision method a crawl started
+            # right now would use. Read from THIS process's own config
+            # (.env), not persisted per-run -- if a --live-status call
+            # runs in an environment whose .env differs from the one the
+            # actual crawl process started with, this can misreport. Real
+            # per-run traceability lives on the pairs themselves
+            # (quality_decision_method in canonical.jsonl) and in each
+            # branch-selection response's decision_method field, both of
+            # which are what the crawl process itself actually used.
+            "decision_mode": (
+                config.SYSTEM_ONE_PROVIDER if config.USE_SYSTEM_ONE else "traditional"
+            ),
         }
     finally:
         conn.close()

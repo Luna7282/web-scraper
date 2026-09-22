@@ -1,3 +1,4 @@
+import importlib.util
 import os
 from enum import Enum
 from pydantic import BaseModel
@@ -53,6 +54,22 @@ EXTRACTION_STRATEGY = ExtractionStrategy.PER_CHUNK
 EXTRACTION_TOP_K = 3
 MAX_EXTRACT_CHARS = 4000  # same conservative bound as relevance.py's MAX_EMBED_CHARS -- one real per_chunk unit (2000 chars) is already well under this
 
+# Sample quality scoring (content/sample_quality.py, crawl/pipeline.py's
+# extract_worker quality_backend param) -- opt-in, off by default (0.0 =
+# every pair kept, same "0 = log-only/off" convention as extract_
+# threshold/follow_threshold). A pair's quality noul value below this is
+# dropped before it's ever written to canonical.jsonl.
+SAMPLE_QUALITY_THRESHOLD = 0.0
+
+class ExtractionPromptVariant(str, Enum):
+    STANDARD = "standard"          # QA_EXTRACTION_SYSTEM_PROMPT -- prose Q&A over any content
+    CODE_FOCUSED = "code_focused"  # CODE_QA_EXTRACTION_SYSTEM_PROMPT -- instruction->code pairs for runnable examples, prose Q&A fallback otherwise
+
+# Kept at STANDARD -- switch per-run once the code-focused variant has been
+# reviewed against real chunks (see LESSONS_LEARNED.md), not as this file's
+# default.
+EXTRACTION_PROMPT_VARIANT = ExtractionPromptVariant.STANDARD
+
 # Network timeouts for the two real HTTP call sites behind asyncio.to_thread
 # in llm_factory.py (LESSONS_LEARNED.md #56, ROADMAP.md #40) -- neither had
 # any timeout at all before this: LocalOllamaEmbeddings' requests.post()
@@ -72,6 +89,13 @@ MAX_EXTRACT_CHARS = 4000  # same conservative bound as relevance.py's MAX_EMBED_
 #   server, not just "slow."
 LLM_EXTRACT_TIMEOUT_SECONDS = 600
 OLLAMA_EMBED_TIMEOUT_SECONDS = 60
+# Jev's own docs: 70-500ms end-to-end observed, "40x-200x faster" than a
+# frontier LLM call. 30s is generous headroom (like OLLAMA_EMBED_TIMEOUT_
+# SECONDS above, not tight) given that profile -- not LLM_EXTRACT_TIMEOUT_
+# SECONDS's 600s, which is sized for a genuinely slow chat completion, a
+# different kind of call entirely. Not yet confirmed against a real call
+# (no TYPESAFE_API_KEY in this environment) -- see SYSTEM_ONE_MODELS.md.
+JEV_TIMEOUT_SECONDS = 30
 
 # Section granularity for canonical records / export-time filenames
 # (sectioning.py) -- how many leading URL path segments count as one
@@ -85,6 +109,7 @@ class LLMProvider(str, Enum):
     NVIDIA = "nvidia"
     OLLAMA = "ollama"
     OLLAMA_CLOUD = "ollama_cloud"
+    GEMINI = "gemini"
 
 # Providers with a working, wired-up embeddings path. OLLAMA_CLOUD is
 # deliberately excluded: verified 2026-08-18 against docs.ollama.com that
@@ -93,6 +118,17 @@ class LLMProvider(str, Enum):
 # embedding models; the embeddings docs page only documents localhost).
 # See LESSONS_LEARNED.md #7. Do not route embeddings through OLLAMA_CLOUD --
 # there is nothing at the other end to answer that request.
+#
+# GEMINI is ALSO deliberately excluded here despite actually having a real,
+# working, free-tier embeddings endpoint (gemini-embedding-2, via the same
+# OpenAI-compat /v1/embeddings path used for chat -- see
+# SYSTEM_ONE_MODELS.md's Gemini section). get_llm() below hardcodes
+# LocalOllamaEmbeddings for every provider regardless of this set, so
+# nothing currently reads this set to make an embeddings-routing decision
+# -- it's a documentation-only record of "could this provider serve
+# embeddings," not live logic. Not wired up on purpose: switching the
+# embeddings path is a separate decision from adding Gemini as a chat
+# provider, not bundled into it here.
 EMBEDDING_CAPABLE_PROVIDERS = {
     LLMProvider.OPENAI,
     LLMProvider.NVIDIA,
@@ -136,9 +172,89 @@ def get_llm_config(provider: LLMProvider) -> LLMConfig:
             base_url="https://ollama.com/v1",
             api_key=os.getenv("OLLAMA_API_KEY")
         )
+    elif provider == LLMProvider.GEMINI:
+        # OpenAI-compat endpoint confirmed against ai.google.dev/gemini-api/
+        # docs/openai (2026-09-22) -- see SYSTEM_ONE_MODELS.md. Chat only
+        # here; embeddings deliberately not wired despite Gemini having a
+        # working one (see EMBEDDING_CAPABLE_PROVIDERS above).
+        return LLMConfig(
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=os.getenv("GEMINI_API_KEY")
+        )
     raise ValueError(f"Unsupported provider: {provider}")
 
 class OutputPreferences(BaseModel):
     unified_jsonl: bool = False
     split_jsonl: bool = False
     build_rag: bool = False
+
+# ---------------------------------------------------------------------------
+# System One decision models (Jev/Laya) -- switchable alternative to the
+# traditional LLM-call-based decision at every judgment point in the
+# pipeline (branch selection, relevance gate, semantic dedup, sample
+# quality scoring). See SYSTEM_ONE_MODELS.md for what each provider
+# actually is; this is config only -- the decision interface itself and
+# its wiring into call sites is separate follow-on work (not built by this
+# change). Traditional stays the default and must keep working exactly as
+# today regardless of anything below.
+class SystemOneProvider(str, Enum):
+    JEV = "jev"
+    LAYA = "laya"
+
+# false (default): every decision point uses the current (traditional)
+# method. true: every decision point uses SYSTEM_ONE_PROVIDER instead.
+# This is a single global switch, not per-decision-point, matching the
+# instruction that traditional-vs-System-One is one setting applied
+# everywhere, not a per-call-site knob.
+USE_SYSTEM_ONE = os.getenv("USE_SYSTEM_ONE", "false").strip().lower() == "true"
+
+# Only meaningful (and only validated) when USE_SYSTEM_ONE is true.
+SYSTEM_ONE_PROVIDER = os.getenv("SYSTEM_ONE_PROVIDER")
+
+# A noul answer (P(true), 0.0-1.0) collapses to a 3-way select/reject/
+# uncertain decision (branch selection) via these thresholds -- symmetric
+# around 0.5, picked so the traditional backend's own exact-1.0/0.0/0.5
+# encoding (see crawl/branch_select.py's TraditionalBranchDecisionBackend)
+# round-trips to identical select/reject/uncertain output as before this
+# interface existed: 1.0 >= 0.7 -> select, 0.0 <= 0.3 -> reject, 0.5 falls
+# in neither band -> uncertain. Not yet tuned against a real Jev/Laya
+# probability distribution (no live calls made yet) -- revisit once Step
+# 5's real comparison data exists.
+SYSTEM_ONE_NOUL_SELECT_THRESHOLD = 0.7
+SYSTEM_ONE_NOUL_REJECT_THRESHOLD = 0.3
+
+
+class SystemOneConfigError(Exception):
+    pass
+
+
+def validate_system_one_config() -> None:
+    """Fails loudly at startup -- not on the first decision an hour into a
+    crawl, which is what happens if this is left to whatever call site
+    happens to hit a misconfigured decision first. Pure/offline: checks
+    the SHAPE of what's configured (provider name valid, required key
+    present, required package importable) -- never makes a network call,
+    so it can't itself be slow or flaky. Call this from any entry point
+    that actually makes decisions (main(), headless_crawl(),
+    suggest_selection_command() today) before doing real work; read-only
+    commands (--graph, --live-status, --cancel, etc.) never call it, since
+    they never reach a decision point regardless of this config.
+    """
+    if not USE_SYSTEM_ONE:
+        return
+    valid_providers = {p.value for p in SystemOneProvider}
+    if SYSTEM_ONE_PROVIDER not in valid_providers:
+        raise SystemOneConfigError(
+            f"USE_SYSTEM_ONE=true requires SYSTEM_ONE_PROVIDER to be one of "
+            f"{sorted(valid_providers)}, got {SYSTEM_ONE_PROVIDER!r}."
+        )
+    if SYSTEM_ONE_PROVIDER == SystemOneProvider.JEV.value and not os.getenv("TYPESAFE_API_KEY"):
+        raise SystemOneConfigError(
+            "SYSTEM_ONE_PROVIDER=jev requires TYPESAFE_API_KEY to be set (see .env.example)."
+        )
+    if SYSTEM_ONE_PROVIDER == SystemOneProvider.LAYA.value and importlib.util.find_spec("laya") is None:
+        raise SystemOneConfigError(
+            "SYSTEM_ONE_PROVIDER=laya requires the 'laya' package, which is not "
+            "installed. See SYSTEM_ONE_MODELS.md before installing it -- torch/"
+            "transformers may conflict with this project's numpy<2 pin."
+        )

@@ -20,8 +20,10 @@ from crawl.scope import normalize_url, derive_prefix, is_in_scope
 from crawl.frontier import Frontier
 from crawl.pipeline import crawl_worker, extract_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError
 from crawl.politeness import HostPoliteness
-from content.extraction import QA_EXTRACTION_SYSTEM_PROMPT
+from content.extraction import QA_EXTRACTION_SYSTEM_PROMPT, CODE_QA_EXTRACTION_SYSTEM_PROMPT
+from crawl.branch_select import suggest_branch_selection, BRANCH_CLASSIFICATION_SYSTEM_PROMPT
 from content.relevance import make_score_fn
+from content.sample_quality import make_quality_backend
 from crawl.robots_cache import RobotsCache
 from crawl.graph import discovery_graph, path_tree, to_json
 from crawl.live_status import read_live_status
@@ -150,12 +152,53 @@ async def discover_command(root_url: str) -> dict:
     return result
 
 
+_DEFAULT_MODEL_BY_PROVIDER = {
+    # nvidia: "meta/llama3-70b-instruct" 404'd -- removed from NVIDIA's
+    # catalog (confirmed via GET /v1/models, 2026-08-25). Replaced with
+    # meta/llama-3.3-70b-instruct, verified against 4 real chat-completion
+    # calls the same day (see LESSONS_LEARNED.md), not just a models-list
+    # check -- a model can be listed and still not actually serve.
+    "nvidia": "meta/llama-3.3-70b-instruct",
+    # ollama (local): "llama3" -- confirmed resolvable in Ollama's public
+    # registry (200) but that's a different claim than "present on this
+    # machine," and --verify-providers proved the gap: real call, 404
+    # "model 'llama3' not found" (2026-09-22) -- it was never pulled
+    # here. Unlike a hosted API's catalog, "ollama" is inherently
+    # machine-dependent -- no hardcoded default can be universally right
+    # -- but a default that's never actually been reachable on the
+    # machine it was tested from is exactly the failure --verify-
+    # providers exists to catch. Replaced with "llama3.2", confirmed
+    # present (ollama list) and already used successfully this session.
+    "ollama": "llama3.2",
+    # ollama_cloud: "deepseek-v4-flash" was confirmed working 2026-08-18
+    # (LESSONS_LEARNED.md #10-11) but as of 2026-08-25 returns 403 "this
+    # model requires a subscription" on this account -- NOT verified to
+    # still be a safe default, and NOT replaced, because every other
+    # model tried on this account (gpt-oss:20b/120b, nemotron-3-nano:30b)
+    # 403's with "payment past due" -- an account billing issue, not a
+    # model-catalog one, so there's currently no way to verify a working
+    # replacement. See LESSONS_LEARNED.md before assuming this default
+    # works; resolve billing first, then re-verify.
+    "ollama_cloud": "deepseek-v4-flash",
+    # openai: not verified live (no OPENAI_API_KEY in this environment)
+    # -- not known-deprecated, but unverified is not the same as verified.
+    "openai": "gpt-4o-mini",
+    # gemini: "gemini-2.5-flash" (picked from docs, never live-verified)
+    # 404'd the moment it was actually called (2026-09-22) -- the API's own
+    # error message: "no longer available to new users... use models/
+    # gemini-3.6-flash". Replaced with that, confirmed via a real
+    # successful chat-completion call the same day. Third default in this
+    # file now proven wrong by an actual call after being picked from
+    # docs/memory (nvidia's was the first, see above) -- reinforces: only
+    # "confirmed via a real call" counts as verified here, docs-checked
+    # is not enough.
+    "gemini": "gemini-3.6-flash",
+}
+
+
 def _resolve_llm(cfg: dict):
     provider_name = cfg.get("provider", "openai")
-    model_name = cfg.get("model") or {
-        "nvidia": "meta/llama3-70b-instruct", "ollama": "llama3",
-        "ollama_cloud": "deepseek-v4-flash", "openai": "gpt-4o-mini",
-    }[provider_name]
+    model_name = cfg.get("model") or _DEFAULT_MODEL_BY_PROVIDER[provider_name]
     llm, embeddings = get_llm(provider_name, model_name)
     return provider_name, model_name, llm, embeddings
 
@@ -217,6 +260,7 @@ async def headless_crawl(cfg: dict) -> dict:
     headless_map's docstring for the seeds/host_prefix_pairs contract and
     why this is always subprocess-launched, never called in-process by
     the server."""
+    config.validate_system_one_config()
     run_dir = cfg["run_dir"]
     os.makedirs(run_dir, exist_ok=True)
     db_path = os.path.join(run_dir, "frontier.db")
@@ -236,12 +280,15 @@ async def headless_crawl(cfg: dict) -> dict:
 
     embed_fn = _make_embed_fn(embeddings)
     intent_embedding = await embed_fn(intent) if intent else None
-    score_fn = make_score_fn(intent_embedding, embed_fn)
+    score_fn = make_score_fn(intent, intent_embedding, embed_fn)
     extract_fn = _make_extract_fn(llm)
     extraction_units_fn = make_extraction_units_fn(
         config.EXTRACTION_STRATEGY, embed_fn=embed_fn, intent_embedding=intent_embedding,
     )
     robots_cache = RobotsCache(_http_get_text)
+
+    quality_backend = make_quality_backend(_make_decision_chat_fn(llm)) if cfg.get("enable_quality_scoring") else None
+    quality_threshold = cfg.get("quality_threshold", config.SAMPLE_QUALITY_THRESHOLD)
 
     chunk_fn = None
     chroma_upsert_fn = None
@@ -289,7 +336,8 @@ async def headless_crawl(cfg: dict) -> dict:
                                 cfg.get("extract_threshold", 0.0), cfg.get("follow_threshold", 0.0),
                                 chunk_fn=chunk_fn, extraction_units_fn=extraction_units_fn,
                                 generation_model=model_name, extraction_strategy=config.EXTRACTION_STRATEGY.value,
-                                section_depth=config.SECTION_DEPTH, seed_prefixes=host_prefix_pairs)
+                                section_depth=config.SECTION_DEPTH, seed_prefixes=host_prefix_pairs,
+                                quality_backend=quality_backend, quality_threshold=quality_threshold)
             )
             for _ in range(extract_workers_n)
         ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
@@ -495,11 +543,72 @@ def graph_command(db_path: str, graph_type: str, root: str | None, max_depth: in
         print(payload)
 
 
+async def suggest_selection_command(
+    db_path: str, intent: str, provider: str, model: str | None, root_prefix: str | None, max_samples: int,
+):
+    """After a --map run, classify each discovered branch against `intent`
+    -- one LLM call, prints JSON, proposes only. Nothing here selects
+    anything; the printed prefixes are what you'd pass to --select-prefix
+    yourself once you've read the reasons. See crawl/branch_select.py."""
+    config.validate_system_one_config()
+    if not os.path.exists(db_path):
+        console.print(f"[red]No frontier DB found at {db_path}[/red]")
+        sys.exit(1)
+    projection = path_tree(db_path, root_prefix=root_prefix)
+    model_name = model or _DEFAULT_MODEL_BY_PROVIDER[provider]
+    llm, _ = get_llm(provider, model_name)
+    classify_fn = _make_classify_fn(llm)
+    branches = await suggest_branch_selection(projection["tree"], intent, classify_fn, max_samples=max_samples)
+    print(json.dumps({"intent": intent, "provider": provider, "model": model_name, "branches": branches}, indent=2))
+
+
 def live_status_command(db_path: str):
     if not os.path.exists(db_path):
         console.print(f"[red]No frontier DB found at {db_path}[/red]")
         sys.exit(1)
     print(json.dumps(read_live_status(db_path), indent=2))
+
+
+async def verify_providers_command():
+    """Pings every LLMProvider's default model (config._DEFAULT_MODEL_BY_
+    PROVIDER) with a minimal real chat completion, one call each, and
+    reports which actually respond -- the check that would have caught
+    all three defaults this project has picked from docs and had proven
+    wrong by an actual call (nvidia's 404, ollama_cloud's 403 subscription
+    gate, gemini's 404 -- see LESSONS_LEARNED.md). A provider whose
+    required key isn't set in .env is skipped, not silently treated as
+    passing -- "not tested" and "tested and works" are different claims,
+    and this command is careful never to conflate them. ollama (local)
+    needs no key and is always attempted. No crawl, no site touched --
+    every call is a one-line ping to the provider's own chat endpoint."""
+    console.print(Panel.fit("[bold blue]Verifying every configured provider's default model[/bold blue]"))
+    rows = []
+    for provider in config.LLMProvider:
+        provider_name = provider.value
+        model_name = _DEFAULT_MODEL_BY_PROVIDER[provider_name]
+        llm_config = config.get_llm_config(provider)
+        needs_key = provider != config.LLMProvider.OLLAMA
+        if needs_key and not llm_config.api_key:
+            rows.append((provider_name, model_name, "[yellow]skipped[/yellow]", "no API key set in .env"))
+            continue
+        try:
+            llm, _ = get_llm(provider_name, model_name)
+            response = await asyncio.to_thread(
+                llm.invoke, [SystemMessage(content="Reply with exactly: OK"), HumanMessage(content="ping")],
+            )
+            rows.append((provider_name, model_name, "[green]responds[/green]", repr(response.content[:60])))
+        except Exception as e:
+            rows.append((provider_name, model_name, "[red]FAILED[/red]", f"{type(e).__name__}: {str(e)[:180]}"))
+
+    table = Table(title="Provider verification")
+    table.add_column("provider")
+    table.add_column("default model")
+    table.add_column("status")
+    table.add_column("detail")
+    for provider_name, model_name, status, detail in rows:
+        table.add_row(provider_name, model_name, status, detail)
+    console.print(table)
+    return rows
 
 
 async def score_report_command(db_path: str):
@@ -637,10 +746,18 @@ def _is_rate_limit_exception(e: Exception) -> bool:
     return status == 429
 
 
-def _make_extract_fn(llm):
+_EXTRACTION_SYSTEM_PROMPTS = {
+    config.ExtractionPromptVariant.STANDARD: QA_EXTRACTION_SYSTEM_PROMPT,
+    config.ExtractionPromptVariant.CODE_FOCUSED: CODE_QA_EXTRACTION_SYSTEM_PROMPT,
+}
+
+
+def _make_extract_fn(llm, prompt_variant: "config.ExtractionPromptVariant" = None):
+    system_prompt = _EXTRACTION_SYSTEM_PROMPTS[prompt_variant or config.EXTRACTION_PROMPT_VARIANT]
+
     async def extract_fn(content: str) -> str:
         messages = [
-            SystemMessage(content=QA_EXTRACTION_SYSTEM_PROMPT),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=f"Text to process:\n\n{content[:config.MAX_EXTRACT_CHARS]}"),
         ]
         try:
@@ -653,6 +770,41 @@ def _make_extract_fn(llm):
     return extract_fn
 
 
+def _make_decision_chat_fn(llm):
+    """The (system_prompt, user_prompt) -> text shape decisions.
+    LLMTraditionalBackend needs -- unlike extract_fn/classify_fn, the
+    system prompt isn't fixed at construction time, since this one chat_fn
+    is shared by every decision point that ends up using the generic
+    traditional backend (today: sample quality scoring only -- see
+    content/sample_quality.py)."""
+    async def chat_fn(system_prompt: str, user_prompt: str) -> str:
+        messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+        try:
+            response = await asyncio.to_thread(llm.invoke, messages)
+        except Exception as e:
+            if _is_rate_limit_exception(e):
+                raise RateLimitError() from e
+            raise
+        return response.content
+    return chat_fn
+
+
+def _make_classify_fn(llm):
+    async def classify_fn(prompt: str) -> str:
+        messages = [
+            SystemMessage(content=BRANCH_CLASSIFICATION_SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ]
+        try:
+            response = await asyncio.to_thread(llm.invoke, messages)
+        except Exception as e:
+            if _is_rate_limit_exception(e):
+                raise RateLimitError() from e
+            raise
+        return response.content
+    return classify_fn
+
+
 def _make_scope_check(host_prefix_pairs: list[tuple[str, str | None]]):
     def scope_check(url: str) -> bool:
         return any(
@@ -663,6 +815,7 @@ def _make_scope_check(host_prefix_pairs: list[tuple[str, str | None]]):
 
 
 async def main():
+    config.validate_system_one_config()
     console.print(Panel.fit("[bold blue]Prompt-Steered Crawler[/bold blue]"))
 
     root_url = Prompt.ask("Enter the Root URL to start discovery")
@@ -723,16 +876,11 @@ async def main():
     console.print("2. Ollama (local)")
     console.print("3. Ollama (cloud)")
     console.print("4. OpenAI")
-    llm_choice = Prompt.ask("Choice", choices=["1", "2", "3", "4"], default="4")
-    provider_map = {"1": "nvidia", "2": "ollama", "3": "ollama_cloud", "4": "openai"}
+    console.print("5. Gemini")
+    llm_choice = Prompt.ask("Choice", choices=["1", "2", "3", "4", "5"], default="4")
+    provider_map = {"1": "nvidia", "2": "ollama", "3": "ollama_cloud", "4": "openai", "5": "gemini"}
     provider_name = provider_map[llm_choice]
-    default_models = {
-        "nvidia": "meta/llama3-70b-instruct",
-        "ollama": "llama3",
-        "ollama_cloud": "deepseek-v4-flash",
-        "openai": "gpt-4o-mini",
-    }
-    model_name = Prompt.ask(f"Enter model name for {provider_name}", default=default_models[provider_name])
+    model_name = Prompt.ask(f"Enter model name for {provider_name}", default=_DEFAULT_MODEL_BY_PROVIDER[provider_name])
     llm, embeddings = get_llm(provider_name, model_name)
     console.print(
         "[dim]Embeddings always use local Ollama (nomic-embed-text) regardless of the "
@@ -741,6 +889,15 @@ async def main():
 
     console.print("\n[bold]Output[/bold]")
     build_rag = Confirm.ask("Build Vector RAG index (Chroma)?", default=False)
+    enable_quality_scoring = Confirm.ask(
+        "Score each extracted pair's quality and drop low-quality ones? "
+        "(opt-in -- adds one decision call per pair; traditional path is an LLM call, see SYSTEM_ONE_MODELS.md)",
+        default=False,
+    )
+    quality_threshold = (
+        float(Prompt.ask("Quality threshold (0 = keep everything, log-only)", default="0"))
+        if enable_quality_scoring else config.SAMPLE_QUALITY_THRESHOLD
+    )
     console.print(
         "[dim]split_jsonl (by section) isn't wired into the new pipeline yet -- "
         "unified JSONL only. Old orchestrator.py flow still has it if needed.[/dim]"
@@ -777,11 +934,12 @@ async def main():
 
     embed_fn = _make_embed_fn(embeddings)
     intent_embedding = await embed_fn(intent) if intent else None
-    score_fn = make_score_fn(intent_embedding, embed_fn)
+    score_fn = make_score_fn(intent, intent_embedding, embed_fn)
     extract_fn = _make_extract_fn(llm)
     extraction_units_fn = make_extraction_units_fn(
         config.EXTRACTION_STRATEGY, embed_fn=embed_fn, intent_embedding=intent_embedding,
     )
+    quality_backend = make_quality_backend(_make_decision_chat_fn(llm)) if enable_quality_scoring else None
     robots_cache = RobotsCache(_http_get_text)
 
     chunk_fn = None
@@ -838,7 +996,8 @@ async def main():
                                 generation_model=model_name,
                                 extraction_strategy=config.EXTRACTION_STRATEGY.value,
                                 section_depth=config.SECTION_DEPTH,
-                                seed_prefixes=host_prefix_pairs)
+                                seed_prefixes=host_prefix_pairs,
+                                quality_backend=quality_backend, quality_threshold=quality_threshold)
             )
             for _ in range(extract_workers_n)
         ] + [
@@ -879,6 +1038,14 @@ if __name__ == "__main__":
         metavar="FRONTIER_DB",
         help="Print the relevance score distribution recorded in an existing "
              "frontier DB (from a prior run) -- no crawl, no LLM calls.",
+    )
+    parser.add_argument(
+        "--verify-providers",
+        action="store_true",
+        help="Ping every LLMProvider's default model (one real chat call "
+             "each, only for providers with a key set in .env) and report "
+             "which actually respond -- run this before trusting any "
+             "default picked from docs, not after. No crawl.",
     )
     parser.add_argument(
         "--query",
@@ -986,6 +1153,31 @@ if __name__ == "__main__":
     parser.add_argument("--graph-out", metavar="PATH", default=None,
                          help="Write the JSON here instead of stdout.")
     parser.add_argument(
+        "--suggest-select",
+        metavar="INTENT",
+        help="After a --map run, classify each discovered branch (select/"
+             "reject/uncertain, one reason each) against INTENT -- one "
+             "LLM call, prints JSON. Proposes only: nothing is selected "
+             "until you run --select/--select-prefix yourself. Pairs "
+             "with --suggest-select-db/-root/-provider/-model/-samples.",
+    )
+    parser.add_argument("--suggest-select-db", metavar="FRONTIER_DB", default=FRONTIER_DB_PATH,
+                         help="Frontier DB to read (default: %(default)s).")
+    parser.add_argument(
+        "--suggest-select-root",
+        metavar="PREFIX",
+        default=None,
+        help="Scope to this path prefix instead of auto-detecting the "
+             "crawl's effective root (the first point the site's path "
+             "tree actually forks).",
+    )
+    parser.add_argument("--suggest-select-provider", default="openai",
+                         help="LLM provider for classification (default: %(default)s).")
+    parser.add_argument("--suggest-select-model", default=None,
+                         help="LLM model for classification (default: the provider's usual default).")
+    parser.add_argument("--suggest-select-samples", type=int, default=5,
+                         help="Sample URLs to show the model per branch (default: %(default)s).")
+    parser.add_argument(
         "--live-status",
         action="store_true",
         help="Print one JSON snapshot of a crawl's current state -- counts "
@@ -1063,10 +1255,17 @@ if __name__ == "__main__":
             asyncio.run(select_command(args.select_db, url=args.select, prefix=args.select_prefix))
         elif args.graph:
             graph_command(args.graph_db, args.graph, args.graph_root, args.graph_max_depth, args.graph_out)
+        elif args.suggest_select:
+            asyncio.run(suggest_selection_command(
+                args.suggest_select_db, args.suggest_select, args.suggest_select_provider,
+                args.suggest_select_model, args.suggest_select_root, args.suggest_select_samples,
+            ))
         elif args.live_status:
             live_status_command(args.live_status_db)
         elif args.score_report:
             asyncio.run(score_report_command(args.score_report))
+        elif args.verify_providers:
+            asyncio.run(verify_providers_command())
         elif args.query:
             asyncio.run(query_command(args.query, chroma_dir=args.query_chroma_dir))
         elif args.dataset_report:

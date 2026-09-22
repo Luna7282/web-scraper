@@ -11,6 +11,7 @@ tests use a trivial recrawl_stub for that, rather than a real crawl_worker
 being tested here).
 """
 import asyncio
+import json
 import time
 import unittest
 
@@ -19,6 +20,8 @@ import requests
 
 from crawl.frontier import Frontier
 from crawl.pipeline import extract_worker, RateLimitError, ExtractionResult
+from decisions import DecisionError
+from decisions.types import NoulAnswer
 
 SEED = "https://x.test/a"
 CONTENT = "markdown content"
@@ -61,12 +64,13 @@ class TestExtractWorkerFailureModes(unittest.IsolatedAsyncioTestCase):
         await self.frontier.close()
 
     def _spawn(self, score_fn, extract_fn, extract_threshold=0.5, follow_threshold=0.5,
-               chunk_fn=None, extraction_units_fn=None):
+               chunk_fn=None, extraction_units_fn=None, quality_backend=None, quality_threshold=0.0):
         extract_task = asyncio.create_task(
             extract_worker(
                 self.frontier, self.content_queue, self.results_queue,
                 score_fn, extract_fn, extract_threshold, follow_threshold,
                 chunk_fn=chunk_fn, extraction_units_fn=extraction_units_fn, poll_interval=0.01,
+                quality_backend=quality_backend, quality_threshold=quality_threshold,
             )
         )
         recrawl_task = asyncio.create_task(
@@ -376,6 +380,58 @@ class TestExtractWorkerFailureModes(unittest.IsolatedAsyncioTestCase):
         row = await cur.fetchone()
         self.assertIn("APITimeoutError", row["last_error"])
         self.assertIn("extraction", row["last_error"])
+
+    async def test_quality_backend_drops_pairs_below_threshold(self):
+        async def score_fn(url, content):
+            return 1.0
+
+        async def extract_fn(content):
+            return json.dumps([
+                {"instruction": "Q good", "response": "A good"},
+                {"instruction": "Q bad", "response": "A bad"},
+            ])
+
+        class StubQualityBackend:
+            async def noul(self, state, instructions, criteria=None):
+                value = 0.9 if "good" in state else 0.1
+                return NoulAnswer(value=value, method="jev")
+
+        tasks = self._spawn(score_fn, extract_fn, quality_backend=StubQualityBackend(), quality_threshold=0.5)
+        for _ in range(50):
+            if self.results_queue.qsize() >= 1:
+                break
+            await asyncio.sleep(0.02)
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+        result: ExtractionResult = self.results_queue.get_nowait()
+        self.assertEqual(len(result.qa_pairs), 1)
+        self.assertEqual(result.qa_pairs[0]["question"], "Q good")
+        self.assertAlmostEqual(result.qa_pairs[0]["quality_score"], 0.9)
+        self.assertEqual(result.qa_pairs[0]["quality_decision_method"], "jev")
+
+    async def test_quality_backend_failure_fails_the_row_not_silently_kept(self):
+        async def score_fn(url, content):
+            return 1.0
+
+        async def extract_fn(content):
+            return json.dumps([{"instruction": "Q", "response": "A"}])
+
+        class FailingQualityBackend:
+            async def noul(self, state, instructions, criteria=None):
+                raise DecisionError("Jev: simulated failure")
+
+        tasks = self._spawn(score_fn, extract_fn, quality_backend=FailingQualityBackend(), quality_threshold=0.5)
+        await run_to_quiescence(tasks, self.frontier)
+
+        counts = await self.frontier.counts_by_status()
+        self.assertEqual(counts.get("failed"), 1)  # loud failure, not a silent keep-the-pair fallback
+        self.assertEqual(self.results_queue.qsize(), 0)
 
 
 if __name__ == "__main__":

@@ -4,11 +4,14 @@ stub embed_fn with deterministic fake vectors. Real semantic behavior
 measured separately against real embeddings, not asserted here -- these
 tests only prove the math and the strategies wire together correctly."""
 import unittest
+from unittest.mock import patch
 
+import config
 from content.relevance import (
     cosine_similarity, extract_headings, chunk_text,
-    score_whole_page, score_headings, score_max_chunk, make_score_fn,
+    score_whole_page, score_headings, score_max_chunk, make_score_fn, gate_state,
 )
+from decisions.types import NoulAnswer
 
 
 class TestCosineSimilarity(unittest.TestCase):
@@ -55,6 +58,20 @@ class TestChunkText(unittest.TestCase):
 
     def test_empty_text_no_chunks(self):
         self.assertEqual(chunk_text(""), [])
+
+    def test_never_splits_inside_a_fenced_code_block(self):
+        code = "```python\n" + "\n".join(f"line_{i} = {i}" for i in range(50)) + "\n```"
+        text = f"intro prose\n\n{code}\n\nmore prose after"
+        # chunk_size smaller than the fenced block forces the overflow path
+        chunks = chunk_text(text, chunk_size=50, chunk_overlap=0)
+        self.assertIn(code, chunks)  # kept whole, not fragmented
+        for chunk in chunks:
+            self.assertEqual(chunk.count("```") % 2, 0, f"unbalanced fence in chunk: {chunk!r}")
+
+    def test_oversized_code_block_overflows_rather_than_splitting(self):
+        code = "```\n" + ("x" * 500) + "\n```"
+        chunks = chunk_text(code, chunk_size=100, chunk_overlap=0)
+        self.assertEqual(chunks, [code])
 
 
 def make_stub_embed_fn(vectors: dict[str, list[float]], default=None):
@@ -136,15 +153,46 @@ class TestMakeScoreFn(unittest.IsolatedAsyncioTestCase):
         async def embed_fn(text):
             raise AssertionError("embed_fn must never be called when intent_embedding is None")
 
-        score_fn = make_score_fn(None, embed_fn)
+        score_fn = make_score_fn(None, None, embed_fn)
         score = await score_fn("https://x.com", "any content")
         self.assertGreaterEqual(score, 1.0)  # above any threshold in (0, 1]
 
     async def test_with_intent_delegates_to_score_headings(self):
         embed_fn = make_stub_embed_fn({"# Match": [1.0, 0.0]}, default=[0.0, 1.0])
-        score_fn = make_score_fn([1.0, 0.0], embed_fn)
+        score_fn = make_score_fn("find the match", [1.0, 0.0], embed_fn)
         score = await score_fn("https://x.com", "# Match\n\nbody text")
         self.assertAlmostEqual(score, 1.0)
+
+
+class TestGateState(unittest.TestCase):
+    def test_uses_headings_when_present(self):
+        self.assertEqual(gate_state("# Title\n\nbody\n\n## Sub"), "# Title\n## Sub")
+
+    def test_falls_back_to_content_when_no_headings(self):
+        self.assertEqual(gate_state("just prose, no headings"), "just prose, no headings")
+
+
+class TestMakeScoreFnSystemOne(unittest.IsolatedAsyncioTestCase):
+    """USE_SYSTEM_ONE=true routes the relevance gate through
+    decisions.get_backend() instead of embedding cosine similarity
+    directly -- content/relevance.py itself never reads config.USE_SYSTEM_ONE."""
+
+    async def test_system_one_backend_answers_the_gate_not_embed_fn(self):
+        async def embed_fn(text):
+            raise AssertionError("embed_fn must not be called when a System One backend is active")
+
+        async def fake_noul(state, instructions, criteria=None):
+            self.assertIn("relevant", instructions)
+            return NoulAnswer(value=0.42, method="jev")
+
+        stub_backend = type("StubBackend", (), {"noul": staticmethod(fake_noul)})()
+
+        with patch.object(config, "USE_SYSTEM_ONE", True), \
+             patch("content.relevance.get_backend", return_value=stub_backend):
+            score_fn = make_score_fn("find X", [1.0, 0.0], embed_fn)
+            score = await score_fn("https://x.com", "# Heading\n\nbody")
+
+        self.assertEqual(score, 0.42)
 
 
 if __name__ == "__main__":

@@ -55,6 +55,7 @@ const Api = {
   },
 
   liveStatus: (runId) => request("GET", `/runs/${encodeURIComponent(runId)}/live-status`),
+  suggestSelection: (runId, params) => request("POST", `/runs/${encodeURIComponent(runId)}/suggest-selection`, params),
   datasetReport: (runId) => request("GET", `/runs/${encodeURIComponent(runId)}/dataset-report`),
   query: (runId, question) => request("POST", `/runs/${encodeURIComponent(runId)}/query`, { question }),
 

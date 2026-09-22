@@ -909,6 +909,38 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     each new `start()` call instead of always appending, if a clean
     per-launch log is worth losing the continuous history for.
 
+46. **LLM-assisted branch selection (`crawl/branch_select.py`) has only a
+    URL slug of signal for a single-page branch, and that's thin.**
+    `extract_branches()`'s `sample_urls` are the entire signal the
+    classification prompt gets per branch; for a docs site, a directory
+    branch's 3-5 real URLs reveal an actual pattern (`reference/Foo.html`,
+    `reference/Bar.html`, ...). For a flat site (a blog), the branch *is*
+    one post, so "sample_urls" degenerates to the same one URL the
+    `prefix` already is -- no additional signal at all. Confirmed against
+    a real test (2026-08-25, `LESSONS_LEARNED.md`): classifying
+    blog.cloudflare.com's individual-post branches against a broad intent
+    ("how to use Cloudflare products and APIs") selected 18/20 sampled
+    posts with generic reasoning ("could contain relevant information"),
+    versus a narrow intent ("security research...") which stayed
+    plausible throughout -- the same model, same branches, same code,
+    worse result purely because the intent was broad enough that a bare
+    slug couldn't discriminate. This is a data-availability gap, not a
+    prompt-quality one.
+    *Fix (proposed, not built)*: store `page_title` on the frontier row
+    during `map_worker`'s fetch -- the map already fetches and parses
+    every page for link discovery, so the `<title>`/first-heading text is
+    already in hand and free to keep; only the fetch itself is billed,
+    not this. `extract_branches()` would then report a real title
+    alongside each sample URL for a single-page branch, giving the
+    classification prompt "Detecting CGN to Reduce Collateral Damage"
+    instead of just `/detecting-cgn-to-reduce-collateral-damage` to
+    reason from. Needs a `frontier` schema column (additive, like
+    `discovery_edges` was) and a small `map_worker` change to populate
+    it; `crawl/branch_select.py`'s prompt-building already accepts
+    whatever fields are in a branch dict, so the classification side
+    barely changes. **Size: S/M** (schema column + populate it + thread
+    the field through `extract_branches`/the prompt).
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

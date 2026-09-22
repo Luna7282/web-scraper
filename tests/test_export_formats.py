@@ -1,7 +1,10 @@
 """Offline tests for export_formats.py -- pure functions, synthetic
 canonical records, no I/O."""
 import unittest
+from unittest.mock import patch
 
+import config
+from decisions.types import NoulAnswer
 from export.export_formats import (
     dedup_by_question,
     mine_triplets,
@@ -222,6 +225,52 @@ class TestSchemaProjections(unittest.TestCase):
     def test_vertex_uses_model_role_not_assistant(self):
         out = to_vertex(self.r)
         self.assertEqual(out["contents"][1]["role"], "model")
+
+
+class TestSemanticDedupSystemOne(unittest.TestCase):
+    """USE_SYSTEM_ONE=true routes semantic dedup's actual duplicate
+    judgment through decisions.get_backend() instead of SequenceMatcher
+    directly -- find_near_duplicates()'s cheap prefilter still narrows
+    which pairs get asked about."""
+
+    def test_system_one_backend_can_overturn_the_prefilter(self):
+        records = [
+            _record(source_url="https://x.com/a", question="Q1", answer="Scene is the base class."),
+            _record(source_url="https://x.com/a", question="Q2", answer="Scene is the animation root class."),
+        ]
+
+        async def fake_noul_many(items):
+            # backend disagrees with the string-similarity prefilter --
+            # judges these as NOT duplicates (low value).
+            return {key: NoulAnswer(value=0.1, method="jev") for key in items}
+
+        stub_backend = type("StubBackend", (), {"noul_many": staticmethod(fake_noul_many)})()
+
+        with patch.object(config, "USE_SYSTEM_ONE", True), \
+             patch("export.export_formats.get_backend", return_value=stub_backend):
+            deduped, dropped = semantic_dedup(records, threshold=0.5)
+
+        self.assertEqual(len(deduped), 2)  # nothing dropped -- backend said not-duplicate
+        self.assertEqual(dropped, [])
+
+    def test_system_one_backend_confirms_and_records_method(self):
+        records = [
+            _record(source_url="https://x.com/a", question="Q1", answer="Scene is the base class."),
+            _record(source_url="https://x.com/a", question="Q2", answer="Scene is the animation root class."),
+        ]
+
+        async def fake_noul_many(items):
+            return {key: NoulAnswer(value=0.95, method="laya") for key in items}
+
+        stub_backend = type("StubBackend", (), {"noul_many": staticmethod(fake_noul_many)})()
+
+        with patch.object(config, "USE_SYSTEM_ONE", True), \
+             patch("export.export_formats.get_backend", return_value=stub_backend):
+            deduped, dropped = semantic_dedup(records, threshold=0.5)
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(dropped[0]["_dedup_method"], "laya")
 
 
 class TestRawText(unittest.TestCase):

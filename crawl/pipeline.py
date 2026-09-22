@@ -11,7 +11,10 @@ import asyncio
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
+
+if TYPE_CHECKING:
+    from decisions import DecisionBackend
 
 from storage.canonical import build_canonical_record, detect_license_signal, extract_page_title
 from config import MAX_RETRIES
@@ -175,6 +178,8 @@ async def extract_worker(
     section_depth: int = DEFAULT_SECTION_DEPTH,
     seed_prefixes: list[tuple[str, str | None]] | None = None,
     poll_interval: float = POLL_INTERVAL,
+    quality_backend: DecisionBackend | None = None,
+    quality_threshold: float = 0.0,
 ) -> None:
     while True:
         try:
@@ -233,6 +238,21 @@ async def extract_worker(
                     continue
                 parsed_any_unit = True
                 for pair in pairs:
+                    quality_score, quality_method = None, None
+                    if quality_backend is not None:
+                        # Not caught here -- a DecisionError/RateLimitError
+                        # from this call falls through to the same
+                        # except blocks below that already handle
+                        # extract_fn's failures identically (fail loudly,
+                        # mark_extract_outcome(..., 'failed', reason),
+                        # never a silent fallback to keeping the pair).
+                        answer = await quality_backend.noul(
+                            f"Instruction: {pair['instruction']}\nResponse: {pair['response']}",
+                            "Is this a good instruction-response training pair?",
+                        )
+                        quality_score, quality_method = answer.value, answer.method
+                        if quality_score < quality_threshold:
+                            continue
                     qa_pairs.append(build_canonical_record(
                         question=pair["instruction"], answer=pair["response"],
                         source_chunk=unit, chunk_index=chunk_index, source_url=url, section=section,
@@ -240,6 +260,7 @@ async def extract_worker(
                         extraction_strategy=extraction_strategy,
                         timestamp=timestamp, crawl_date=crawl_date,
                         license_signal=license_signal,
+                        quality_score=quality_score, quality_decision_method=quality_method,
                     ))
         except RateLimitError as e:
             await frontier.mark_extract_outcome(

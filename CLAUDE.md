@@ -272,6 +272,74 @@ way — only cloud's OpenAI-compat path was ever in question. Local
 embeddings staying off the OpenAI-compat wrapper remains the one hard,
 confirmed invariant above.
 
+**Gemini** is a fifth `LLMProvider`, routed through `ChatOpenAI` at
+`https://generativelanguage.googleapis.com/v1beta/openai/` — same shape as
+every other `ChatOpenAI`-backed provider, no new client class. Chat only;
+Gemini does have a working free-tier embeddings endpoint
+(`gemini-embedding-2`) but it's deliberately not wired up — see
+`config.py`'s `EMBEDDING_CAPABLE_PROVIDERS` comment and
+`SYSTEM_ONE_MODELS.md`. Default model (`gemini-2.5-flash`,
+`main.py::_DEFAULT_MODEL_BY_PROVIDER`) is picked from current docs, not
+live-verified — no `GEMINI_API_KEY` in this environment yet.
+
+## System One decision models (`decisions/`) — wired, tested against real calls
+
+`USE_SYSTEM_ONE`/`SYSTEM_ONE_PROVIDER` (`config.py`, `.env.example`)
+switch every judgment point in the pipeline (branch selection, the
+relevance gate, semantic dedup, sample quality scoring) between the
+traditional method and a `decisions.DecisionBackend` — `JevBackend`
+(hosted, `TYPESAFE_API_KEY`) or `LayaBackend` (local, open-weights,
+`uv add laya` — already installed in this environment, numpy<2 confirmed
+unaffected). See `SYSTEM_ONE_MODELS.md` for what Jev/Laya actually are,
+and `LESSONS_LEARNED.md`'s Steps 2-5 entries for the full build and the
+real three-way comparison this recommendation comes from.
+
+**`config.py::validate_system_one_config()`** fails loudly at startup on
+a misconfigured `USE_SYSTEM_ONE=true` (bad/missing provider, missing
+key, missing `laya` package) — wired into every entry point that makes a
+decision (`main()`, `headless_crawl()`, `suggest_selection_command()`).
+**No decision-point module reads `config.USE_SYSTEM_ONE`/
+`SYSTEM_ONE_PROVIDER` directly** — `decisions.get_backend()` is the one
+sanctioned place, enforced by `tests/test_decision_interface_ownership.py`
+(AST-based, fails if a future change bypasses it).
+
+**Recommendation, from a real three-way run (manim, 16 branches, two
+intents, one direct and one inverted — see `LESSONS_LEARNED.md` #73):**
+- **Jev is the recommended `SYSTEM_ONE_PROVIDER` for branch selection** —
+  27/32 exact match against the known-correct traditional (70B) answer
+  across both intents, including a **perfect** 16/16 on the
+  intent-inversion test. Its misses lean toward "uncertain" rather than
+  a wrong-signed answer — the safer failure mode by this project's own
+  design ("Uncertain is a real answer, not a guess").
+- **Laya is not viable zero-shot for branch selection.** 11/32 overall,
+  and the failure on the inverted intent is **structural, not a
+  threshold issue**: it selected 13 of 16 branches regardless of
+  relevance, with an irrelevant branch (`reference/`, 0.90) scoring
+  *higher* than the one actually about the intent (`changelog/`, 0.85).
+  No threshold recovers a backwards ordering — this matches Laya's own
+  documented Honest Limit ("base checkpoints are near chance zero-shot
+  on typed-decisions... treat Laya as a fast base to specialise, not a
+  zero-shot decision engine"), confirmed live, not just assumed from
+  its docs.
+- **Neither is yet recommended for semantic dedup** — on the two
+  known-hard false positives from `LESSONS_LEARNED.md` #40, Jev was the
+  best performer on one case and the *worst* (more confidently wrong
+  than plain string similarity) on the other. Small sample (2 pairs);
+  a wider hand-labeled comparison is tracked as follow-up work, not
+  concluded yet either way.
+- Sample quality scoring: untested against real calls as of this entry
+  — no real call made yet, not assumed to inherit branch selection's
+  result.
+
+**`--verify-providers`** (`main.py`) pings every `LLMProvider`'s default
+model with one real call and reports which respond — run this before
+trusting any default picked from docs, not after. It has already caught
+four wrong defaults this way (nvidia, ollama_cloud, gemini, and
+local-ollama's `llama3` — resolvable in Ollama's public registry but
+never actually pulled on the machine it was tested from); see
+`LESSONS_LEARNED.md` for each. A provider whose key isn't in `.env` is
+reported as `skipped`, never conflated with a pass.
+
 ## Queue architecture invariants
 
 Crawling is a bounded work-queue pipeline (`crawl/frontier.py` + crawl
@@ -605,3 +673,15 @@ extraction, real RAG index, real crash-resume).
 - Append to `LESSONS_LEARNED.md` after every significant session or run:
   what happened, root cause, fix, why it matters. Don't skip this even
   when nothing broke — confirmed non-obvious decisions belong there too.
+- **Never kill processes by a broad filter (name/command-line pattern
+  match) — always by a specific PID you already confirmed you started.**
+  A `Where-Object { $_.CommandLine -like '*server.py*' }`-style filter
+  matches every process fitting that shape, not just the one you meant,
+  and it's exactly this kind of match that once took down `.venv` via
+  `uv sync --active` (see the `uv` workflow section above) and, on a
+  later occasion, killed 8 processes instead of 1 during cleanup —
+  including some that had been running for hours before that session
+  ever started. Both incidents share the same shape: a command scoped by
+  "what it looks like" instead of "what I specifically launched," and
+  both times the damage landed outside the task, not inside it. Capture
+  the exact PID(s) at launch time and kill only those.

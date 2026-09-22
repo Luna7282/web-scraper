@@ -10,11 +10,13 @@ in-memory structures, nothing more.
 """
 from __future__ import annotations
 
+import asyncio
 import random
 from difflib import SequenceMatcher
 from re import sub as _sub
 from typing import Callable
 
+from decisions import DecisionBackend, NoulAnswer, get_backend
 from storage.chunk_store import normalize_chunk_text
 
 DEFAULT_MIN_ANSWER_LENGTH = 20
@@ -33,6 +35,27 @@ ANSWER_NEAR_DUP_THRESHOLD = 0.4
 
 def _normalize_near_dup_text(text: str) -> str:
     return _sub(r"[^a-z0-9 ]", "", (text or "").lower())
+
+
+_PAIR_SEP = "\n\n---\n\n"
+
+
+class TraditionalDedupDecisionBackend(DecisionBackend):
+    """Wraps SequenceMatcher's ratio -- already 0.0-1.0, exactly
+    noul-shaped, no transformation needed -- as a DecisionBackend. `state`
+    is "TEXT_A<sep>TEXT_B", built by semantic_dedup()'s candidate-pair
+    loop; normalizes both sides the same way find_near_duplicates()
+    already does, so traditional's answer for a given pair is identical
+    to what it was before this interface existed."""
+
+    async def noul(
+        self, state: str, instructions: str = "", criteria: dict[str, str] | None = None,
+    ) -> NoulAnswer:
+        text_a, text_b = state.split(_PAIR_SEP, 1)
+        ratio = SequenceMatcher(
+            None, _normalize_near_dup_text(text_a), _normalize_near_dup_text(text_b),
+        ).ratio()
+        return NoulAnswer(value=ratio, method="traditional", raw={"ratio": ratio})
 
 
 def find_near_duplicates(
@@ -151,19 +174,49 @@ def semantic_dedup(
     dry_run=True runs identical detection and collision logic but
     returns every record unchanged in the first slot and the drop
     decisions in the second, so a threshold can be picked from a real
-    report instead of guessed -- see export.py's --semantic-dedup-report."""
-    dups = find_near_duplicates(records, field, threshold)
-    if not dups:
+    report instead of guessed -- see export.py's --semantic-dedup-report.
+
+    Decision method resolved via decisions.get_backend() -- this module
+    never reads config.USE_SYSTEM_ONE/SYSTEM_ONE_PROVIDER itself (see
+    tests/test_decision_interface_ownership.py). find_near_duplicates()
+    (the O(n^2), quick_ratio-prefiltered scan) still runs first and is
+    unchanged -- it's cheap candidate-finding, not itself the decision;
+    only the CANDIDATE pairs it returns get a real noul() call, which
+    keeps System One's per-pair cost bounded the same way the prefilter
+    already bounds the traditional path's cost. This function stays a
+    plain sync function (export_formats.py's own "nothing here touches
+    the network" design) by wrapping the one async backend call in
+    asyncio.run() -- export.py's whole call chain is sync end to end, so
+    this never runs inside an already-active event loop.
+    """
+    candidates = find_near_duplicates(records, field, threshold)
+    if not candidates:
         return records, []
 
+    traditional = TraditionalDedupDecisionBackend()
+    backend = get_backend(traditional)
+    items = {
+        f"{i}:{j}": (
+            f"{records[i].get(field, '')}{_PAIR_SEP}{records[j].get(field, '')}",
+            "Are these two answers near-duplicates of each other -- do they say "
+            "essentially the same thing, even if worded differently?",
+            None,
+        )
+        for i, j, _ in candidates
+    }
+    answers = asyncio.run(backend.noul_many(items))
+
     drop_reasons: dict[int, dict] = {}
-    for i, j, ratio in dups:
+    for i, j, _prefilter_ratio in candidates:
+        answer = answers[f"{i}:{j}"]
+        if answer.value < threshold:
+            continue  # backend disagreed with the cheap quick_ratio prefilter -- not a duplicate after all
         len_i = len((records[i].get(field) or ""))
         len_j = len((records[j].get(field) or ""))
         winner, loser = (i, j) if len_i >= len_j else (j, i)
         existing = drop_reasons.get(loser)
-        if existing is None or ratio > existing["ratio"]:
-            drop_reasons[loser] = {"winner": winner, "ratio": ratio}
+        if existing is None or answer.value > existing["ratio"]:
+            drop_reasons[loser] = {"winner": winner, "ratio": answer.value, "method": answer.method}
 
     dropped = [
         {
@@ -171,6 +224,7 @@ def semantic_dedup(
             "_dedup_reason": "semantic_near_duplicate",
             "_dedup_ratio": round(info["ratio"], 3),
             "_dedup_survivor_question": records[info["winner"]].get("question"),
+            "_dedup_method": info["method"],
         }
         for loser, info in drop_reasons.items()
     ]

@@ -34,6 +34,8 @@ const state = {
   pollTimer: null,
   activityLog: [],
   seenLogKeys: new Set(),
+  suggestions: null,      // null, or {path: {decision, reason, prefix, page_count, sample_urls}} from the last "Suggest selection (AI)" call
+  suggestMessage: null,
   camera: { panX: 0, panY: 0, zoom: 1 },
   levels: [],            // stack of at most 2 built levels: [dimmed-parent?, current]
   panelPositions: {},
@@ -550,6 +552,25 @@ function updateNodeVisuals(el, region) {
   }
 }
 
+// Pre-highlight from the last "Suggest selection (AI)" call -- decorative
+// only, never touches state.selected or fires a request. Keyed by
+// region.path, which is the same path_tree node.path the server's
+// suggest-selection response calls "prefix" (both come from the same
+// path_tree projection), so a straight lookup is enough -- no fuzzy
+// matching needed.
+function applySuggestionHighlight(item) {
+  if (!item || !item.el) return;
+  item.el.classList.remove("suggest-select", "suggest-reject", "suggest-uncertain");
+  const s = state.suggestions && item.region && item.region.path ? state.suggestions[item.region.path] : null;
+  if (s) item.el.classList.add(`suggest-${s.decision}`);
+}
+
+function applySuggestionHighlights(level) {
+  if (!level) return;
+  applySuggestionHighlight(level.rootItem);
+  for (const it of level.childItems || []) applySuggestionHighlight(it);
+}
+
 function renderDeadMarkIcon() {
   const svg = svgEl("svg", { class: "dead-mark", viewBox: "-6 -6 12 12", width: 22, height: 22 });
   const s = 3;
@@ -749,6 +770,7 @@ async function buildLevelForRoot(rootItem, animateEntry) {
   level.childItems = items;
   level.edgePaths = edgePaths;
   level.svg = svg;
+  applySuggestionHighlights(level);
   return level;
 }
 
@@ -1135,9 +1157,49 @@ function renderControlsPanel() {
     "Same-site only (shuts cross-host gates)",
   ]));
 
+  if (state.mode === "path-tree") {
+    body.appendChild(h("div", { class: "btn-row" }, [
+      h("button", { class: "secondary", text: "Suggest selection (AI)", onclick: suggestSelectionFlow }),
+    ]));
+    if (state.suggestMessage) body.appendChild(h("p", { class: "hint", text: state.suggestMessage }));
+  }
+
   if (state.run.job_state) {
     body.appendChild(h("div", { class: "btn-row" }, controlButtons()));
   }
+}
+
+// Proposes only -- fills state.suggestions and pre-highlights matching
+// world-nodes (applySuggestionHighlights); does not call Api.select or
+// Api.cancel itself. Always classifies from the tree's true effective
+// root (same one --suggest-select auto-detects server-side), regardless
+// of which level the user is currently zoomed into -- suggestMessage
+// says so when that means "zoom out to see them".
+async function suggestSelectionFlow() {
+  const intent = prompt("Intent for branch selection (e.g. \"how do I use this library\"):", state.lastSuggestIntent || "");
+  if (!intent) return;
+  state.lastSuggestIntent = intent;
+  state.suggestMessage = "Classifying branches with an LLM…";
+  renderControlsPanel();
+  try {
+    const result = await Api.suggestSelection(state.runId, { intent });
+    state.suggestions = {};
+    const counts = { select: 0, reject: 0, uncertain: 0 };
+    for (const b of result.branches) {
+      state.suggestions[b.prefix] = b;
+      counts[b.decision] = (counts[b.decision] || 0) + 1;
+    }
+    state.suggestMessage = `${result.branches.length} branch(es): ${counts.select} select, `
+      + `${counts.reject} reject, ${counts.uncertain} uncertain. Nothing is selected yet -- `
+      + `zoom to the top level to see them highlighted, click a node for the reason, then use `
+      + `"Select for extraction" yourself.`;
+    for (const lvl of state.levels) applySuggestionHighlights(lvl);
+    if (state.selected) renderDetailPanel();
+  } catch (err) {
+    state.suggestMessage = null;
+    alert((err.message || err) + (err.detail ? "\n" + err.detail : ""));
+  }
+  renderControlsPanel();
 }
 
 function radioGroup(name, options, current, onChange) {
@@ -1193,6 +1255,18 @@ function renderStatsPanel() {
   body.appendChild(chips);
   const activeN = state.liveStatus ? (state.liveStatus.in_flight || []).length : 0;
   body.appendChild(h("div", { class: "hint", text: `Active fetches: ${activeN}`, style: "margin-top:0.4rem" }));
+
+  // Step 4 traceability: which decision method (traditional/jev/laya) a
+  // crawl started right now would use -- read live-status's own report,
+  // never inferred client-side. See crawl/live_status.py's decision_mode
+  // caveat: this reflects the polling process's own .env, not
+  // necessarily the exact env the crawl itself started under.
+  const mode = state.liveStatus && state.liveStatus.decision_mode;
+  if (mode) {
+    body.appendChild(h("div", { class: `hint decision-mode-${mode}`, style: "margin-top:0.2rem" }, [
+      "Decision mode: ", h("b", { text: mode }),
+    ]));
+  }
 }
 
 function renderActivityPanel() {
@@ -1270,6 +1344,14 @@ function renderDetailPanel() {
 
   if (state.lastActionMessage) body.appendChild(h("p", { class: "hint", text: `✓ ${state.lastActionMessage}` }));
   body.appendChild(h("h3", { text: sel.label }));
+
+  const suggestion = state.suggestions && sel.path ? state.suggestions[sel.path] : null;
+  if (suggestion) {
+    body.appendChild(h("div", { class: `suggestion-banner suggestion-${suggestion.decision}` }, [
+      h("b", { text: `AI suggests: ${suggestion.decision.toUpperCase()}` }),
+      h("p", { text: suggestion.reason }),
+    ]));
+  }
   const dl = h("dl", {});
   if (sel.url) {
     dl.appendChild(h("dt", { text: "URL" }));

@@ -20,6 +20,7 @@ CANONICAL_FIELDS = (
     "question", "answer", "source_chunk", "chunk_index", "source_url", "section",
     "page_title", "generation_model", "extraction_strategy",
     "timestamp", "crawl_date", "license_signal",
+    "quality_score", "quality_decision_method",
 )
 
 
@@ -37,6 +38,8 @@ def build_canonical_record(
     timestamp: str,
     crawl_date: str,
     license_signal: str | None,
+    quality_score: float | None = None,
+    quality_decision_method: str | None = None,
 ) -> dict:
     return {
         "question": question,
@@ -51,6 +54,13 @@ def build_canonical_record(
         "timestamp": timestamp,
         "crawl_date": crawl_date,
         "license_signal": license_signal,
+        # Step 4 traceability: which decision method (traditional/jev/laya)
+        # judged this pair's quality, and its raw noul value -- None/None
+        # when sample quality scoring wasn't enabled for this run (the
+        # common case today; see content/sample_quality.py -- opt-in, not
+        # a default-on behavior change to every existing crawl).
+        "quality_score": quality_score,
+        "quality_decision_method": quality_decision_method,
     }
 
 

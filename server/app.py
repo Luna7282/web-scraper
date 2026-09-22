@@ -18,6 +18,8 @@ import os
 
 from flask import Flask, jsonify, request, send_from_directory
 
+import config
+
 from crawl.graph import discovery_graph, path_tree
 from crawl.live_status import read_live_status
 from server.jobs import JobManager, JobError, run_bounded
@@ -172,6 +174,8 @@ def create_app() -> Flask:
                 "provider": body.get("provider", "openai"),
                 "model": body.get("model"),
                 "build_rag": bool(body.get("build_rag", False)),
+                "enable_quality_scoring": bool(body.get("enable_quality_scoring", False)),
+                "quality_threshold": body.get("quality_threshold", config.SAMPLE_QUALITY_THRESHOLD),
             })
 
         job = _launch(jobs, run_dir, mode, cfg)
@@ -205,6 +209,7 @@ def create_app() -> Flask:
             for key, default in (
                 ("extract_workers", 2), ("extract_threshold", 0.0), ("follow_threshold", 0.0),
                 ("intent", None), ("provider", "openai"), ("model", None), ("build_rag", False),
+                ("enable_quality_scoring", False), ("quality_threshold", config.SAMPLE_QUALITY_THRESHOLD),
             ):
                 cfg[key] = overrides.get(key, cfg.get(key, default))
         job = _launch(jobs, run_dir, mode, cfg)
@@ -284,6 +289,43 @@ def create_app() -> Flask:
         if result.returncode != 0:
             raise ApiError("select failed", status=502, detail=result.stderr[-2000:])
         return jsonify({"output": result.stdout.strip()})
+
+    @app.post("/runs/<run_id>/suggest-selection")
+    def suggest_selection(run_id):
+        """One LLM call classifying every discovered branch against an
+        intent -- proposes only (see crawl/branch_select.py). Same
+        bounded-subprocess pattern as /query (also LLM-touching, also one
+        call): synchronous, not a tracked background job, since it's one
+        request, not a long-running crawl/export. The timeout has to be
+        the real chat-completion budget (config.LLM_EXTRACT_TIMEOUT_
+        SECONDS, the same one llm_factory.py gives the LLM client itself),
+        not /query's 60s -- confirmed the hard way: a real classification
+        call against a 70B model took ~5 minutes, so 120s timed out this
+        endpoint out from under a call that was still genuinely working."""
+        run_dir = _require_run(run_id)
+        body = _body()
+        intent = body.get("intent")
+        if not intent:
+            raise ApiError("intent is required")
+        db_path = os.path.join(run_dir, "frontier.db")
+        args = [
+            "--suggest-select", intent,
+            "--suggest-select-db", db_path,
+            "--suggest-select-provider", body.get("provider", "openai"),
+        ]
+        if body.get("model"):
+            args += ["--suggest-select-model", body["model"]]
+        if body.get("root"):
+            args += ["--suggest-select-root", body["root"]]
+        if body.get("samples"):
+            args += ["--suggest-select-samples", str(body["samples"])]
+        result = run_bounded([MAIN_PY] + args, timeout=config.LLM_EXTRACT_TIMEOUT_SECONDS + 30)
+        if result.returncode != 0:
+            raise ApiError("suggest-selection failed", status=502, detail=result.stderr[-4000:])
+        try:
+            return jsonify(json.loads(result.stdout.strip().splitlines()[-1]))
+        except (json.JSONDecodeError, IndexError):
+            raise ApiError("suggest-selection produced no parseable output", status=502, detail=result.stdout[-2000:])
 
     # ------------------------------------------------------------------
     # read-only: graph projections, live status, dataset report, query
