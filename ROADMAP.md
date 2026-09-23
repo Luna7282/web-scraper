@@ -973,35 +973,37 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     (prompt wording change + a re-run of the same 10-chunk comparison to
     confirm no regression).
 
-49. **[Likely root cause of the one known real Phase 2 relevance-gate
-    loss] `content/relevance.py::gate_state()`'s headings-first fallback
-    only falls back to full content when `extract_headings()` returns
-    nothing at all — not when it returns something present but useless.**
-    Found investigating why Jev scored the known Phase 2 loss page
-    (`madeyoureset-an-http-2-...`, a 6,026-character article entirely
-    about a real DDoS-adjacent HTTP/2 vulnerability) at 0.10 during gate
-    recalibration (2026-09-23, `LESSONS_LEARNED.md` #75). The article has
-    **zero in-body `##` headings** — `extract_headings()` doesn't come
-    back empty, it falls through to page-chrome headings elsewhere in the
-    fetched markdown (`"## Related tags\n## Subscribe to receive
-    notifications of new posts"`, 66 characters, no relation to the
-    article's actual topic), and because that string is non-empty,
-    `gate_state()`'s `headings if headings else content` never falls back
-    to the real body. Confirmed decisively: scoring Jev against the same
-    page's real first-4000-characters-of-body instead of the broken
-    66-char heading string scored it **0.91** — correctly, confidently
-    relevant. This is a shared bug (`gate_state()` is used by every
-    relevance-gate backend, traditional included) — the original Phase 2
-    traditional score (0.4325, just under the 0.50 threshold) was
-    probably also a victim of this exact fallback gap, not a
-    genuinely-borderline judgment call as it was characterized before
-    this was traced. *Fix (proposed, not built — this phase's instruction
-    was report-only)*: fall back to full content when extracted headings
-    are too short to carry real signal (a length threshold, not a
-    site-specific heading-text blocklist — keeps `content/relevance.py`'s
-    existing no-site-specific-logic rule intact), not just when they're
-    empty. **Size: S** (one conditional in `gate_state()` + a regression
-    test using this exact page's fixture markdown).
+49. **[RESOLVED, 2026-09-23] `content/relevance.py::gate_state()`'s
+    headings-first fallback only fell back to full content when
+    `extract_headings()` returned nothing at all — not when it returned
+    something present but useless.** Root cause of the one known real
+    Phase 2 relevance-gate loss (`madeyoureset-an-http-2-...`, a
+    6,026-character article entirely about a real DDoS-adjacent HTTP/2
+    vulnerability, scored 0.10 by Jev and 0.4325 by traditional — both
+    against **66 characters of page-chrome heading text**, "Related tags"/
+    "Subscribe to receive notifications", not the article). A length
+    threshold was considered and **rejected after measuring both archived
+    corpora live** (354 pages, `LESSONS_LEARNED.md` #79): manim's real
+    single-class-name page titles run as short as 6 characters ("# Cube"),
+    so any length cutoff generous enough to admit those would also admit
+    chrome lines, and any cutoff tight enough to exclude chrome would
+    exclude real manim headings too — the two populations overlap in
+    length. Measuring the actual heading **text** instead found the real
+    signal: "Related tags"/"Subscribe to receive notifications of new
+    posts" repeat verbatim across 125/313 (40%) of the Cloudflare corpus,
+    while no other heading line repeats anywhere near that rate — a
+    frequency-based, content-based signature, not a length one. **Fixed**:
+    `_strip_chrome_headings()` (new, `content/relevance.py`) drops any
+    heading line matching a known page-furniture phrase
+    (`DEFAULT_HEADING_CHROME_PATTERNS`, same theme-specific-phrase-lives-
+    in-data convention as `chrome_strip.py`'s `DEFAULT_TEXT_PATTERNS`,
+    extensible per-theme, nothing hardcoded into the matching logic)
+    before `gate_state()`'s empty check — a page whose only heading is
+    furniture now falls back to content exactly like a page with no
+    headings at all already did. Verified end-to-end against the real
+    known-loss page: post-fix, both Jev (0.91) and traditional (0.63,
+    real local-embedding cosine similarity on a real content excerpt)
+    correctly score it as relevant. 7 new tests in `tests/test_relevance.py`.
 
 ---
 

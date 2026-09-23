@@ -4926,10 +4926,16 @@ tuned for, and thin/short chunks) using the **unchanged** prompt, against
 Gemini instead of the archived deepseek-v4-flash output
 (`archive/step6-manim-baseline/canonical.jsonl`) — same prompt, same
 source text, different chat model, to isolate what the Gemini default
-switch (`#77`) actually changes. 7/10 completed cleanly; 3 hit Gemini's
-20/day free-tier cap mid-run (`#77`) and one of those three could not be
-recovered even after cooldown retries (same daily-cap mechanism, not a
-transient rate limit — retrying doesn't help until the quota resets).
+switch (`#77`) actually changes. 7/10 completed immediately; 3 hit
+Gemini's 20/day free-tier cap mid-run (`#77`). **All 10/10 now complete**
+— the last 3 (including the one that didn't recover on same-day retry)
+succeeded once the daily quota reset. The 10th chunk
+(`manim.utils.tex_file_writing`, a 4-function reference page, not
+table-heavy) followed the same pattern as the others: 4 pairs vs
+deepseek's 5, covering the same 4 functions individually — deepseek's
+5th pair was a module-level "what does this module do" summary question
+Gemini didn't generate here, the only coverage gap found across the full
+10-chunk set. Not a padding or fabrication case either way.
 
 - **Table/list-row coverage is substantially better under Gemini, not
   regressed**: on the `manim.animation.transform` reference page (a
@@ -4939,9 +4945,9 @@ transient rate limit — retrying doesn't help until the quota resets).
   two other table-heavy chunks (13 vs 5 pairs, 14 vs 5 pairs) — the
   Variant A rule appears to transfer to Gemini fine, and Gemini follows
   it considerably more thoroughly than deepseek did.
-- **No paraphrase-padding regression observed**: across all 7 successful
-  chunks, Gemini's extra pairs (relative to deepseek) target genuinely
-  distinct facts (different table rows, different classes) rather than
+- **No paraphrase-padding regression observed**: across all 10 chunks,
+  Gemini's extra pairs (relative to deepseek) target genuinely distinct
+  facts (different table rows, different classes/functions) rather than
   reworded restatements of the same fact — spot-checked directly,
   side-by-side, not inferred from counts alone.
 - **A new pattern deepseek didn't produce on this sample: thin-content
@@ -4961,6 +4967,156 @@ transient rate limit — retrying doesn't help until the quota resets).
   net-positive on the one property it was tuned for (table/list
   coverage) and doesn't show the failure mode it was most at risk of
   (padding). The free-tier daily cap (`#77`) is the real blocker for
-  using it on anything beyond a small test crawl — worth deciding
-  explicitly whether to accept that ceiling, move to a paid tier, or
-  keep Gemini as default only for interactive/test use.
+  using it on anything beyond a small test crawl — it did reset within
+  the same day (observed reset around 07:00 UTC, consistent with a
+  Pacific-midnight quota boundary, though only observed once, not
+  confirmed as a stable schedule), so it's a real-time-of-day constraint
+  on crawl scheduling, not a multi-day block — but a real crawl
+  extracting more than ~20 chunks would still need to either spread
+  across days, move to a paid tier, or accept the cap.
+
+### 79. `gate_state()`'s chrome-heading bug fixed and verified: blast-radius measured across both archived corpora (354 pages), a length threshold rejected in favor of a pattern filter, chrome_strip.py confirmed unable to catch this structurally, and the relevance gate recalibrated clean
+
+Follow-up to `#75`'s discovery that the one known real Phase 2 loss
+(`madeyoureset-an-http-2-...`) was fed 66 characters of page-furniture
+heading text ("Related tags"/"Subscribe to receive notifications of new
+posts") instead of its real 6,026-character body, because
+`gate_state()`'s `headings if headings else content` only falls back to
+content when `extract_headings()` returns nothing at all, not when it
+returns something present but useless. Four things were asked before any
+fix: measure the real length distribution instead of guessing a
+threshold, measure the blast radius across both archived corpora, check
+whether `chrome_strip.py` could catch this at the source instead, and
+only then redo the calibration.
+
+**Chrome-strippability checked first, before any threshold work**:
+fetched the known-loss page's raw HTML (no exclusions at all) and found
+`<h2>Related tags</h2>` sitting inside `<section class="post-extras">` —
+a real, structurally plain heading, not inside `<nav>`/`<header>`/
+`<footer>`/`<aside>` or any ARIA-role-marked element.
+`content/chrome_strip.py`'s tag/role-based exclusion (the "primary
+mechanism," per its own module docstring) **structurally cannot catch
+this** without a Cloudflare-blog-specific CSS selector, which would
+violate the project's no-site-specific-logic convention the same way a
+domain-name branch in `crawl/scope.py` would. This ruled out expanding
+`chrome_strip.py`'s excluded-tag set as a fix and pointed toward
+filtering at the heading-extraction layer instead.
+
+**Blast radius measured live across all 354 unique `source_url`s in both
+archived corpora** (41 manim + 313 Cloudflare, real fetches through the
+real `main.py::_make_fetch_fn` pipeline — same chrome-stripping
+`gate_state()` itself sees). First attempt (concurrent Cloudflare
+fetches) was killed by harness-level low system memory at 348/354 —
+recovered cleanly from its log (no data loss, no corruption, every
+completed fetch had succeeded) and the remaining 6 pages plus 35 manim
+pages that separately hit `docs.manim.community`'s own previously-unseen
+rate limit (HTTP 429 under concurrency=6 — a new finding: manim's docs
+site rate-limits too, just not at the lower concurrency prior sessions
+happened to use) were retried sequentially to reach a clean 354/354, zero
+errors.
+
+- **53.1% of pages (188/354) already have zero extracted headings** —
+  `gate_state()` already correctly falls back to full content for these
+  today; not part of the bug.
+- **46.0% (166/354) have non-empty headings** — the population the bug
+  can actually affect. Of these, the two known chrome lines
+  ("Related tags", "Subscribe to receive notifications of new posts")
+  appear on 125/313 Cloudflare pages (40%) — found by literally counting
+  which heading *lines* repeat verbatim across many otherwise-unrelated
+  pages (a frequency signature, not a guess): no other heading line
+  anywhere in either corpus repeats anywhere near that rate (next most
+  common: "Conclusion" on 6 pages — a legitimately common real section
+  title, not furniture).
+- **Zero pages in this 354-page corpus have heading extraction that's
+  *entirely* chrome** — every page that has the two chrome lines also
+  has at least one real heading alongside them. This is not evidence the
+  bug is harmless: it's **survivorship bias**, stated plainly rather than
+  presented as a clean result. This corpus is pages that *already passed*
+  the relevance gate and got extracted — a page whose `gate_state()` was
+  100% chrome would very likely score near-zero and get silently
+  skipped, which is exactly what happened to the one confirmed real case,
+  and skipped pages' content is never persisted (this project's own
+  architecture, `crawl/pipeline.py`'s `map_worker`/`extract_worker`
+  design), so the corpus of already-extracted pages structurally cannot
+  contain the bug's worst victims. The true blast radius on production
+  losses can only be bounded from below by what's now confirmed (at
+  least one real case) and from the *rate* of chrome contamination in
+  general (40% of Cloudflare pages carry some), not measured exactly.
+- **A length threshold was considered and rejected by the data, not by
+  reasoning alone**: the 166 non-empty-heading pages' lengths, sorted,
+  show manim's genuinely real single-class-name page titles running as
+  short as 6 characters (`"# Cube"`, `"# frame"`, `"# graph"`, ...,
+  30 pages under 24 characters, all legitimate) directly adjacent in the
+  distribution to where chrome-contaminated lengths would also fall.
+  Re-checking the 9 pages `#75` originally flagged as degenerate
+  (`state_chars < 100` in the pre-fix Phase 1 gate-calibration run)
+  against their real heading *text* (not just length) confirmed this:
+  **only 1 of the 9 (the known loss) is purely chrome**; 3 are already
+  correctly empty today (author/tag pages — content genuinely thin, not
+  a bug); the other 5 (including the ASPA article and the Rogers-outage
+  postmortem) have 4-8 real content headings each, alongside the chrome
+  lines, well past any length cutoff that would also spare manim's real
+  6-character titles. A length threshold generous enough to admit real
+  short headings would also admit chrome; one tight enough to exclude
+  chrome would exclude real short headings too — the populations
+  overlap in length but not in content.
+
+**Fix**: `content/relevance.py::_strip_chrome_headings()` (new) drops any
+heading line whose text, once the leading `#`s are stripped, exactly
+matches a known page-furniture phrase
+(`DEFAULT_HEADING_CHROME_PATTERNS = ["related tags", "subscribe to
+receive notifications of new posts"]`), case-insensitively — same
+whole-line-not-substring matching discipline, and the same
+theme-specific-phrases-live-in-data-not-logic convention, as
+`chrome_strip.py`'s existing `DEFAULT_TEXT_PATTERNS`/
+`strip_text_patterns()` (extensible per theme via the `patterns` param,
+nothing hardcoded into the matching function itself). `gate_state()` now
+filters chrome lines out of `extract_headings()`'s output *before* the
+empty check, so a page whose only heading is furniture falls back to
+content exactly like a page with no headings at all already did. 7 new
+tests in `tests/test_relevance.py` (chrome lines dropped
+case-insensitively; a real heading that merely *mentions* "related tags"
+in a longer title is not dropped — substring match would have been
+wrong; custom `patterns` override the default; manim's short real
+headings like `"# Cube"` are untouched). **Verified end-to-end against
+the real known-loss page, live**: post-fix `gate_state()` output is now
+4,000 characters of real article body (was 66 characters of chrome);
+Jev scores it **0.91**; a real local-Ollama-embedding traditional score
+on a real body excerpt scores it **0.63** — both backends now correctly
+call this page relevant when they're not being fed noise.
+
+**Calibration redone clean** — same 109 Phase 1 pages + the known loss
+(110 total, 0 fetch errors), traditional (real embedding cosine
+similarity via `TraditionalRelevanceDecisionBackend`, not a stub) and
+Jev, both against the fixed `gate_state()`:
+
+| | old traditional (broken state) | new traditional (fixed state) | Jev (fixed state) |
+|---|---|---|---|
+| mean | 0.551 | 0.548 | 0.119 |
+| median | 0.555 | 0.548 | 0.060 |
+| min | 0.409 | 0.392 | 0.010 |
+| max | 0.729 | 0.728 | 0.900 |
+| **known-loss page** | **0.4325 (below 0.50 threshold — the real miss)** | **0.6170 (above threshold — fixed)** | **0.900** |
+
+Aggregate distributions barely moved (mean shifted 0.003) — exactly what
+a *surgical* fix should look like: it doesn't perturb the 90%+ of pages
+that were never actually affected, it corrects the rare pages that were.
+3/110 pages still show `state_chars < 100` post-fix — checked each
+directly (`going-bgp-zombie-hunting`, `cloudflare-incident-on-...`,
+`...ovhcloud-outage`): all three are genuinely short-but-real headings
+(e.g. `"## Background\n## What happened\n## Timeline\n## Remediations
+and follow-up steps\n## Conclusion"`), correctly preserved rather than
+over-filtered — confirms the fix isn't accidentally too aggressive
+either.
+
+Traditional-vs-Jev correlation on the repaired state: Pearson r≈0.49,
+rank correlation ≈0.58 — essentially unchanged from `#75`'s
+degenerate-excluded estimate (r≈0.53/0.68 on a smaller, less complete
+sample). **The fix's value is the one confirmed real case, not a change
+in the aggregate traditional-vs-Jev relationship** — Jev's distribution
+is still heavily right-skewed (mean 0.119 vs traditional's 0.548) and
+would still skip 93-95% of pages at any threshold in traditional's
+range, so the `#75` conclusion stands: Jev needs its own calibrated
+threshold, not traditional's, before it's trustworthy as a gate. What's
+different now is that the comparison is no longer confounded by feeding
+either backend noise on an unknown number of pages.

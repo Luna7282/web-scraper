@@ -10,6 +10,7 @@ import config
 from content.relevance import (
     cosine_similarity, extract_headings, chunk_text,
     score_whole_page, score_headings, score_max_chunk, make_score_fn, gate_state,
+    DEFAULT_HEADING_CHROME_PATTERNS,
 )
 from decisions.types import NoulAnswer
 
@@ -170,6 +171,54 @@ class TestGateState(unittest.TestCase):
 
     def test_falls_back_to_content_when_no_headings(self):
         self.assertEqual(gate_state("just prose, no headings"), "just prose, no headings")
+
+    def test_falls_back_to_content_when_headings_are_pure_chrome(self):
+        # Real production case (LESSONS_LEARNED.md #75/#79): an article
+        # with zero in-body headings, only page-furniture ones -- must not
+        # be judged on furniture text alone.
+        content = (
+            "A whole real article about DDoS mitigation, with no ## "
+            "headings anywhere in the body.\n\n"
+            "## Related tags\n## Subscribe to receive notifications of new posts"
+        )
+        self.assertEqual(gate_state(content), content)
+
+    def test_keeps_real_headings_alongside_chrome_ones(self):
+        content = "# Real Title\n\nbody\n\n## Real Sub\n\n## Related tags"
+        self.assertEqual(gate_state(content), "# Real Title\n## Real Sub")
+
+    def test_short_real_heading_not_treated_as_chrome(self):
+        # A terse but genuine single-class-name page title (real example:
+        # manim's reference pages) must not be discarded by a chrome filter.
+        self.assertEqual(gate_state("# Cube\n\nsome body text"), "# Cube")
+
+
+class TestStripChromeHeadings(unittest.TestCase):
+    def test_drops_known_chrome_lines_case_insensitively(self):
+        from content.relevance import _strip_chrome_headings
+        headings = "## Real Section\n## RELATED TAGS\n## Subscribe to receive notifications of new posts"
+        self.assertEqual(_strip_chrome_headings(headings), "## Real Section")
+
+    def test_does_not_drop_a_heading_that_only_mentions_the_phrase(self):
+        from content.relevance import _strip_chrome_headings
+        headings = "## Related tags\n## How Related Tags Work In Our New Feature"
+        self.assertEqual(
+            _strip_chrome_headings(headings),
+            "## How Related Tags Work In Our New Feature",
+        )
+
+    def test_custom_patterns_override_default(self):
+        from content.relevance import _strip_chrome_headings
+        self.assertEqual(
+            _strip_chrome_headings("## Real Section\n## Related tags", patterns=["a different phrase"]),
+            "## Real Section\n## Related tags",
+        )
+
+    def test_default_patterns_constant_is_the_measured_set(self):
+        self.assertEqual(
+            DEFAULT_HEADING_CHROME_PATTERNS,
+            ["related tags", "subscribe to receive notifications of new posts"],
+        )
 
 
 class TestMakeScoreFnSystemOne(unittest.IsolatedAsyncioTestCase):

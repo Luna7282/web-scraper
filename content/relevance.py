@@ -46,6 +46,43 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+# Heading-level page furniture that leaks into extract_headings() because
+# it's a real ATX heading (a genuine <h2>, not nav/header/footer/aside),
+# so content/chrome_strip.py's tag/role-based exclusion can't catch it --
+# confirmed against a real page's raw HTML: "Related tags" sits in
+# <section class="post-extras">, not any excluded landmark tag (see
+# LESSONS_LEARNED.md #75/#79). Found by measuring which heading lines
+# repeat verbatim across many otherwise-unrelated real pages (125/313 of
+# the archived Cloudflare corpus for these two) -- a length threshold was
+# considered and rejected: manim's real single-class-name page titles are
+# as short as 6 characters ("# Cube"), so any length cutoff generous
+# enough to admit those would also admit these chrome lines, and any
+# cutoff tight enough to exclude these would exclude real manim headings
+# too. Same theme-specific-phrase, data-not-logic convention as
+# chrome_strip.py's DEFAULT_TEXT_PATTERNS -- extend via the patterns
+# param, don't hardcode a new phrase into the matching logic itself.
+DEFAULT_HEADING_CHROME_PATTERNS = [
+    "related tags",
+    "subscribe to receive notifications of new posts",
+]
+
+_HEADING_PREFIX_RE = re.compile(r"^#+\s*")
+
+
+def _strip_chrome_headings(headings: str, patterns=None) -> str:
+    """Drops any heading line whose text (after the leading #s) exactly
+    matches a known page-furniture phrase, case-insensitively -- same
+    "whole line, not substring" matching discipline as
+    chrome_strip.py::strip_text_patterns(), so a real heading that merely
+    mentions one of these phrases in a longer title isn't dropped."""
+    normalized = {p.strip().lower() for p in (patterns if patterns is not None else DEFAULT_HEADING_CHROME_PATTERNS)}
+    lines = [
+        line for line in headings.split("\n")
+        if _HEADING_PREFIX_RE.sub("", line).strip().lower() not in normalized
+    ]
+    return "\n".join(lines)
+
+
 def extract_headings(markdown: str) -> str:
     """Concatenated markdown ATX headings -- a candidate scoring unit much
     closer in length/specificity to a short intent string than a full
@@ -127,16 +164,21 @@ async def _no_gate_score_fn(url: str, content: str) -> float:
 
 def gate_state(content: str) -> str:
     """The unit the relevance gate actually judges -- headings if the page
-    has any (closer in scale to a short intent string, see score_headings'
-    own docstring), else the truncated whole page. Shared by every gate
-    backend (traditional and System One both judge the SAME unit) --
+    has any *real* ones, else the truncated whole page. Shared by every
+    gate backend (traditional and System One both judge the SAME unit) --
     important for Jev/Laya specifically, not just Laya's small context
     budget: Jev's own docs warn "accuracy drops as the state fills with
     irrelevant content -- filter before sending" (SYSTEM_ONE_MODELS.md),
     so sending a whole raw page as state would be a real accuracy
     regression for System One, not just a traditional-only optimization.
+
+    Chrome headings are filtered out before the empty check, not after --
+    a page whose only extracted heading is page furniture (a real
+    production loss traced to exactly this: LESSONS_LEARNED.md #75/#79)
+    must fall back to content the same way a page with zero headings at
+    all already does, not be judged on furniture text alone.
     """
-    headings = extract_headings(content)
+    headings = _strip_chrome_headings(extract_headings(content))
     state = headings if headings else content
     return state[:MAX_EMBED_CHARS]
 
