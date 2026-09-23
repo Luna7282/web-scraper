@@ -941,6 +941,68 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     barely changes. **Size: S/M** (schema column + populate it + thread
     the field through `extract_branches`/the prompt).
 
+47. **Sample-quality scoring's production call never sends `source_chunk`,
+    making "is this grounded in its source" structurally unanswerable as
+    currently wired.** `crawl/pipeline.py::extract_worker`'s
+    `quality_backend.noul(...)` call builds its `state` from the
+    instruction/response pair alone. Found while designing the first real
+    test of this decision point (2026-09-23,
+    `LESSONS_LEARNED.md` #76): any offline test that wants to check
+    groundedness has to add `source_chunk` back into `state` itself to
+    mean anything, which is exactly what that test did — production
+    doesn't. Whatever a quality backend returns today can only be judging
+    fluency/plausibility, not accuracy against source. *Fix (not built,
+    report-only phase)*: thread `source_chunk` into the `state` string at
+    the real call site, matching what the offline test already proved
+    works. **Size: S** (one call site, no schema change).
+
+48. **Extraction under Gemini (now the default, `LESSONS_LEARNED.md` #77)
+    shows a pattern deepseek didn't: thin-content over-atomization** —
+    splitting a short parameter list into one mechanically-derived,
+    low-substance pair per parameter rather than one pair covering all of
+    them (`LESSONS_LEARNED.md` #78, the `mobject`/`target_mobject`/
+    `path_arc` example). Not fabrication, every claim stays grounded, but
+    each pair individually carries little training signal. *Fix
+    (proposed, not built)*: either a minimum-answer-substance rule or an
+    explicit prompt instruction not to split a single short parameter/
+    field list into one pair per field. Needs a few more real chunks to
+    confirm this is a pattern and not a one-off before touching the
+    prompt — `content/extraction.py`'s `QA_EXTRACTION_SYSTEM_PROMPT` is
+    shared with deepseek and any prompt change here must not regress the
+    table/list-coverage rule it was already tuned for. **Size: S**
+    (prompt wording change + a re-run of the same 10-chunk comparison to
+    confirm no regression).
+
+49. **[Likely root cause of the one known real Phase 2 relevance-gate
+    loss] `content/relevance.py::gate_state()`'s headings-first fallback
+    only falls back to full content when `extract_headings()` returns
+    nothing at all — not when it returns something present but useless.**
+    Found investigating why Jev scored the known Phase 2 loss page
+    (`madeyoureset-an-http-2-...`, a 6,026-character article entirely
+    about a real DDoS-adjacent HTTP/2 vulnerability) at 0.10 during gate
+    recalibration (2026-09-23, `LESSONS_LEARNED.md` #75). The article has
+    **zero in-body `##` headings** — `extract_headings()` doesn't come
+    back empty, it falls through to page-chrome headings elsewhere in the
+    fetched markdown (`"## Related tags\n## Subscribe to receive
+    notifications of new posts"`, 66 characters, no relation to the
+    article's actual topic), and because that string is non-empty,
+    `gate_state()`'s `headings if headings else content` never falls back
+    to the real body. Confirmed decisively: scoring Jev against the same
+    page's real first-4000-characters-of-body instead of the broken
+    66-char heading string scored it **0.91** — correctly, confidently
+    relevant. This is a shared bug (`gate_state()` is used by every
+    relevance-gate backend, traditional included) — the original Phase 2
+    traditional score (0.4325, just under the 0.50 threshold) was
+    probably also a victim of this exact fallback gap, not a
+    genuinely-borderline judgment call as it was characterized before
+    this was traced. *Fix (proposed, not built — this phase's instruction
+    was report-only)*: fall back to full content when extracted headings
+    are too short to carry real signal (a length threshold, not a
+    site-specific heading-text blocklist — keeps `content/relevance.py`'s
+    existing no-site-specific-logic rule intact), not just when they're
+    empty. **Size: S** (one conditional in `gate_state()` + a regression
+    test using this exact page's fixture markdown).
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

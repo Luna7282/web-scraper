@@ -4706,3 +4706,261 @@ were reasoned defaults, never measured -- this run's Jev intent-1 misses
 thresholds are roughly sound for Jev specifically, whereas Laya's
 distribution suggests its own thresholds would need separate
 calibration, not the same numbers reused unchanged.
+
+## 2026-09-23 — Per-method thresholds, first real relevance-gate/quality-scoring runs, Gemini defaulted for extraction, verify-providers fixed
+
+### 74. `#73`'s shared 0.4 dedup threshold generalized into a real bug: thresholds are now keyed by (decision_point, method), not global constants
+
+Each method's score distribution has a different shape and center (Jev's
+dedup scores, Jev's relevance-gate scores, and Jev's quality scores
+none resemble each other, let alone traditional's), so one shared
+threshold number per decision point was never meaningful past the one
+case (`#73`'s dedup 0.4) that first exposed it.
+`config.DECISION_THRESHOLDS: dict[tuple[str, str], dict[str, float]]`
+replaces the four flat constants that used to carry this
+(`SYSTEM_ONE_NOUL_SELECT_THRESHOLD`/`_REJECT_THRESHOLD`,
+`SAMPLE_QUALITY_THRESHOLD`, the ad-hoc dedup default), with
+`get_threshold(decision_point, method, key="select")` as the one read
+path. Every call site (`crawl/branch_select.py`,
+`export/export_formats.py::semantic_dedup`,
+`crawl/pipeline.py::extract_worker`'s quality check) now passes its own
+`method` (whatever `answer.method` the backend actually returned) rather
+than assuming which backend produced the score it's thresholding.
+Nothing is switched on by this change alone — `USE_SYSTEM_ONE` stays
+`false` by default, this only fixes what happens *if* it's ever turned
+on for a given decision point.
+
+### 75. Relevance-gate calibration against real archived data: full 110/110 pages recovered on retry, and the known real Phase 2 loss traced to a `gate_state()` fallback bug, not a genuinely-borderline score
+
+Reused the real Cloudflare Phase 1 run (109 pages, `relevance_score`
+already computed by the traditional method against intent "Technical
+explanations of how DDoS attacks work...", threshold 0.50) plus the one
+known Phase 2 loss page, and refetched all 110 URLs live
+(`main.py::_make_fetch_fn`, same chrome-stripping, same
+`content/relevance.py::gate_state()` state prep both backends share) to
+score each with Jev on the identical intent — apples-to-apples, no
+re-crawl, no re-scoring assumption. First pass (concurrent fetches): 39/110
+failed to Cloudflare's own anti-bot 403/429, including the one page that
+mattered most. **Retried sequentially** (one page at a time, 8s spacing,
+backoff on 429) instead of concurrently — all 39 succeeded this time,
+including the known-loss page. Concurrency, not the site itself, was
+almost certainly what triggered the bot protection on the first pass.
+Full 110/110 dataset:
+
+- **Distributions are shaped completely differently**: traditional
+  mean 0.55 (range 0.41–0.73), Jev mean 0.11 (range 0.02–0.87, heavily
+  right-skewed — most pages score near-zero, a few score high).
+  Pearson r≈0.50 across all 110, rising to r≈0.53 (Spearman-style rank
+  correlation ≈0.68) on the 101 pages with a non-degenerate state (see
+  below) — real agreement on relative ordering, cleaner once the noisiest
+  inputs are excluded, but still not reliable enough to port one
+  method's threshold to the other. Porting traditional's 0.50 cutoff to
+  Jev's scores would skip 105/110 pages (95%) — a near-total shutdown of
+  extraction. **A Jev threshold has to be calibrated on Jev's own
+  distribution, not guessed from traditional's** — the same lesson
+  `#74` generalized, confirmed again on a second decision point.
+- **`gate_state()` degenerates for a real fraction of real pages,
+  confounding both backends equally**: 9/110 (8.2%) of the refetched
+  pages produced a `gate_state()` output under 100 characters — author-bio
+  pages and near-empty boilerplate ("Related tags", "Subscribe to receive
+  notifications..."). Not fixed here — flagged as a shared confound
+  affecting any relevance-gate backend, traditional or System One.
+- **The one known real Phase 2 loss, traced to root cause — and it's this
+  same bug, not a borderline judgment call.** `madeyoureset-an-http-2-...`
+  (traditional score 0.4325 against the 0.50 threshold) is a 6,026-character
+  article entirely about a real DDoS-adjacent HTTP/2 vulnerability — squarely
+  on-intent. Its refetched `gate_state()` output was **exactly** the
+  66-character boilerplate case above (`"## Related tags\n## Subscribe to
+  receive notifications of new posts"`), because the article has **zero
+  in-body `##` headings** — `extract_headings()` doesn't return empty, it
+  falls through to page-chrome headings elsewhere in the markdown, and
+  `gate_state()`'s `headings if headings else content` only falls back to
+  full content when headings comes back *empty*, not when it comes back
+  *useless*. Jev scored that 66-char string 0.10 (would be skipped at any
+  reasonable threshold). **Decisive follow-up test**: scored Jev against
+  the same page's real first-4000-characters-of-body instead —
+  **0.91, correctly and confidently relevant.** This means the original
+  Phase 2 loss almost certainly wasn't "just under a reasonable threshold"
+  as it was characterized before this was traced — it was fed
+  content-free input by a state-prep bug that affects every backend, not
+  a Jev-specific or traditional-specific failure. Filed as `ROADMAP.md`
+  #49 (proposed fix: fall back to full content when extracted headings
+  are too short to carry signal, not just when empty — a length
+  threshold, not a site-specific rule, keeping `crawl/scope.py`-style
+  no-site-logic convention intact). **Earlier framing in this session
+  claimed this retry had already succeeded and the page was
+  unrecoverable — both were wrong; corrected here after actually
+  re-running it rather than trusting the earlier claim.**
+- **Cost/latency, measured, not assumed**: Jev's own call averaged
+  0.54s/page against this corpus; the real page fetch itself averaged
+  1.84s/page. Jev is the cheaper half of the round-trip by a wide
+  margin — a relevance gate switch to Jev would not be the bottleneck
+  it might be assumed to be, latency-wise. (Dollar cost per call was
+  not separately measured here — `SYSTEM_ONE_MODELS.md` has Jev's
+  published per-call pricing if that's needed before a decision.)
+- **Recommendation, revised from the incomplete-data version of this
+  entry**: this is no longer cleanly "traditional vs Jev" — it's
+  "the shared state-prep step has a real bug that hides genuinely
+  relevant content from both methods." Fix `ROADMAP.md` #49 first; it's
+  small (one conditional + a regression test using this exact page as a
+  fixture) and the known-loss evidence says it directly fixes the one
+  real, confirmed production loss this project has ever traced to a
+  root cause. Once that's fixed, Jev is worth a second, cleaner
+  calibration pass — the 0.91 score on real content is a strong signal,
+  but one page isn't a calibrated threshold. Not recommending a Jev
+  switch on the relevance gate yet, but the reasoning has changed: the
+  blocker is the shared bug, not Jev's own ranking ability.
+
+### 76. Sample-quality scoring's first real run: 100 archived pairs (manim + Cloudflare), hand-labeled subset, one indexing bug caught mid-review and a second one caught only on report-writing re-verification
+
+`content/sample_quality.py`'s groundedness question ("is this
+response's every claim actually supported by its source_chunk?") run
+via Jev against 100 real Q&A pairs pulled from both archived corpora
+(50/50 split, `archive/step6-manim-baseline/canonical.jsonl` +
+`data/run/canonical.jsonl`) — the first time any method has scored this
+decision point against real data. 98/100 succeeded (2 hit
+`blog.cloudflare.com`'s 403 anti-bot page, same confound as `#75`).
+
+**Hand-labeled 23 of the 100 pairs directly against their own
+`source_chunk`** (not reverse-engineered from Jev's own output) as the
+check this decision point has never had. Caught one indexing bug during
+that labeling (comments in the label dict had drifted from the actual
+sample positions partway through — documented at the time). **Re-verifying
+every one of the 23 labels against the real `quality_sample.json`
+content while writing this entry found the claimed fix had not actually
+landed correctly**: two labels (idx 18, idx 20) were still swapped
+against the wrong questions — idx 18 (a Homebrew install-check question,
+genuinely grounded, exact match to source) was marked not-grounded, and
+idx 20 (the real "`ApplyMatrix` gained `about_point`" case, where the
+changelog states only that the keyword argument was added with **no**
+explanation of what it does — the answer's claim about "centering the
+transformation around a custom location" is invented, not stated
+anywhere in the chunk) was marked grounded. Corrected both by re-reading
+full, untruncated source text for every ambiguous case, not just the two
+known-wrong ones — full text confirmed the other 21 labels were correct
+as recorded, including three (idx 1, 4, 7) that looked suspicious from a
+300-char-truncated view but were grounded once the full chunk was
+checked.
+
+With the corrected 23-item label set against Jev's raw scores:
+
+| Threshold | Accuracy | False positives | False negatives |
+|---|---|---|---|
+| 0.2 | 23/23 (100%) | 0 | 0 |
+| 0.3 | 22/23 (95.7%) | 0 | 1 (idx 17 — hedged-but-correct PR-changelog answer, scored 0.22) |
+| 0.4 | 21/23 (91.3%) | 0 | 2 (+ idx 3 — seccomp thread-termination, scored 0.33) |
+| 0.5 | 20/23 (87.0%) | 0 | 3 (+ idx 7 — OpenGLSurface fill-by-value, scored 0.48) |
+
+**Zero false positives at every threshold tested** — in this sample,
+Jev never once scored a fabricated/invented claim as grounded; every
+miss is in the conservative direction (correctly-grounded answers
+scored low, usually ones that hedge or require connecting two nearby
+facts). That's the safer failure mode for a quality gate to have. n=23
+is small — this is not a robust multi-domain proof, the same caveat
+`#73` carried forward for branch selection.
+
+**The "how many existing pairs would fail at threshold 0.3" number,
+reported as asked, with its caveat attached**: 8/98 (8.2%) of the full
+100-pair sample scores below 0.3 — 7/48 (14.6%) on manim, 1/50 (2.0%)
+on Cloudflare. Given the false-negative pattern just found (Jev
+under-scores some genuinely grounded answers), this 8.2% is likely an
+overestimate of how much of the existing corpora is actually
+ungrounded — some fraction of it is probably legitimate content Jev
+scored conservatively, not fabrication. Not a clean answer to "are the
+datasets already built clean" — directionally reassuring (low), not
+precise.
+
+**A structural gap found along the way, not fixed here**: this test's
+`state` explicitly includes `source_chunk` alongside the Q&A pair.
+`crawl/pipeline.py::extract_worker`'s actual production quality-check
+call does **not** — it only ever shows the backend the pair itself,
+never the source text, which makes a real "is this grounded in its
+source" check structurally impossible as currently wired in production,
+regardless of which method scores it. Flagged in `ROADMAP.md`-style
+detail here; not fixed, since fixing it changes what
+`extract_worker` sends today and this phase's instruction was report-only.
+
+### 77. Gemini defaulted for extraction; verify-providers now skips unconfigured providers silently instead of reporting them as temporarily unavailable
+
+Two production-behavior changes made this phase, both per explicit
+instruction (distinct from everything above, which is report-only):
+
+- `main.py::_resolve_llm`'s default `provider` is now `"gemini"` (was
+  `"openai"`), and the interactive provider prompt's default is now `"5"`
+  (Gemini) — Gemini is the default **extraction** provider from this
+  point forward. Embeddings remain always-local-Ollama regardless,
+  unchanged invariant. **This makes every measurement in this file and
+  in `content/extraction.py`'s prompt-tuning history up through the
+  Phase 2/3 real-crawl figures not directly comparable to a Gemini-default
+  run without re-checking** — they were all produced against
+  `ollama_cloud/deepseek-v4-flash`. Noted in `CLAUDE.md` under Provider
+  routing, not just here.
+- `main.py::verify_providers_command()` now silently skips any provider
+  with no API key configured, instead of listing it as a "skipped" row.
+  The distinction matters for a provider like Ollama Cloud on an account
+  that isn't subscribed to it: that's not a transient/skippable state,
+  it's permanently unavailable on this account, and reporting it
+  alongside real failures implied it might start working later.
+
+**A live re-run of `--verify-providers` surfaced Gemini's actual free-tier
+limit the hard way**: `gemini-3.6-flash`'s free tier caps at **20
+requests/day per model** (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`,
+confirmed from the API's own 429 response body, not docs) — this
+session's own testing (the extraction comparison in `#78` below plus this
+verify-providers run) burned through the day's quota, so `--verify-providers`
+now reports Gemini as failing with a 429 that has nothing to do with
+whether the endpoint or model name is correct. **This is a real
+operational ceiling worth flagging before relying on Gemini as the
+default for anything beyond light testing** — a real crawl extracting
+from more than ~20 chunks in a day would need a paid tier or a different
+default. NVIDIA still fails for the same account-wide 404 `#69` already
+found (unresolved, no working replacement model found on this account);
+`ollama` (local) responds cleanly.
+
+### 78. Gemini-vs-deepseek extraction comparison, 10 real manim chunks with known deepseek output: table/list coverage improves substantially, no paraphrase-padding regression, but one new pattern (thin-content over-atomization) not seen under deepseek
+
+Re-extracted the same 10 real `source_chunk` texts (picked to span both
+table-heavy pages, testing the Variant A table/list-coverage rule
+`content/extraction.py`'s `QA_EXTRACTION_SYSTEM_PROMPT` was specifically
+tuned for, and thin/short chunks) using the **unchanged** prompt, against
+Gemini instead of the archived deepseek-v4-flash output
+(`archive/step6-manim-baseline/canonical.jsonl`) — same prompt, same
+source text, different chat model, to isolate what the Gemini default
+switch (`#77`) actually changes. 7/10 completed cleanly; 3 hit Gemini's
+20/day free-tier cap mid-run (`#77`) and one of those three could not be
+recovered even after cooldown retries (same daily-cap mechanism, not a
+transient rate limit — retrying doesn't help until the quota resets).
+
+- **Table/list-row coverage is substantially better under Gemini, not
+  regressed**: on the `manim.animation.transform` reference page (a
+  22-row class table), deepseek generated 6 pairs covering 6 of the
+  table's rows; Gemini generated 18 pairs, one per table row with a
+  description, covering 18 of the ~21 described entries. Same pattern on
+  two other table-heavy chunks (13 vs 5 pairs, 14 vs 5 pairs) — the
+  Variant A rule appears to transfer to Gemini fine, and Gemini follows
+  it considerably more thoroughly than deepseek did.
+- **No paraphrase-padding regression observed**: across all 7 successful
+  chunks, Gemini's extra pairs (relative to deepseek) target genuinely
+  distinct facts (different table rows, different classes) rather than
+  reworded restatements of the same fact — spot-checked directly,
+  side-by-side, not inferred from counts alone.
+- **A new pattern deepseek didn't produce on this sample: thin-content
+  over-atomization.** On a 4-line parameter list (`mobject`,
+  `target_mobject`, `path_arc`, return type — no prose, no elaboration),
+  deepseek produced 1 pair covering all three parameters plus return
+  type in one answer; Gemini produced 4 pairs, one per parameter,
+  each a single mechanically-derived sentence ("The `mobject` parameter
+  expects an argument of type `Mobject`."). Not fabrication — every
+  claim is still grounded — but each individual pair carries very little
+  standalone training signal. Whether this is worth trying to suppress
+  (a minimum-answer-substance rule, or explicitly telling the prompt not
+  to split a single parameter table into one pair per row) is a prompt-
+  tuning question, not answered here — report only, per this phase's
+  instruction.
+- **Recommendation**: the switch to Gemini as extraction default looks
+  net-positive on the one property it was tuned for (table/list
+  coverage) and doesn't show the failure mode it was most at risk of
+  (padding). The free-tier daily cap (`#77`) is the real blocker for
+  using it on anything beyond a small test crawl — worth deciding
+  explicitly whether to accept that ceiling, move to a paid tier, or
+  keep Gemini as default only for interactive/test use.

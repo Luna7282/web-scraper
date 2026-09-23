@@ -197,7 +197,13 @@ _DEFAULT_MODEL_BY_PROVIDER = {
 
 
 def _resolve_llm(cfg: dict):
-    provider_name = cfg.get("provider", "openai")
+    # gemini is the default extraction provider as of 2026-09-22 -- every
+    # measurement before this point (Phase 2/3 figures in LESSONS_LEARNED.md,
+    # the extraction-prompt tuning in content/extraction.py) used
+    # ollama_cloud/deepseek-v4-flash. Numbers from a gemini-default run are
+    # NOT directly comparable to those archived figures without re-running
+    # the same check against gemini first -- see CLAUDE.md.
+    provider_name = cfg.get("provider", "gemini")
     model_name = cfg.get("model") or _DEFAULT_MODEL_BY_PROVIDER[provider_name]
     llm, embeddings = get_llm(provider_name, model_name)
     return provider_name, model_name, llm, embeddings
@@ -288,7 +294,11 @@ async def headless_crawl(cfg: dict) -> dict:
     robots_cache = RobotsCache(_http_get_text)
 
     quality_backend = make_quality_backend(_make_decision_chat_fn(llm)) if cfg.get("enable_quality_scoring") else None
-    quality_threshold = cfg.get("quality_threshold", config.SAMPLE_QUALITY_THRESHOLD)
+    # None (unset): extract_worker looks up the per-method default itself
+    # (config.DECISION_THRESHOLDS) once it knows which backend answered --
+    # not resolved here, since this run's active method isn't necessarily
+    # traditional.
+    quality_threshold = cfg.get("quality_threshold")
 
     chunk_fn = None
     chroma_upsert_fn = None
@@ -573,14 +583,15 @@ async def verify_providers_command():
     """Pings every LLMProvider's default model (config._DEFAULT_MODEL_BY_
     PROVIDER) with a minimal real chat completion, one call each, and
     reports which actually respond -- the check that would have caught
-    all three defaults this project has picked from docs and had proven
+    all four defaults this project has picked from docs and had proven
     wrong by an actual call (nvidia's 404, ollama_cloud's 403 subscription
-    gate, gemini's 404 -- see LESSONS_LEARNED.md). A provider whose
-    required key isn't set in .env is skipped, not silently treated as
-    passing -- "not tested" and "tested and works" are different claims,
-    and this command is careful never to conflate them. ollama (local)
-    needs no key and is always attempted. No crawl, no site touched --
-    every call is a one-line ping to the provider's own chat endpoint."""
+    gate, gemini's 404, local-ollama's 404 -- see LESSONS_LEARNED.md).
+
+    A provider with no key in .env is left out of the report entirely,
+    not listed as "skipped" -- a provider nobody has signed up for isn't
+    a gap to flag every run, it's just not in play; ollama (local) needs
+    no key and is always attempted. No crawl, no site touched -- every
+    call is a one-line ping to the provider's own chat endpoint."""
     console.print(Panel.fit("[bold blue]Verifying every configured provider's default model[/bold blue]"))
     rows = []
     for provider in config.LLMProvider:
@@ -589,7 +600,6 @@ async def verify_providers_command():
         llm_config = config.get_llm_config(provider)
         needs_key = provider != config.LLMProvider.OLLAMA
         if needs_key and not llm_config.api_key:
-            rows.append((provider_name, model_name, "[yellow]skipped[/yellow]", "no API key set in .env"))
             continue
         try:
             llm, _ = get_llm(provider_name, model_name)
@@ -599,6 +609,10 @@ async def verify_providers_command():
             rows.append((provider_name, model_name, "[green]responds[/green]", repr(response.content[:60])))
         except Exception as e:
             rows.append((provider_name, model_name, "[red]FAILED[/red]", f"{type(e).__name__}: {str(e)[:180]}"))
+
+    if not rows:
+        console.print("[yellow]No provider has a key set in .env -- nothing to verify.[/yellow]")
+        return rows
 
     table = Table(title="Provider verification")
     table.add_column("provider")
@@ -877,7 +891,7 @@ async def main():
     console.print("3. Ollama (cloud)")
     console.print("4. OpenAI")
     console.print("5. Gemini")
-    llm_choice = Prompt.ask("Choice", choices=["1", "2", "3", "4", "5"], default="4")
+    llm_choice = Prompt.ask("Choice", choices=["1", "2", "3", "4", "5"], default="5")
     provider_map = {"1": "nvidia", "2": "ollama", "3": "ollama_cloud", "4": "openai", "5": "gemini"}
     provider_name = provider_map[llm_choice]
     model_name = Prompt.ask(f"Enter model name for {provider_name}", default=_DEFAULT_MODEL_BY_PROVIDER[provider_name])
@@ -894,10 +908,15 @@ async def main():
         "(opt-in -- adds one decision call per pair; traditional path is an LLM call, see SYSTEM_ONE_MODELS.md)",
         default=False,
     )
-    quality_threshold = (
-        float(Prompt.ask("Quality threshold (0 = keep everything, log-only)", default="0"))
-        if enable_quality_scoring else config.SAMPLE_QUALITY_THRESHOLD
+    quality_threshold_input = (
+        Prompt.ask(
+            "Quality threshold (blank = use the calibrated default for whichever "
+            "method answers -- traditional/jev/laya each score on a different "
+            "scale, see config.DECISION_THRESHOLDS; 0 = keep everything, log-only)",
+            default="",
+        ) if enable_quality_scoring else None
     )
+    quality_threshold = float(quality_threshold_input) if quality_threshold_input else None
     console.print(
         "[dim]split_jsonl (by section) isn't wired into the new pipeline yet -- "
         "unified JSONL only. Old orchestrator.py flow still has it if needed.[/dim]"

@@ -433,6 +433,38 @@ class TestExtractWorkerFailureModes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counts.get("failed"), 1)  # loud failure, not a silent keep-the-pair fallback
         self.assertEqual(self.results_queue.qsize(), 0)
 
+    async def test_quality_threshold_none_uses_per_method_config_default(self):
+        # config.DECISION_THRESHOLDS[("sample_quality", "jev")]["select"] is
+        # 0.0 today (every pair kept) -- with quality_threshold=None (the
+        # real default main.py now passes), a jev-answered 0.1 must still
+        # survive, proving the per-method lookup actually ran rather than
+        # falling back to some other fixed number.
+        async def score_fn(url, content):
+            return 1.0
+
+        async def extract_fn(content):
+            return json.dumps([{"instruction": "Q", "response": "A"}])
+
+        class StubQualityBackend:
+            async def noul(self, state, instructions, criteria=None):
+                return NoulAnswer(value=0.1, method="jev")
+
+        tasks = self._spawn(score_fn, extract_fn, quality_backend=StubQualityBackend(), quality_threshold=None)
+        for _ in range(50):
+            if self.results_queue.qsize() >= 1:
+                break
+            await asyncio.sleep(0.02)
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+        result: ExtractionResult = self.results_queue.get_nowait()
+        self.assertEqual(len(result.qa_pairs), 1)  # kept: 0.1 >= config default (0.0) for method "jev"
+
 
 if __name__ == "__main__":
     unittest.main()

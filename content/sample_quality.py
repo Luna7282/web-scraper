@@ -6,11 +6,12 @@ the traditional path is an LLM call", so traditional here is
 LLMTraditionalBackend, not a bespoke implementation.
 
 Opt-in (crawl/pipeline.py::extract_worker's quality_backend param,
-config.SAMPLE_QUALITY_THRESHOLD) -- unlike the relevance gate/branch
-selection, which already ran before this interface existed, adding a
-mandatory extra LLM call to every existing crawl by default would itself
-be a behavior/cost change this project's "traditional stays the default"
-rule exists to prevent.
+threshold from config.DECISION_THRESHOLDS[("sample_quality", method)]
+unless overridden) -- unlike the relevance gate/branch selection, which
+already ran before this interface existed, adding a mandatory extra LLM
+call to every existing crawl by default would itself be a behavior/cost
+change this project's "traditional stays the default" rule exists to
+prevent.
 """
 from __future__ import annotations
 

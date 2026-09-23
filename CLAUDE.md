@@ -278,9 +278,22 @@ every other `ChatOpenAI`-backed provider, no new client class. Chat only;
 Gemini does have a working free-tier embeddings endpoint
 (`gemini-embedding-2`) but it's deliberately not wired up — see
 `config.py`'s `EMBEDDING_CAPABLE_PROVIDERS` comment and
-`SYSTEM_ONE_MODELS.md`. Default model (`gemini-2.5-flash`,
-`main.py::_DEFAULT_MODEL_BY_PROVIDER`) is picked from current docs, not
-live-verified — no `GEMINI_API_KEY` in this environment yet.
+`SYSTEM_ONE_MODELS.md`. Default model is `gemini-3.6-flash`
+(`main.py::_DEFAULT_MODEL_BY_PROVIDER`) — live-verified via a real call
+after `gemini-2.5-flash` (the docs-picked original default) turned out to
+be retired (404, pointed at `gemini-3.6-flash` as the replacement).
+
+**Gemini is now the default extraction provider** (`main.py::_resolve_llm`,
+as of 2026-09-22) — chat/extraction only, embeddings are still always
+local Ollama per the invariant above. This makes measurements **not
+directly comparable across a line in time**: every number in this file and
+in `LESSONS_LEARNED.md` up through the Phase 2/3 real-crawl figures, and
+the extraction-prompt tuning history in `content/extraction.py`
+(table/list-coverage rule, anti-reword rule), was produced against
+`ollama_cloud/deepseek-v4-flash`. A different chat model can silently
+undo prompt work tuned against a different one — don't assume a rule
+verified under deepseek still holds under Gemini without re-checking it
+against real output first.
 
 ## System One decision models (`decisions/`) — wired, tested against real calls
 

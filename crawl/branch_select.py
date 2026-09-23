@@ -200,10 +200,11 @@ class TraditionalBranchDecisionBackend(DecisionBackend):
         }
 
 
-def _value_to_decision(value: float) -> str:
-    if value >= config.SYSTEM_ONE_NOUL_SELECT_THRESHOLD:
+def _value_to_decision(value: float, method: str) -> str:
+    thresholds = config.DECISION_THRESHOLDS[("branch_selection", method)]
+    if value >= thresholds["select"]:
         return "select"
-    if value <= config.SYSTEM_ONE_NOUL_REJECT_THRESHOLD:
+    if value <= thresholds["reject"]:
         return "reject"
     return "uncertain"
 
@@ -216,7 +217,10 @@ async def suggest_branch_selection(
     via decisions.get_backend()): one noul call per branch, each branch's
     own sample URLs as its state -- "is this branch relevant to the
     intent?" -- collapsed back to select/reject/uncertain via
-    config.SYSTEM_ONE_NOUL_SELECT_THRESHOLD/_REJECT_THRESHOLD. Jev/Laya
+    config.DECISION_THRESHOLDS[("branch_selection", method)], looked up
+    per the answering backend's own method (not one shared number across
+    traditional/jev/laya -- see config.py's DECISION_THRESHOLDS docstring).
+    Jev/Laya
     don't generate free-text reasoning (non-generative models -- see
     SYSTEM_ONE_MODELS.md), so `reason` for those is a restatement of the
     raw probability, not real reasoning -- said explicitly, not left
@@ -244,7 +248,7 @@ async def suggest_branch_selection(
     results = []
     for b in branches:
         answer = answers[b["prefix"]]
-        decision = _value_to_decision(answer.value)
+        decision = _value_to_decision(answer.value, answer.method)
         reason = answer.reason
         if reason is None:
             reason = (

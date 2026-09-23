@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from decisions import DecisionBackend
 
 from storage.canonical import build_canonical_record, detect_license_signal, extract_page_title
-from config import MAX_RETRIES
+from config import MAX_RETRIES, get_threshold
 from content.extraction import MalformedExtractionError, parse_qa_json
 from crawl.frontier import Frontier, FrontierRow
 from crawl.politeness import HostPoliteness
@@ -179,7 +179,7 @@ async def extract_worker(
     seed_prefixes: list[tuple[str, str | None]] | None = None,
     poll_interval: float = POLL_INTERVAL,
     quality_backend: DecisionBackend | None = None,
-    quality_threshold: float = 0.0,
+    quality_threshold: float | None = None,
 ) -> None:
     while True:
         try:
@@ -251,7 +251,20 @@ async def extract_worker(
                             "Is this a good instruction-response training pair?",
                         )
                         quality_score, quality_method = answer.value, answer.method
-                        if quality_score < quality_threshold:
+                        # None (the default): per-method threshold, looked
+                        # up by the answering backend's own method -- Jev/
+                        # Laya/traditional score quality on different
+                        # distributions (see config.DECISION_THRESHOLDS),
+                        # so reusing one fixed number regardless of which
+                        # backend answered would be the same category
+                        # error dedup's shared 0.4 threshold turned out to
+                        # be. An explicit quality_threshold still overrides
+                        # this for every method, same as before.
+                        active_threshold = (
+                            quality_threshold if quality_threshold is not None
+                            else get_threshold("sample_quality", quality_method)
+                        )
+                        if quality_score < active_threshold:
                             continue
                     qa_pairs.append(build_canonical_record(
                         question=pair["instruction"], answer=pair["response"],

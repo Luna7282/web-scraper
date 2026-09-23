@@ -16,6 +16,7 @@ from difflib import SequenceMatcher
 from re import sub as _sub
 from typing import Callable
 
+import config
 from decisions import DecisionBackend, NoulAnswer, get_backend
 from storage.chunk_store import normalize_chunk_text
 
@@ -145,7 +146,7 @@ def semantic_dedup(
     records: list[dict],
     *,
     field: str = "answer",
-    threshold: float = ANSWER_NEAR_DUP_THRESHOLD,
+    threshold: float | None = None,
     dry_run: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     """Pair-level near-duplicate removal, run after dedup_by_question
@@ -183,13 +184,28 @@ def semantic_dedup(
     unchanged -- it's cheap candidate-finding, not itself the decision;
     only the CANDIDATE pairs it returns get a real noul() call, which
     keeps System One's per-pair cost bounded the same way the prefilter
-    already bounds the traditional path's cost. This function stays a
-    plain sync function (export_formats.py's own "nothing here touches
-    the network" design) by wrapping the one async backend call in
-    asyncio.run() -- export.py's whole call chain is sync end to end, so
-    this never runs inside an already-active event loop.
+    already bounds the traditional path's cost.
+
+    threshold=None (default): the candidate PREFILTER always uses
+    ANSWER_NEAR_DUP_THRESHOLD (string-similarity-based candidate-finding,
+    unrelated to which backend ends up judging a candidate), but the
+    FINAL drop/keep cutoff is looked up per the answering backend's own
+    method (config.DECISION_THRESHOLDS[("semantic_dedup", method)]) --
+    Jev, Laya, and traditional produce different score distributions
+    (measured, not assumed -- LESSONS_LEARNED.md), so reusing one number
+    across methods is wrong by construction. Passing threshold explicitly
+    overrides BOTH the prefilter and the final cutoff, same as before
+    per-method thresholds existed -- for --semantic-dedup-threshold /
+    --semantic-dedup-report, which need one number to sweep and report
+    against regardless of method.
+
+    This function stays a plain sync function (export_formats.py's own
+    "nothing here touches the network" design) by wrapping the one async
+    backend call in asyncio.run() -- export.py's whole call chain is sync
+    end to end, so this never runs inside an already-active event loop.
     """
-    candidates = find_near_duplicates(records, field, threshold)
+    prefilter_threshold = threshold if threshold is not None else ANSWER_NEAR_DUP_THRESHOLD
+    candidates = find_near_duplicates(records, field, prefilter_threshold)
     if not candidates:
         return records, []
 
@@ -209,7 +225,8 @@ def semantic_dedup(
     drop_reasons: dict[int, dict] = {}
     for i, j, _prefilter_ratio in candidates:
         answer = answers[f"{i}:{j}"]
-        if answer.value < threshold:
+        final_threshold = threshold if threshold is not None else config.get_threshold("semantic_dedup", answer.method)
+        if answer.value < final_threshold:
             continue  # backend disagreed with the cheap quick_ratio prefilter -- not a duplicate after all
         len_i = len((records[i].get(field) or ""))
         len_j = len((records[j].get(field) or ""))

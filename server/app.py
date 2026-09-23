@@ -171,11 +171,13 @@ def create_app() -> Flask:
                 "extract_threshold": body.get("extract_threshold", 0.0),
                 "follow_threshold": body.get("follow_threshold", 0.0),
                 "intent": body.get("intent"),
-                "provider": body.get("provider", "openai"),
+                "provider": body.get("provider", "gemini"),  # see main.py::_resolve_llm's comment
                 "model": body.get("model"),
                 "build_rag": bool(body.get("build_rag", False)),
                 "enable_quality_scoring": bool(body.get("enable_quality_scoring", False)),
-                "quality_threshold": body.get("quality_threshold", config.SAMPLE_QUALITY_THRESHOLD),
+                # None (unset): per-method default, resolved in extract_worker
+                # once it knows which backend answered -- see config.DECISION_THRESHOLDS.
+                "quality_threshold": body.get("quality_threshold"),
             })
 
         job = _launch(jobs, run_dir, mode, cfg)
@@ -208,8 +210,8 @@ def create_app() -> Flask:
         if mode == "crawl":
             for key, default in (
                 ("extract_workers", 2), ("extract_threshold", 0.0), ("follow_threshold", 0.0),
-                ("intent", None), ("provider", "openai"), ("model", None), ("build_rag", False),
-                ("enable_quality_scoring", False), ("quality_threshold", config.SAMPLE_QUALITY_THRESHOLD),
+                ("intent", None), ("provider", "gemini"), ("model", None), ("build_rag", False),
+                ("enable_quality_scoring", False), ("quality_threshold", None),
             ):
                 cfg[key] = overrides.get(key, cfg.get(key, default))
         job = _launch(jobs, run_dir, mode, cfg)

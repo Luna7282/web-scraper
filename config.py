@@ -54,13 +54,6 @@ EXTRACTION_STRATEGY = ExtractionStrategy.PER_CHUNK
 EXTRACTION_TOP_K = 3
 MAX_EXTRACT_CHARS = 4000  # same conservative bound as relevance.py's MAX_EMBED_CHARS -- one real per_chunk unit (2000 chars) is already well under this
 
-# Sample quality scoring (content/sample_quality.py, crawl/pipeline.py's
-# extract_worker quality_backend param) -- opt-in, off by default (0.0 =
-# every pair kept, same "0 = log-only/off" convention as extract_
-# threshold/follow_threshold). A pair's quality noul value below this is
-# dropped before it's ever written to canonical.jsonl.
-SAMPLE_QUALITY_THRESHOLD = 0.0
-
 class ExtractionPromptVariant(str, Enum):
     STANDARD = "standard"          # QA_EXTRACTION_SYSTEM_PROMPT -- prose Q&A over any content
     CODE_FOCUSED = "code_focused"  # CODE_QA_EXTRACTION_SYSTEM_PROMPT -- instruction->code pairs for runnable examples, prose Q&A fallback otherwise
@@ -211,17 +204,56 @@ USE_SYSTEM_ONE = os.getenv("USE_SYSTEM_ONE", "false").strip().lower() == "true"
 # Only meaningful (and only validated) when USE_SYSTEM_ONE is true.
 SYSTEM_ONE_PROVIDER = os.getenv("SYSTEM_ONE_PROVIDER")
 
-# A noul answer (P(true), 0.0-1.0) collapses to a 3-way select/reject/
-# uncertain decision (branch selection) via these thresholds -- symmetric
-# around 0.5, picked so the traditional backend's own exact-1.0/0.0/0.5
-# encoding (see crawl/branch_select.py's TraditionalBranchDecisionBackend)
-# round-trips to identical select/reject/uncertain output as before this
-# interface existed: 1.0 >= 0.7 -> select, 0.0 <= 0.3 -> reject, 0.5 falls
-# in neither band -> uncertain. Not yet tuned against a real Jev/Laya
-# probability distribution (no live calls made yet) -- revisit once Step
-# 5's real comparison data exists.
-SYSTEM_ONE_NOUL_SELECT_THRESHOLD = 0.7
-SYSTEM_ONE_NOUL_REJECT_THRESHOLD = 0.3
+# Jev, Laya, and the traditional method each produce a differently-shaped
+# score distribution -- confirmed empirically, not assumed: dedup's single
+# shared 0.4 threshold (originally tuned for string-similarity ratios) was
+# wrong for all three methods when actually measured (see LESSONS_LEARNED.md's
+# Step 5/6 entries). Reusing one number across methods is a category error,
+# not a simplification, so thresholds are keyed by (decision_point, method)
+# here instead of one constant per decision point. "select"/"reject" apply
+# to a 3-way noul decision (branch selection); a decision point with a
+# single accept/drop cutoff (dedup, sample quality) only defines "select",
+# used as its sole cutoff. The relevance gate's threshold is normally a
+# per-run, user-chosen value (main.py's extract_threshold/follow_threshold
+# prompts) rather than a fixed config default -- its entries here are the
+# suggested default shown for each method, not an enforced value; main.py's
+# prompt reads calibrate_threshold_default() to pick which one to show.
+#
+# Current values are either inherited from before per-method thresholds
+# existed (branch_selection: still the original reasoned-not-measured
+# 0.7/0.3, shared by all methods because Step 5's real comparison found
+# them roughly sound for Jev specifically, not yet for laya) or explicitly
+# uncalibrated placeholders (dedup, sample_quality: no method-specific
+# number has been measured yet) -- calibrate_threshold_default() and
+# DECISION_THRESHOLDS exist so a real calibration (like Step 6's relevance-
+# gate measurement) has somewhere real to put its answer, not to claim
+# these particular numbers are already trustworthy.
+DECISION_THRESHOLDS: dict[tuple[str, str], dict[str, float]] = {
+    ("branch_selection", "traditional"): {"select": 0.7, "reject": 0.3},
+    ("branch_selection", "jev"): {"select": 0.7, "reject": 0.3},
+    ("branch_selection", "laya"): {"select": 0.7, "reject": 0.3},
+    ("relevance_gate", "traditional"): {"select": 0.50},  # the measured Phase 1/2 default
+    ("relevance_gate", "jev"): {"select": 0.50},  # placeholder until calibrated -- see LESSONS_LEARNED.md
+    ("relevance_gate", "laya"): {"select": 0.50},  # placeholder, not yet tested at all
+    ("semantic_dedup", "traditional"): {"select": 0.4},
+    ("semantic_dedup", "jev"): {"select": 0.4},
+    ("semantic_dedup", "laya"): {"select": 0.4},
+    ("sample_quality", "traditional"): {"select": 0.0},  # 0.0 = off/log-only, matches the gate's own convention
+    ("sample_quality", "jev"): {"select": 0.0},
+    ("sample_quality", "laya"): {"select": 0.0},
+}
+
+
+def get_threshold(decision_point: str, method: str, key: str = "select") -> float:
+    return DECISION_THRESHOLDS[(decision_point, method)][key]
+
+
+def relevance_gate_threshold_default(method: str) -> float:
+    """What main.py's extract_threshold/follow_threshold prompts should
+    show as the default for the currently-active method -- the same
+    number for every gate call in a run (one method is active at a time),
+    never silently reused across methods."""
+    return get_threshold("relevance_gate", method)
 
 
 class SystemOneConfigError(Exception):
