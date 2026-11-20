@@ -1005,6 +1005,32 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     real local-embedding cosine similarity on a real content excerpt)
     correctly score it as relevant. 7 new tests in `tests/test_relevance.py`.
 
+50. **[Found 2026-11-20, Brief 1 Step 0 baseline on macOS] `server/jobs.py::_pid_alive()`
+    reports a finished job as `running` forever on POSIX.** On non-Windows
+    it checks liveness with `os.kill(pid, 0)`, but `JobManager.start()`
+    deliberately never `wait()`s/`poll()`s the `Popen` child (see the
+    comments near the top of `server/jobs.py` and in `start()`'s docstring). On
+    POSIX an exited-but-unreaped child stays a zombie until its parent
+    reaps it, and `os.kill(pid, 0)` succeeds against a zombie — so the
+    state never leaves `running`, and `stop()` on an already-finished job
+    reports `stopped` rather than `done`. Windows has no zombies (and uses
+    `tasklist` there), which is why this never showed up before. Caught by
+    the existing suite on macOS, not by a live run: all 10 failures in a
+    473-test baseline are this one cause — 8 in `tests/test_server_jobs.py`
+    and 2 in `tests/test_server_app.py`
+    (`test_start_run_then_poll_job_to_completion`,
+    `test_resume_can_promote_a_mapped_run_to_a_real_crawl`), each asserting
+    `'running' != 'done'/'failed'/'exited'/'stopped'`. **Doc gap alongside
+    it:** `CLAUDE.md`'s control-server section describes job tracking
+    (PID file + live OS check, `tasklist`/`taskkill` "on Windows") as if
+    it were cross-platform, but it has only ever been verified on Windows
+    — the POSIX branch of `_pid_alive`/`_kill_pid` was never exercised
+    until this run. Not fixed here (out of scope for Brief 1); any fix has
+    to keep `JobManager`'s stateless, survives-a-server-restart design
+    (a reaper only works from the process that spawned the child, so a
+    POSIX zombie check — e.g. reading process state — is likely needed
+    alongside it, not instead of it).
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
