@@ -97,6 +97,14 @@ EXTRACT_UNIT_CONCURRENCY = int(os.getenv("EXTRACT_UNIT_CONCURRENCY", "1"))
 # single row's backoff.
 RATE_LIMIT_MAX_BACKOFF_SECONDS = 300.0
 
+# Count terminally failed pages toward max_pages (crawl/frontier.py
+# count_failed_toward_budget). Off by default = the original budget
+# (done/skipped_extract/mapped only). On: genuine fetch/extraction failures
+# also consume the budget -- robots.txt disallows never do -- so a run whose
+# pages keep failing stops at its budget instead of claiming page after page
+# (ROADMAP.md #54: 247 pages / 741 fetches against max_pages=20).
+MAX_PAGES_COUNTS_FAILED = os.getenv("MAX_PAGES_COUNTS_FAILED", "false").strip().lower() == "true"
+
 # Network timeouts for the two real HTTP call sites behind asyncio.to_thread
 # in llm_factory.py (LESSONS_LEARNED.md #56, ROADMAP.md #40) -- neither had
 # any timeout at all before this: LocalOllamaEmbeddings' requests.post()

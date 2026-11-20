@@ -405,6 +405,17 @@ it to cap total pages ever processed against this frontier across restarts.
 Relevant to any test that resumes a capped run (step 8 exercises both the
 capped-stop path and the resume-past-cap path in one test).
 
+**What counts toward `max_pages`** is one shared predicate
+(`Frontier._budget_sql`), used by both `_locked_claim` and
+`_locked_check_quiescence`. Never write the status list out separately
+again: if the two disagree, a run can stop claiming without ever
+quiescing. By default only `done`/`skipped_extract`/`mapped` count.
+With `config.MAX_PAGES_COUNTS_FAILED` (off by default), terminally
+`failed` rows count too, except a robots.txt disallow
+(`ROBOTS_DISALLOWED_ERROR`; no request was made). Without it, a run
+whose pages keep failing never reaches its budget (`ROADMAP.md` #54).
+Like done rows, failed rows already in a resumed `frontier.db` count.
+
 **JSONL duplicate-write risk on crash-resume, and why it's handled at the
 file layer, not a DB column**: see `LESSONS_LEARNED.md` for the incident
 this traces to. Short version — `status='done'` is set by the *writer*,

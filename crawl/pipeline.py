@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 from storage.canonical import build_canonical_record, detect_license_signal, extract_page_title
 from config import MAX_RETRIES, RATE_LIMIT_MAX_BACKOFF_SECONDS, get_threshold
 from content.extraction import MalformedExtractionError, parse_qa_json
-from crawl.frontier import Frontier, FrontierRow
+from crawl.frontier import ROBOTS_DISALLOWED_ERROR, Frontier, FrontierRow
 from crawl.politeness import HostPoliteness
 from crawl.robots_cache import RobotsCache
 from crawl.scope import normalize_url
@@ -330,7 +330,7 @@ async def crawl_worker(
             policy = await robots_cache.get_policy(row.host)
             if not policy.is_allowed(row.url):
                 print(f"[robots] disallowed by robots.txt, skipping: {row.url}")
-                await frontier.mark_permanently_failed(row.url, "robots_disallowed")
+                await frontier.mark_permanently_failed(row.url, ROBOTS_DISALLOWED_ERROR)
                 continue
 
         # One shared HostPoliteness instance across every crawl_worker task

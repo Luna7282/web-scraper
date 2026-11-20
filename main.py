@@ -227,7 +227,8 @@ async def headless_map(cfg: dict) -> dict:
     host_prefix_pairs = [(h, p) for h, p in cfg["host_prefix_pairs"]]
     scope_check = _make_scope_check(host_prefix_pairs)
 
-    frontier = Frontier(db_path, max_pages=cfg.get("max_pages"), max_depth=cfg.get("max_depth"))
+    frontier = Frontier(db_path, max_pages=cfg.get("max_pages"), max_depth=cfg.get("max_depth"),
+                        count_failed_toward_budget=config.MAX_PAGES_COUNTS_FAILED)
     await frontier.open()
     await frontier.recover_crashed()
     await frontier.seed(seeds)
@@ -280,7 +281,8 @@ async def headless_crawl(cfg: dict) -> dict:
 
     provider_name, model_name, llm, embeddings = _resolve_llm(cfg)
 
-    frontier = Frontier(db_path, max_pages=cfg.get("max_pages"), max_depth=cfg.get("max_depth"))
+    frontier = Frontier(db_path, max_pages=cfg.get("max_pages"), max_depth=cfg.get("max_depth"),
+                        count_failed_toward_budget=config.MAX_PAGES_COUNTS_FAILED)
     await frontier.open()
     await frontier.recover_crashed()
     await frontier.seed(seeds)
@@ -444,7 +446,8 @@ async def map_main(root_url: str):
     crawl_workers_n = int(Prompt.ask("Concurrent crawl workers", default="5"))
 
     os.makedirs(RUN_DIR, exist_ok=True)
-    frontier = Frontier(FRONTIER_DB_PATH, max_pages=max_pages, max_depth=max_depth)
+    frontier = Frontier(FRONTIER_DB_PATH, max_pages=max_pages, max_depth=max_depth,
+                        count_failed_toward_budget=config.MAX_PAGES_COUNTS_FAILED)
     await frontier.open()
     recovery = await frontier.recover_crashed()
     if recovery["requeued"] or recovery["failed"]:
@@ -979,7 +982,8 @@ async def main():
     extract_workers_n = int(Prompt.ask("Concurrent extract workers", default="2"))
 
     os.makedirs(RUN_DIR, exist_ok=True)
-    frontier = Frontier(FRONTIER_DB_PATH, max_pages=max_pages, max_depth=max_depth)
+    frontier = Frontier(FRONTIER_DB_PATH, max_pages=max_pages, max_depth=max_depth,
+                        count_failed_toward_budget=config.MAX_PAGES_COUNTS_FAILED)
     await frontier.open()
     recovery = await frontier.recover_crashed()
     if recovery["requeued"] or recovery["failed"]:

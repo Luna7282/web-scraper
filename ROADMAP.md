@@ -1112,7 +1112,9 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     dedupe and must not make the robots check more permissive than the
     file says. Not fixed in Brief 1.
 
-54. **[Found 2026-11-20, Brief 1 Step 2] Failed pages don't count toward
+54. **[Option available -- Brief 1 3c item B: `config.MAX_PAGES_COUNTS_FAILED`
+    (off by default) counts genuine failures toward the budget; default
+    behaviour unchanged] [Found 2026-11-20, Brief 1 Step 2] Failed pages don't count toward
     `max_pages`, so a run whose pages keep failing never stops at its
     budget.** `Frontier.claim()`'s cap counts only
     `done`/`skipped_extract`/`mapped` rows (see #28 for the separate
