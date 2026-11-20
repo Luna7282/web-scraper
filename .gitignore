@@ -12,3 +12,4 @@ data/
 archive/
 .claude/
 .pytest_cache/
+.DS_Store
