@@ -5287,3 +5287,63 @@ measured, not assumed. (3) A 4,308-pair page from one changelog is a
 dataset-balance question, out of scope here but visible now. The 28
 fetched URLs are saved in this run's `crawled_urls.json` for the Step 4
 before/after.
+
+### 83. Brief 1 Step 4: per-page unit concurrency 4 roughly doubles throughput (0.66 → 1.24 pages/min), not 4×. The provider shares capacity across concurrent calls, so per-call latency triples
+
+**Setup.** Same 28 pages as the Step 2 baseline (#82): seeded from its
+`crawled_urls.json` with `max_depth=0` (checked offline first: exactly the
+seeds are fetched, nothing else), `max_pages` 28, fresh run directory.
+`ollama_cloud/deepseek-v4.1-flash:cloud`, 2 crawl / 2 extract workers,
+`EXTRACT_UNIT_CONCURRENCY=4` (code `68a867e`), blank intent, `per_chunk`,
+quality scoring and RAG off, timing on. A stop rule covered site
+429s/challenges and LLM 429s or 3 consecutive LLM errors; it never fired.
+No strict concurrency-1 rerun (agreed: fetch was 0.8% of the baseline's
+wall-clock). All 650 units that produced pairs in both runs had
+byte-identical source text, so the inputs really were the same.
+
+| | baseline (c=1) | c=4 |
+|---|---|---|
+| wall-clock | 42.6 min | **22.5 min** |
+| pages/min, all 28 | 0.66 | **1.24** (1.9×) |
+| pages/min, without release-notes | 1.42 | 1.61 |
+| release-notes page | 2,133s | **1,058s** (2.0×) |
+| per-page s, mean / median | 132.0 / 36.8 | 84.0 / 39.0 |
+| per-page s without release-notes, mean / median | 57.9 / 35.1 | 48.0 / 30.3 |
+| call latency median / p95 / max | 3.78 / 12.6 / 21.1s | **11.18 / 21.7 / 40.5s** |
+| output tokens per call (median) | 1,212 | 1,216 |
+| per-call output speed (median) | 289 tok/s | **123 tok/s** |
+| aggregate output throughput | 490 tok/s | **950 tok/s** |
+| peak LLM calls in flight | 2 | **8** (760s at 8) |
+| calls / malformed | 752 / 3 | 752 / 1 |
+| pairs (all / without release-notes) | 5,986 / 1,678 | 6,094 / 1,717 |
+| 429s / errors / site blocks | 0 / 0 / 0 | 0 / 0 / 0 |
+
+**What it means.**
+- **The provider, not the code, set the ceiling.** Output per call is
+  unchanged, but each call ran ~2.3× slower once 8 were in flight.
+  Aggregate throughput rose ~1.9×, not 4×. `deepseek-v4.1-flash:cloud`
+  appears to share capacity across one key's concurrent calls. More
+  concurrency would likely give diminishing returns rather than a linear
+  speed-up. One run, one model; not a general claim about Ollama Cloud.
+- **The gain is concentrated where the brief predicted:** the one huge
+  page (release-notes 2.0×). Small pages (≤5 units) barely move or get
+  slightly slower per call, since they mostly ran alongside 4-8 other
+  calls.
+- **release-notes is still 78% of the wall-clock** (1,058 of 1,350s).
+  Pages/min on this site is still a function of one page.
+- **Pair quality: no change detected.** Whole-run stats match (answer
+  median 115 vs 117 chars, question 72 vs 73, word overlap of answers with
+  their source unit 0.72 vs 0.71, `source_chunk` always set). A same-unit
+  spot-check on 4 pages (encoder, deployment/versions,
+  tutorial/dependencies, release-notes) showed the same facts, PR numbers
+  and authors, reworded. Per-page pair counts moved by −9…+23 (+1.8% in
+  total), consistent with sampling noise. Temperature isn't set, and
+  concurrency doesn't touch the prompt. No baseline-vs-baseline repeat
+  exists to size that noise exactly.
+- **Measurement caveat found:** a naive interval sweep reported a peak of
+  9 (and 3 for the baseline). Both lasted 0.0s and are artefacts of
+  millisecond-rounded `ts`. Weight in-flight counts by duration before
+  quoting a peak.
+- **The 429 path was not exercised.** Doubling the request rate drew no
+  rate limit from this provider, so ROADMAP #51/#54/#56 stay unverified
+  against a real limit under concurrency.
