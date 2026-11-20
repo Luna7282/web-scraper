@@ -45,6 +45,7 @@ not by accident.
 | | `graph.py` | `discovery_graph`/`path_tree`: JSON graph projections over a frontier DB (`--graph`) |
 | | `live_status.py` | `read_live_status`: poll-friendly crawl-state snapshot, own connection (`--live-status`) |
 | | `score_report.py` | `--score-report`: relevance-score distribution from a prior run |
+| | `timing.py` | `TimingLog`: opt-in (`config.EXTRACT_TIMING_LOG`, off by default) JSONL timing of fetch/score/LLM calls → `<run_dir>/timings.jsonl` |
 | `content/` | `chrome_strip.py` | Nav/header/footer/aside/button exclusion, applied in `main.py::_make_fetch_fn` |
 | | `extraction.py` | `parse_qa_json`, the Q&A system prompt |
 | | `extraction_units.py` | Extraction-strategy chunk selection (`first_n_chars`/`per_chunk`/`top_k_chunks_by_relevance`) |

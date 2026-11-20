@@ -63,6 +63,18 @@ class ExtractionPromptVariant(str, Enum):
 # default.
 EXTRACTION_PROMPT_VARIANT = ExtractionPromptVariant.STANDARD
 
+# Opt-in timing log (crawl/timing.py). Off by default -- when off, no
+# TimingLog is built and the workers run exactly the pre-timing code path.
+# When on, main()/headless_crawl() append one JSON line per event (fetch,
+# relevance scoring, each extraction LLM call, each quality-scoring call,
+# per-page summary, run start/end) to <run_dir>/EXTRACT_TIMING_LOG_FILENAME
+# (data/run/timings.jsonl for the interactive CLI). Appends rather than
+# truncates so a resumed run keeps its earlier events; split runs on the
+# run_start event. Env-overridable (same pattern as USE_SYSTEM_ONE below)
+# so a measurement run doesn't need a source edit.
+EXTRACT_TIMING_LOG = os.getenv("EXTRACT_TIMING_LOG", "false").strip().lower() == "true"
+EXTRACT_TIMING_LOG_FILENAME = "timings.jsonl"
+
 # Network timeouts for the two real HTTP call sites behind asyncio.to_thread
 # in llm_factory.py (LESSONS_LEARNED.md #56, ROADMAP.md #40) -- neither had
 # any timeout at all before this: LocalOllamaEmbeddings' requests.post()

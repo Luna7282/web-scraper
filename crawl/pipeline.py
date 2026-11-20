@@ -8,12 +8,14 @@ tests/test_crawl_worker.py, tests/test_extract_worker.py.
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 if TYPE_CHECKING:
+    from crawl.timing import TimingLog
     from decisions import DecisionBackend
 
 from storage.canonical import build_canonical_record, detect_license_signal, extract_page_title
@@ -76,6 +78,36 @@ ExtractFn = Callable[[str], Awaitable[str]]  # content -> raw LLM response text
 ScopeCheck = Callable[[str], bool]
 
 
+# Timing helpers (crawl/timing.py, config.EXTRACT_TIMING_LOG). Every one is
+# a no-op when timing is None -- the default -- and none of them awaits.
+def _since(started: float) -> float:
+    return round(time.perf_counter() - started, 4)
+
+
+def _record_extract_call(
+    timing: TimingLog | None, url: str, chunk_index: int, unit: str, started: float,
+    outcome: str, seconds: float | None = None,
+) -> None:
+    if timing is None:
+        return
+    timing.record(
+        "extract_call", url=url, chunk_index=chunk_index, chars_in=len(unit),
+        seconds=seconds if seconds is not None else _since(started),
+        outcome=outcome, **timing.llm_fields(),
+    )
+
+
+def _record_page(
+    timing: TimingLog | None, url: str, outcome: str, units: int, pairs: int, started: float | None,
+) -> None:
+    if timing is None:
+        return
+    timing.record(
+        "page", url=url, outcome=outcome, units=units, pairs=pairs,
+        extraction_seconds=_since(started) if started is not None else 0.0,
+    )
+
+
 async def crawl_worker(
     frontier: Frontier,
     fetch_fn: FetchFn,
@@ -85,6 +117,7 @@ async def crawl_worker(
     politeness: HostPoliteness | None = None,
     poll_interval: float = POLL_INTERVAL,
     fatal_error_sink: list[str] | None = None,
+    timing: TimingLog | None = None,
 ) -> None:
     while True:
         # Checked before claim() too, not just in the row-is-None branch
@@ -120,7 +153,19 @@ async def crawl_worker(
 
         try:
             async with gate:
-                html, raw_hrefs = await fetch_fn(row.url)
+                if timing is None:
+                    html, raw_hrefs = await fetch_fn(row.url)
+                else:
+                    # Timed inside the politeness gate: fetch time only,
+                    # not time spent waiting for the per-host slot.
+                    fetch_started = time.perf_counter()
+                    try:
+                        html, raw_hrefs = await fetch_fn(row.url)
+                    except Exception as e:
+                        timing.record("fetch", url=row.url, seconds=_since(fetch_started),
+                                      outcome=type(e).__name__)
+                        raise
+                    timing.record("fetch", url=row.url, seconds=_since(fetch_started), outcome="ok")
         except FetchTimeout as e:
             await frontier.mark_fetch_failed(row.url, f"timeout: {e}")
             continue
@@ -160,6 +205,8 @@ async def crawl_worker(
             children.append((normalized, row.section_label))
 
         await frontier.insert_children(row.url, row.depth, children)
+        if timing is not None:
+            timing.mark_enqueued(row.url)
         await frontier.put_content(content_queue, (row.url, html))
 
 
@@ -180,6 +227,7 @@ async def extract_worker(
     poll_interval: float = POLL_INTERVAL,
     quality_backend: DecisionBackend | None = None,
     quality_threshold: float | None = None,
+    timing: TimingLog | None = None,
 ) -> None:
     while True:
         try:
@@ -189,6 +237,8 @@ async def extract_worker(
                 return
             continue
 
+        queue_wait = timing.pop_queue_wait(url) if timing is not None else None
+        score_started = time.perf_counter()
         try:
             score = await score_fn(url, content)
         except RateLimitError as e:
@@ -202,11 +252,16 @@ async def extract_worker(
             await frontier.mark_extract_outcome(url, "failed", f"scoring: {type(e).__name__}: {e}")
             await frontier.content_done(content_queue)
             continue
+        finally:
+            if timing is not None:
+                timing.record("score", url=url, seconds=_since(score_started),
+                              queue_wait_seconds=queue_wait)
 
         promote = score >= follow_threshold
         await frontier.score_and_resolve_children(url, score, promote)
 
         if score < extract_threshold:
+            _record_page(timing, url, "skipped_extract", units=0, pairs=0, started=None)
             await frontier.mark_extract_outcome(url, "skipped_extract")
             await frontier.content_done(content_queue)
             continue
@@ -214,6 +269,7 @@ async def extract_worker(
         try:
             units = await extraction_units_fn(content) if extraction_units_fn else [content]
         except Exception as e:
+            _record_page(timing, url, "error", units=0, pairs=0, started=None)
             await frontier.mark_extract_outcome(url, "failed", f"extraction_units: {type(e).__name__}: {e}")
             await frontier.content_done(content_queue)
             continue
@@ -226,16 +282,28 @@ async def extract_worker(
 
         qa_pairs: list[dict] = []
         parsed_any_unit = False
+        extraction_started = time.perf_counter()
         try:
             for chunk_index, unit in enumerate(units):
-                raw_response = await extract_fn(unit)
+                call_started = time.perf_counter()
+                try:
+                    raw_response = await extract_fn(unit)
+                except Exception as e:
+                    _record_extract_call(timing, url, chunk_index, unit, call_started,
+                                         "rate_limited" if isinstance(e, RateLimitError) else "error")
+                    raise
+                call_seconds = _since(call_started)
                 try:
                     pairs = parse_qa_json(raw_response)
                 except MalformedExtractionError:
+                    _record_extract_call(timing, url, chunk_index, unit, call_started, "malformed",
+                                         seconds=call_seconds)
                     # One bad unit doesn't fail the whole page -- each unit
                     # is an independent LLM call; a page only fails below
                     # if literally none of its units parsed.
                     continue
+                _record_extract_call(timing, url, chunk_index, unit, call_started, "ok",
+                                     seconds=call_seconds)
                 parsed_any_unit = True
                 for pair in pairs:
                     quality_score, quality_method = None, None
@@ -246,10 +314,23 @@ async def extract_worker(
                         # extract_fn's failures identically (fail loudly,
                         # mark_extract_outcome(..., 'failed', reason),
                         # never a silent fallback to keeping the pair).
-                        answer = await quality_backend.noul(
-                            f"Instruction: {pair['instruction']}\nResponse: {pair['response']}",
-                            "Is this a good instruction-response training pair?",
-                        )
+                        quality_started = time.perf_counter()
+                        try:
+                            answer = await quality_backend.noul(
+                                f"Instruction: {pair['instruction']}\nResponse: {pair['response']}",
+                                "Is this a good instruction-response training pair?",
+                            )
+                        except Exception as e:
+                            if timing is not None:
+                                timing.record(
+                                    "quality_call", url=url, chunk_index=chunk_index,
+                                    seconds=_since(quality_started),
+                                    outcome="rate_limited" if isinstance(e, RateLimitError) else "error",
+                                )
+                            raise
+                        if timing is not None:
+                            timing.record("quality_call", url=url, chunk_index=chunk_index,
+                                          seconds=_since(quality_started), outcome="ok")
                         quality_score, quality_method = answer.value, answer.method
                         # None (the default): per-method threshold, looked
                         # up by the answering backend's own method -- Jev/
@@ -276,6 +357,8 @@ async def extract_worker(
                         quality_score=quality_score, quality_decision_method=quality_method,
                     ))
         except RateLimitError as e:
+            _record_page(timing, url, "rate_limited", units=len(units), pairs=len(qa_pairs),
+                         started=extraction_started)
             await frontier.mark_extract_outcome(
                 url, "failed", "rate_limited (extraction)",
                 backoff_seconds=e.retry_after or DEFAULT_RATE_LIMIT_BACKOFF_SECONDS,
@@ -283,17 +366,21 @@ async def extract_worker(
             await frontier.content_done(content_queue)
             continue
         except Exception as e:
+            _record_page(timing, url, "error", units=len(units), pairs=len(qa_pairs),
+                         started=extraction_started)
             await frontier.mark_extract_outcome(url, "failed", f"extraction: {type(e).__name__}: {e}")
             await frontier.content_done(content_queue)
             continue
 
         if units and not parsed_any_unit:
+            _record_page(timing, url, "malformed", units=len(units), pairs=0, started=extraction_started)
             await frontier.mark_extract_outcome(
                 url, "failed", "malformed_json: no extraction unit produced valid JSON",
             )
             await frontier.content_done(content_queue)
             continue
 
+        _record_page(timing, url, "ok", units=len(units), pairs=len(qa_pairs), started=extraction_started)
         chunks = chunk_fn(content) if chunk_fn is not None else None
         await frontier.put_results(results_queue, ExtractionResult(url=url, qa_pairs=qa_pairs, chunks=chunks))
         await frontier.content_done(content_queue)

@@ -20,6 +20,7 @@ from crawl.scope import normalize_url, derive_prefix, is_in_scope
 from crawl.frontier import Frontier
 from crawl.pipeline import crawl_worker, extract_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError
 from crawl.politeness import HostPoliteness
+from crawl.timing import TimingLog
 from content.extraction import QA_EXTRACTION_SYSTEM_PROMPT, CODE_QA_EXTRACTION_SYSTEM_PROMPT
 from crawl.branch_select import suggest_branch_selection, BRANCH_CLASSIFICATION_SYSTEM_PROMPT
 from content.relevance import make_score_fn
@@ -334,10 +335,14 @@ async def headless_crawl(cfg: dict) -> dict:
             default_delay_seconds=config.DEFAULT_POLITENESS_DELAY_SECONDS,
         )
         fatal_errors: list[str] = []
+        timing = _start_timing_log(
+            run_dir, provider_name, model_name, crawl_workers_n, extract_workers_n,
+            cfg.get("max_pages"), quality_backend is not None,
+        )
         tasks = [
             asyncio.create_task(
                 crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness,
-                             fatal_error_sink=fatal_errors)
+                             fatal_error_sink=fatal_errors, timing=timing)
             )
             for _ in range(crawl_workers_n)
         ] + [
@@ -347,7 +352,8 @@ async def headless_crawl(cfg: dict) -> dict:
                                 chunk_fn=chunk_fn, extraction_units_fn=extraction_units_fn,
                                 generation_model=model_name, extraction_strategy=config.EXTRACTION_STRATEGY.value,
                                 section_depth=config.SECTION_DEPTH, seed_prefixes=host_prefix_pairs,
-                                quality_backend=quality_backend, quality_threshold=quality_threshold)
+                                quality_backend=quality_backend, quality_threshold=quality_threshold,
+                                timing=timing)
             )
             for _ in range(extract_workers_n)
         ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
@@ -356,6 +362,7 @@ async def headless_crawl(cfg: dict) -> dict:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await _stop_timing_log(timing)
 
     counts = await frontier.counts_by_status()
     await frontier.close()
@@ -700,6 +707,31 @@ async def _http_get_text(url: str) -> str | None:
     return await asyncio.to_thread(_get)
 
 
+def _start_timing_log(
+    run_dir: str, provider_name: str, model_name: str, crawl_workers_n: int,
+    extract_workers_n: int, max_pages: int | None, quality_scoring: bool,
+) -> TimingLog | None:
+    """None unless config.EXTRACT_TIMING_LOG -- see crawl/timing.py."""
+    if not config.EXTRACT_TIMING_LOG:
+        return None
+    timing = TimingLog(
+        os.path.join(run_dir, config.EXTRACT_TIMING_LOG_FILENAME), provider=provider_name, model=model_name,
+    )
+    timing.start()
+    timing.record(
+        "run_start", crawl_workers=crawl_workers_n, extract_workers=extract_workers_n,
+        max_pages=max_pages, extraction_strategy=config.EXTRACTION_STRATEGY.value,
+        quality_scoring=quality_scoring, **timing.llm_fields(),
+    )
+    console.print(f"[dim]Timing log on: {timing.path}[/dim]")
+    return timing
+
+
+async def _stop_timing_log(timing: TimingLog | None) -> None:
+    if timing is not None:
+        await timing.close()  # writes run_end (wall_seconds) and flushes
+
+
 def _make_fetch_fn(crawler: AsyncWebCrawler):
     """Shares one AsyncWebCrawler instance across every crawl_worker call
     -- matching orchestrator.py's existing pattern, not spinning up a new
@@ -1001,10 +1033,14 @@ async def main():
         )
 
         fatal_errors: list[str] = []
+        timing = _start_timing_log(
+            RUN_DIR, provider_name, model_name, crawl_workers_n, extract_workers_n,
+            max_pages, quality_backend is not None,
+        )
         tasks = [
             asyncio.create_task(
                 crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness,
-                             fatal_error_sink=fatal_errors)
+                             fatal_error_sink=fatal_errors, timing=timing)
             )
             for _ in range(crawl_workers_n)
         ] + [
@@ -1016,7 +1052,8 @@ async def main():
                                 extraction_strategy=config.EXTRACTION_STRATEGY.value,
                                 section_depth=config.SECTION_DEPTH,
                                 seed_prefixes=host_prefix_pairs,
-                                quality_backend=quality_backend, quality_threshold=quality_threshold)
+                                quality_backend=quality_backend, quality_threshold=quality_threshold,
+                                timing=timing)
             )
             for _ in range(extract_workers_n)
         ] + [
@@ -1028,6 +1065,7 @@ async def main():
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await _stop_timing_log(timing)
 
     counts = await frontier.counts_by_status()
     await frontier.close()
