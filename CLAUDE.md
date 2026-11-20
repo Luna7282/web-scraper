@@ -667,10 +667,18 @@ extraction, real RAG index, real crash-resume).
   instead of specificity and broke a real site's robots.txt — see
   `LESSONS_LEARNED.md` #27 before assuming a "respects robots.txt" claim
   extends to Allow-overrides-Disallow correctness without checking.
-  Per-host rate limiting/politeness delay is **not** built yet —
-  `Crawl-delay` isn't even collected by `_parse_rules()` (see
-  `ROADMAP.md` #9); none of the 5 fixture sites specify one, so this is
-  unverified against a real case, not proven safe.
+  Per-host politeness **is** built (`ROADMAP.md` #9, resolved):
+  `_parse_rules()` collects `Crawl-delay`, and `crawl_worker` passes it to
+  `crawl/politeness.py::HostPoliteness.hold()`, which caps concurrent
+  requests per host (`MAX_CONCURRENT_REQUESTS_PER_HOST`) and spaces
+  requests by the site's `Crawl-delay` when given, else
+  `DEFAULT_POLITENESS_DELAY_SECONDS`. Covered offline
+  (`tests/test_politeness.py`, `tests/test_robots_cache*.py`). Neither
+  docs.manim.community nor fastapi.tiangolo.com specifies a
+  `Crawl-delay` (checked 2026-11-20), so a real site's value hasn't been
+  exercised live. The defaults alone were too fast for
+  docs.manim.community (`ROADMAP.md` #52), and a site-side 429 is retried
+  with no backoff.
 - **Progress display** (`progress_display.py`) is read-only against the
   frontier — `counts_by_status()`/`in_progress_urls()` only ever `SELECT`.
   Safe to poll on any interval; it cannot perturb the state machine.
