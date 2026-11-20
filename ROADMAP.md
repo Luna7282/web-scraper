@@ -1047,6 +1047,30 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     any fix should parse the provider's own hint first and keep the
     "release the row, never sleep the worker" design.
 
+52. **[Found 2026-11-20, Brief 1 Step 2] Site-side HTTP 429 is retried
+    with zero backoff (the fetch-side twin of #51), and the default crawl
+    settings were too fast for docs.manim.community.** `crawl_worker`
+    handles `FetchHTTPError` with `frontier.mark_fetch_failed(url,
+    f"http_{status}")`, which takes `backoff_seconds` but defaults it to
+    0.0. Nothing passes one, and `Retry-After` is never read, so a page
+    the site answered with 429 is re-queued straight away and re-fetched.
+    Every 429'd page in the run below was hit 3 more times within seconds
+    (`retry_count` 3, `http_429`), raising the request rate at exactly the
+    point the site asked it to drop. A 429 (and a Cloudflare challenge)
+    should at least back off, and probably slow or stop the whole host,
+    not just the one row. **Measured:** a real Brief 1 Step 2 crawl of
+    `https://docs.manim.community/en/stable/` at the defaults (5 crawl
+    workers, `MAX_CONCURRENT_REQUESTS_PER_HOST=2`,
+    `DEFAULT_POLITENESS_DELAY_SECONDS=0.5`) got the seed page, then 71 of
+    its next 72 fetches were refused within ~40s: 70 × "Blocked by
+    anti-bot protection: HTTP 429 Too Many Requests", 1 × "Cloudflare JS
+    challenge". The run was stopped by hand. Earlier manim crawls in
+    `LESSONS_LEARNED.md` didn't hit this, so the site's protection or
+    their settings may have differed; one run is not a calibration.
+    Related: `Crawl-delay` is honoured when present (#9), but this site
+    specifies none, so only the 0.5s default applied. Not fixed in
+    Brief 1.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
