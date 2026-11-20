@@ -5120,3 +5120,62 @@ range, so the `#75` conclusion stands: Jev needs its own calibrated
 threshold, not traditional's, before it's trustworthy as a gate. What's
 different now is that the comparison is no longer confounded by feeding
 either backend noise on an unknown number of pages.
+
+### 80. Brief 1 Steps 0-1: macOS baseline (one POSIX-only control-server bug, nothing else) and opt-in extraction timing, built before measuring anything
+
+**Context.** Brief 1 is about extraction speed. `extract_worker` awaits one
+LLM call per unit, one after another, so worker count only parallelises
+across pages. `README.md`'s throughput figures (~0.75-0.79 pages/min, ~13s
+median call) were measured on `ollama_cloud/deepseek-v4-flash`. Gemini is
+the default now (#77), so those figures aren't treated as current. Nothing
+gets changed until it has been measured (Step 2), and nothing gets measured
+until timing exists (this entry).
+
+**Step 0 baseline, first run on macOS** (fresh `uv sync` from `uv.lock`, 156
+packages; suite is plain `unittest`, no pytest). 473 collected, 453 pass, 10
+fail, 10 skip. 2 more tests in `test_fetch_fn_integration` were held back
+because they need a real Chromium (not installed yet). Every failure has the
+same cause, a bug that can only show up off Windows: `server/jobs.py::_pid_alive`
+uses `os.kill(pid, 0)` on POSIX. `JobManager` never reaps its `Popen`
+children, so a finished job becomes a zombie, and `os.kill(pid, 0)` still
+succeeds against a zombie. The job reads `running` forever. Windows has no
+zombies, which is why the suite was green on `D:\scraper`. Logged as
+`ROADMAP.md` #50, not fixed (out of scope). **Lesson:** "the suite passes" so
+far meant "passes on Windows". `CLAUDE.md` describes job tracking as if it
+were cross-platform, but the POSIX branch had never actually been run.
+
+**Step 1: timing instrumentation** (`crawl/timing.py`, `config.EXTRACT_TIMING_LOG`,
+default `False`, env-overridable like `USE_SYSTEM_ONE`). When it's on,
+`main()`/`headless_crawl()` append JSON lines to `<run_dir>/timings.jsonl`.
+Events: `run_start`/`run_end`, `fetch` (timed inside the politeness gate, so
+it doesn't include waiting for a host slot), `score` (with
+`queue_wait_seconds`: fetch-complete → extract-worker pickup, which includes
+any backpressure wait to get into the queue), `extract_call` (url,
+chunk_index, chars_in, seconds, provider, model, outcome
+ok/malformed/rate_limited/error), `quality_call`, and a per-page `page`
+summary (outcome, units, pairs, extraction wall seconds).
+Decisions worth keeping:
+- **`record()` never awaits.** It's a `put_nowait` onto an unbounded queue,
+  so instrumenting a worker adds no new await points. With timing on, the
+  workers' scheduling stays the same as with it off.
+- **One drain task owns the file and writes through `asyncio.to_thread`.**
+  Only one writer at a time is what makes `to_thread` enough with no lock
+  (see `CLAUDE.md`'s event-loop section). `close()` stops it with a sentinel
+  rather than `cancel()`. Cancelling would leave a `to_thread` write running
+  in its thread, and then the final flush could append to the same file
+  concurrently.
+- **Timing must never take down a crawl.** A write error warns once and
+  drops the lines. Nothing in the drain task re-raises.
+- **The default path is the old path.** With `timing=None`, every
+  instrumentation branch is skipped. The only additions are a
+  `try/except: raise` around `extract_fn` and the quality call, which is a
+  semantic no-op. `tests/test_timing.py` (11 tests) includes a check that
+  `qa_pairs` come out identical with timing on and off. The full suite is
+  otherwise unchanged: 484 run, the same 10 #50 failures, nothing new.
+
+**Noticed while reading the code, relevant to Step 3, not acted on:**
+`_make_extract_fn` runs `llm.invoke` through `asyncio.to_thread`, so
+per-unit concurrency is bounded by the default thread pool
+(min(32, cpu+4)), not only by any semaphore. And it raises
+`RateLimitError()` without a `retry_after`, so every 429 backs off the flat
+5s `DEFAULT_RATE_LIMIT_BACKOFF_SECONDS`, whatever the provider asked for.
