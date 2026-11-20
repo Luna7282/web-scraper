@@ -5179,3 +5179,60 @@ per-unit concurrency is bounded by the default thread pool
 (min(32, cpu+4)), not only by any semaphore. And it raises
 `RateLimitError()` without a `retry_after`, so every 429 backs off the flat
 5s `DEFAULT_RATE_LIMIT_BACKOFF_SECONDS`, whatever the provider asked for.
+
+### 81. Brief 1 Step 2: no valid baseline. Two site attempts blocked or aborted, then a Gemini quota ran out 8 minutes into the fastapi run
+
+**What was attempted.** The plan: one 20-page timed crawl (blank intent,
+per-chunk extraction, `gemini/gemini-3.6-flash`, quality scoring and RAG
+off) to measure extraction before Step 3 changes anything.
+1. **docs.manim.community, seed normalized → robots-disallowed, 0 fetches.**
+   `normalize_url` strips the trailing slash, and the site allows only
+   `/en/stable/` (`ROADMAP.md` #53). The seed has to be passed literally.
+2. **docs.manim.community, literal seed, 5 crawl workers → stopped by hand
+   at 41s.** The seed page fetched, then 71/72 fetches came back "Blocked
+   by anti-bot protection" (70 × HTTP 429, 1 × Cloudflare challenge). Each
+   429'd page was retried 3 times with no backoff (`ROADMAP.md` #52).
+3. **fastapi.tiangolo.com, 2 crawl workers, 24 min, 0 pages done.** The
+   site was fine (741/741 fetches OK, no 429s or challenges, stop rule
+   never fired). Gemini wasn't. A `--verify-providers` call right before
+   had first returned 503 `UNAVAILABLE` ("high demand") and, 5 minutes
+   later, `OK`. During the crawl: 19 extraction calls succeeded in the
+   first ~8 minutes (median 33.5s, p95 291s, max 304s; two calls took
+   ~290-300s). From t≈473s to the end, **all 741 remaining calls were
+   429s**, each returning within ~2.4s, at ~50 attempts/min for 16 minutes
+   without ever recovering. That reads as an exhausted quota window
+   (plausibly a free-tier daily cap; ~21 successful requests in total),
+   not a per-minute limit. **Not confirmed:** the 429 body, which names
+   the quota metric, is never recorded. `_make_extract_fn` raises a bare
+   `RateLimitError()` and the frontier stores only "rate_limited
+   (extraction)". The Gemini tier is still unknown.
+
+**What the failed run still showed (all relevant to Brief 1):**
+- **The 429 path, exercised for real for the first time, spirals.** A 429
+  on any unit fails the whole page. The units that already succeeded are
+  thrown away (one page had 7 OK units before its 429), the row is
+  released with the flat 5s backoff (#51), re-fetched, and every unit
+  re-sent from 0. After `MAX_RETRIES` the page is `failed`. Failed pages
+  don't count toward `max_pages`, so the run kept claiming new rows:
+  **247 distinct pages, 741 fetches, all `failed`**, against a 20-page
+  budget. Prefix `None` also let it wander into the site's translations
+  (zh/pt/es/ja ≈ half the rows).
+- **Per-chunk units are much smaller than `PARENT_CHUNK_SIZE` suggests.**
+  Successful calls carried 27-1,983 chars (most under 300). Units per
+  page: median 16, p75 28, p90 41, max 317 (the release-notes page in each
+  language). That's 6,031 units across 247 pages, each one an LLM call.
+  At ~33s median per call, sequentially, a median page is roughly 9
+  minutes of extraction. This alone dominates throughput, and quota.
+- **Hidden retries inside one timed call.** `ChatOpenAI` keeps
+  LangChain's default `max_retries=2`, so the OpenAI SDK retries 429/5xx
+  itself before `extract_fn` ever sees an error. A "rate_limited" call in
+  `timings.jsonl` was likely 3 HTTP requests, and a slow "ok" call may
+  include retries.
+- Wall-clock share: an LLM call was in flight 99.6% of the time, a fetch
+  35.4%. Distorted by the 429 churn, so not a usable baseline figure.
+
+**Why it matters.** Step 3's concurrency raises the request rate. Under
+whatever quota this key has, it would reach this failure mode sooner, not
+later. And the units-per-page finding means "calls per page" is as big a
+lever as "calls in parallel". No baseline numbers exist yet. The README's
+deepseek figures are still unverified for Gemini.
