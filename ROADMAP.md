@@ -1156,6 +1156,22 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     and should keep the stored text bounded and free of secrets. Not fixed
     in Brief 1 (design proposal in Brief 1 Step 3c).
 
+57. **[Found 2026-11-20, Brief 1 Step 2] One page produced 72% of a run's
+    pairs, and nothing caps or balances pairs per page.** In the Step 2
+    baseline (fastapi.tiangolo.com, English, 28 pages, `per_chunk`,
+    `deepseek-v4.1-flash:cloud`), `release-notes` alone split into 317
+    units and yielded **4,308 of 5,986 pairs (72%)**. The other 27 pages
+    together produced 1,678. Extraction has no per-page pair cap, the
+    canonical file keeps everything, and export's dedup
+    (`dedup_by_question`, optional `semantic_dedup`) removes duplicates,
+    not over-representation. A dataset built from this run would be
+    mostly changelog entries. The page also took 83% of the run's
+    wall-clock (`LESSONS_LEARNED.md` #82). Options to weigh later: a
+    per-page or per-section pair cap at extraction or export, sampling at
+    split time, or flagging outlier pages in `--dataset-report`.
+    Measurement first: one run on one site is not a distribution. Not
+    changed in Brief 1.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
