@@ -5347,3 +5347,41 @@ byte-identical source text, so the inputs really were the same.
 - **The 429 path was not exercised.** Doubling the request rate drew no
   rate limit from this provider, so ROADMAP #51/#54/#56 stay unverified
   against a real limit under concurrency.
+
+### 84. Brief 1 Step 3c design: cancelling a task does not cancel its `asyncio.to_thread` call, so 3b's "cancel siblings" stops no work
+
+**Found while designing** how to keep finished units when a page hits a
+rate limit (3c item D, now deferred). 3b, as the brief specified,
+cancels a page's sibling unit tasks when one raises (`_run_in_order` on
+an `asyncio.TaskGroup`). But each unit's LLM call is
+`await asyncio.to_thread(llm.invoke, ...)` (`main.py::_make_extract_fn`,
+same in `_make_decision_chat_fn`), and a thread can't be interrupted:
+cancelling only abandons the asyncio future.
+
+**Verified offline, not assumed:** a task awaiting
+`asyncio.to_thread(<0.5s blocking call>)`, cancelled after 0.05s,
+raised `CancelledError` immediately, and the thread completed anyway
+~0.45s later.
+
+**What that means in practice:** the "cancelled" calls still reach the
+provider, still generate, and are still billed, and their results are
+thrown away. They also hold a thread-pool slot until they return. So
+under a rate limit, a failing page doesn't actually lower the request
+rate, and the wasted spend is exactly the work item D would have kept.
+The 3b tests (`test_4_rate_limit_releases_row_with_backoff_and_cancels_siblings`)
+pass because they stub `extract_fn` with a pure `asyncio.sleep`, which
+*is* cancellable. The test proves the asyncio-level behaviour, not the
+real cost. **Lesson:** a cancellation test against an async stub says
+nothing about a call that's really a thread underneath. Check what the
+real call site awaits.
+
+**Decision:** item D (unit-result cache, and let in-flight calls finish
+instead of cancelling) deferred, with no code change. Tracked as
+`ROADMAP.md` #58. The other 3c decisions, recorded for the
+implementation that follows: A (429 body on `RateLimitError`) on by
+default. B (failed pages count toward `max_pages`, except
+robots-disallowed) behind a flag, off by default. C (circuit breaker)
+off by default, may make workers wait at its gate as a documented
+exception to "rate limits release the row". `ChatOpenAI`'s
+`max_retries` becomes config (default 2, unchanged), forced to 0 when
+the breaker is on.
