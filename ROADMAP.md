@@ -1046,6 +1046,24 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     4 is the first planned attempt). Deliberately not changed in Brief 1:
     any fix should parse the provider's own hint first and keep the
     "release the row, never sleep the worker" design.
+    **Extended 2026-11-20 (Brief 1 Step 2): 503/`UNAVAILABLE` is worse
+    than a 429 here: it gets no backoff at all.** A real
+    `--verify-providers` call to `gemini/gemini-3.6-flash` returned HTTP
+    503 `UNAVAILABLE` ("This model is currently experiencing high demand...
+    Please try again later"). `_make_extract_fn` only maps a 429 to
+    `RateLimitError`, so a 503 propagates as a generic exception and lands
+    in `extract_worker`'s `except Exception` branch:
+    `mark_extract_outcome(url, "failed", "extraction: ...")` with the default
+    `backoff_seconds=0.0`. The row is re-queued straight away, re-fetched
+    and re-sent into the same overloaded model, and every attempt counts
+    toward `MAX_RETRIES`. A short demand spike at the provider can
+    therefore burn every in-flight page's retries in seconds and leave
+    them permanently `failed`, and it re-hits the crawled site for each
+    retry too (a retry re-fetches; see `CLAUDE.md`). A fix belongs with
+    the 429 one above: treat transient provider errors (429, 503, likely
+    500/502/504) as retry-later with a backoff, distinct from permanent
+    errors (400/401/404). Not changed in Brief 1, and not part of Step 3's
+    scope.
 
 52. **[Found 2026-11-20, Brief 1 Step 2] Site-side HTTP 429 is retried
     with zero backoff (the fetch-side twin of #51), and the default crawl
