@@ -1172,6 +1172,25 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     Measurement first: one run on one site is not a distribution. Not
     changed in Brief 1.
 
+58. **[Found 2026-11-20, Brief 1 Step 3c] "Cancelled" sibling LLM calls
+    keep running and are billed: `asyncio.to_thread` can't be
+    cancelled.** `extract_fn` (and the quality/decision `chat_fn`) run
+    `llm.invoke` via `asyncio.to_thread`. Cancelling the awaiting task
+    (what 3b's `_run_in_order` does to siblings when one unit fails)
+    only abandons the future. The worker thread finishes the blocking
+    HTTP call regardless, the provider generates and bills the
+    completion, and the result is discarded. Verified offline: a task
+    awaiting `to_thread(blocking 0.5s call)` reported cancelled at 0.05s,
+    and the thread still completed. Consequences: (1) 3b's "cancel
+    siblings on a RateLimitError" stops no work; it only throws away
+    already-paid-for results, and each abandoned call keeps occupying a
+    thread-pool slot until it returns. (2) Under a provider rate limit,
+    the "cancelled" calls still hit the provider, so the effective
+    request rate doesn't drop when a page fails. The deferred Brief 1 3c
+    item D (cache finished units, and on a rate limit let in-flight calls
+    finish instead of cancelling them) is the proposed fix. Not
+    implemented: deferred by decision, no code change in Brief 1.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
