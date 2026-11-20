@@ -5236,3 +5236,54 @@ whatever quota this key has, it would reach this failure mode sooner, not
 later. And the units-per-page finding means "calls per page" is as big a
 lever as "calls in parallel". No baseline numbers exist yet. The README's
 deepseek figures are still unverified for Gemini.
+
+### 82. Brief 1 Step 2 baseline (valid): fastapi.tiangolo.com English-only, `ollama_cloud/deepseek-v4.1-flash:cloud`, 28 pages in 42.6 min. Extraction is output-token-bound, and one page took 83% of the run
+
+**Setup.** `deepseek-v4-flash` (the README's model, and `main.py`'s
+`ollama_cloud` default) now returns HTTP 410, retired 2026-09-25. Used
+`deepseek-v4.1-flash:cloud` (same family) through the run config's `model`
+field; `main.py`'s default is unchanged. **These numbers are not directly
+comparable to the README's deepseek-v4-flash figures.** Scope: seed
+`https://fastapi.tiangolo.com/` plus an allowlist of 22 English top-level
+prefixes. The scope config has no exclude option, so this is the
+least-invasive way to keep out `/zh/ /pt/ /es/ /ja/`. 2 crawl / 2 extract
+workers, `max_pages` 20, blank intent, `per_chunk`, quality scoring and
+RAG off, timing on. Token usage was added to the timing log in this step
+(`953a299`).
+
+**Numbers.**
+- Run: 2,558s wall. **28 pages `done`, 0 failed** (20 + 8 in-flight
+  overshoot, #28). 0 rate limits, 0 errors, 0 site blocks; 28/28 fetches
+  OK (median 0.63s).
+- Extraction calls: 752 (749 OK, 3 malformed). **Median 3.78s, p95 12.6s,
+  max 21.1s**, mean 4.91s.
+- Units per page: mean 26.9, but the median page has 16. **release-notes
+  alone is 317 units, 2,133s (83% of wall-clock) and 4,308 of the 5,986
+  pairs.** Excluding it: mean 16.1 units, 57.9s per page (median 35.1s).
+- **Pages/min: 0.66 overall, 2.17 to the 20th page (9.2 min), 1.42 to the
+  27th (19.0 min).** The last 23.6 minutes were one extract worker
+  grinding through release-notes one unit at a time while the other sat
+  idle. This is the tail Step 3's per-unit concurrency targets directly.
+- Wall-clock share: an LLM call in flight 99.9% of the time (both extract
+  workers busy 44.5%, one busy 55.4%), a fetch 0.8%. Pages waited a median
+  130s (max 534s) in `content_queue` for an extract worker. Fetching is
+  not the bottleneck at all.
+- **Tokens (now logged):** input median 498 (sum 454k), **output median
+  1,212 (mean 1,668, max 8,016, sum 1.25M)**, at a median ~289 output
+  tokens/s. Calls are output-bound: output is ~2.4× input, and latency
+  tracks output length. The provider returns no reasoning-token breakdown
+  (`completion_tokens_details: null`), but a one-word "OK" ping cost 32
+  output tokens, so any hidden thinking is likely counted inside
+  `output_tokens`.
+- Units still small (#55): median 572 chars, 10th percentile 41 chars,
+  37% under 300 chars.
+
+**Why it matters.** (1) Pages/min is dominated by the largest page, not
+the average one. Per-unit concurrency (Step 3b) helps exactly there,
+fetch tuning won't. (2) Per-call cost is output generation, so fewer,
+larger units (Step 3a packing) save the per-call prompt overhead but not
+the output. Whether packing changes pair counts/quality has to be
+measured, not assumed. (3) A 4,308-pair page from one changelog is a
+dataset-balance question, out of scope here but visible now. The 28
+fetched URLs are saved in this run's `crawled_urls.json` for the Step 4
+before/after.
