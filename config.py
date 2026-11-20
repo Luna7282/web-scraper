@@ -63,6 +63,78 @@ class ExtractionPromptVariant(str, Enum):
 # default.
 EXTRACTION_PROMPT_VARIANT = ExtractionPromptVariant.STANDARD
 
+# Opt-in timing log (crawl/timing.py). Off by default -- when off, no
+# TimingLog is built and the workers run exactly the pre-timing code path.
+# When on, main()/headless_crawl() append one JSON line per event (fetch,
+# relevance scoring, each extraction LLM call, each quality-scoring call,
+# per-page summary, run start/end) to <run_dir>/EXTRACT_TIMING_LOG_FILENAME
+# (data/run/timings.jsonl for the interactive CLI). Appends rather than
+# truncates so a resumed run keeps its earlier events; split runs on the
+# run_start event. Env-overridable (same pattern as USE_SYSTEM_ONE below)
+# so a measurement run doesn't need a source edit.
+EXTRACT_TIMING_LOG = os.getenv("EXTRACT_TIMING_LOG", "false").strip().lower() == "true"
+EXTRACT_TIMING_LOG_FILENAME = "timings.jsonl"
+
+# How many of ONE page's extraction units (and, with sample-quality scoring
+# on, its pair-scoring calls) extract_worker keeps in flight at once, under
+# one asyncio.Semaphore (crawl/pipeline.py). 1 = the original strictly
+# sequential per-unit loop, unchanged. Worker count (extract_workers) only
+# parallelises across pages; this parallelises within one, which is what a
+# single huge page (one 317-unit page took 83% of the Brief 1 Step 2
+# baseline, LESSONS_LEARNED.md #82) needs. Each in-flight call occupies one
+# asyncio.to_thread slot (extract_fn runs llm.invoke in a thread), so
+# extract_workers x this must stay well under the default thread pool
+# (min(32, cpu_count + 4)); it also multiplies the request rate the provider
+# sees -- see ROADMAP.md #51/#54 for what a provider rate limit does to a run
+# today. Env-overridable like EXTRACT_TIMING_LOG.
+EXTRACT_UNIT_CONCURRENCY = int(os.getenv("EXTRACT_UNIT_CONCURRENCY", "1"))
+
+# Upper bound on a rate-limit backoff (crawl/pipeline.py::_rate_limit_backoff).
+# A 429's own retry hint (Retry-After / Google retryDelay) is used when the
+# provider sends one -- ROADMAP.md #51 -- but a per-day quota can say "retry
+# in 20 hours", and a queued row parked that far out keeps the run from ever
+# reaching quiescence. Longer outages are the circuit breaker's job, not a
+# single row's backoff.
+RATE_LIMIT_MAX_BACKOFF_SECONDS = 300.0
+
+# Count terminally failed pages toward max_pages (crawl/frontier.py
+# count_failed_toward_budget). Off by default = the original budget
+# (done/skipped_extract/mapped only). On: genuine fetch/extraction failures
+# also consume the budget -- robots.txt disallows never do -- so a run whose
+# pages keep failing stops at its budget instead of claiming page after page
+# (ROADMAP.md #54: 247 pages / 741 fetches against max_pages=20).
+MAX_PAGES_COUNTS_FAILED = os.getenv("MAX_PAGES_COUNTS_FAILED", "false").strip().lower() == "true"
+
+# LLM circuit breaker (crawl/circuit_breaker.py; Brief 1 3c item C). Off by
+# default: LLM_BREAKER_THRESHOLD unset/0 = no breaker, original behaviour.
+# Set to N to open the breaker after N consecutive rate-limited LLM calls:
+# extract workers then WAIT at its gate (a deliberate, documented exception
+# to "rate limits release the row" -- see CLAUDE.md) instead of releasing
+# page after page into an exhausted quota (the 741-429 run, ROADMAP #54).
+# The wait is the provider's own retry hint when it sends one, else
+# LLM_BREAKER_BASE_COOLDOWN_SECONDS doubling per trip up to
+# LLM_BREAKER_MAX_COOLDOWN_SECONDS; then one probe call decides. After
+# LLM_BREAKER_MAX_TRIPS trips, or at once on a daily-quota signal (a quota
+# hint naming a per-day quota, or an UNCAPPED provider retry hint of at
+# least LLM_BREAKER_STOP_IF_RETRY_AFTER_SECONDS), the run stops cleanly,
+# leaving its rows resumable.
+LLM_BREAKER_THRESHOLD = int(os.getenv("LLM_BREAKER_THRESHOLD", "0") or 0)
+LLM_BREAKER_BASE_COOLDOWN_SECONDS = 60.0
+LLM_BREAKER_MAX_COOLDOWN_SECONDS = 900.0
+LLM_BREAKER_MAX_TRIPS = 3
+LLM_BREAKER_STOP_IF_RETRY_AFTER_SECONDS = 3600.0
+
+# ChatOpenAI's max_retries: the openai SDK retries 429/5xx itself, invisibly,
+# before our code sees an error (honouring Retry-After up to 60s). 2 is the
+# SDK/LangChain default, so the default here changes nothing. With the
+# breaker on it is forced to 0 (effective_llm_sdk_max_retries) so every 429
+# reaches the breaker -- otherwise one observed 429 can mean three.
+LLM_SDK_MAX_RETRIES = int(os.getenv("LLM_SDK_MAX_RETRIES", "2"))
+
+
+def effective_llm_sdk_max_retries() -> int:
+    return 0 if LLM_BREAKER_THRESHOLD > 0 else LLM_SDK_MAX_RETRIES
+
 # Network timeouts for the two real HTTP call sites behind asyncio.to_thread
 # in llm_factory.py (LESSONS_LEARNED.md #56, ROADMAP.md #40) -- neither had
 # any timeout at all before this: LocalOllamaEmbeddings' requests.post()

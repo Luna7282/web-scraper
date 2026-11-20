@@ -1005,6 +1005,201 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     real local-embedding cosine similarity on a real content excerpt)
     correctly score it as relevant. 7 new tests in `tests/test_relevance.py`.
 
+50. **[Found 2026-11-20, Brief 1 Step 0 baseline on macOS] `server/jobs.py::_pid_alive()`
+    reports a finished job as `running` forever on POSIX.** On non-Windows
+    it checks liveness with `os.kill(pid, 0)`, but `JobManager.start()`
+    deliberately never `wait()`s/`poll()`s the `Popen` child (see the
+    comments near the top of `server/jobs.py` and in `start()`'s docstring). On
+    POSIX an exited-but-unreaped child stays a zombie until its parent
+    reaps it, and `os.kill(pid, 0)` succeeds against a zombie — so the
+    state never leaves `running`, and `stop()` on an already-finished job
+    reports `stopped` rather than `done`. Windows has no zombies (and uses
+    `tasklist` there), which is why this never showed up before. Caught by
+    the existing suite on macOS, not by a live run: all 10 failures in a
+    473-test baseline are this one cause — 8 in `tests/test_server_jobs.py`
+    and 2 in `tests/test_server_app.py`
+    (`test_start_run_then_poll_job_to_completion`,
+    `test_resume_can_promote_a_mapped_run_to_a_real_crawl`), each asserting
+    `'running' != 'done'/'failed'/'exited'/'stopped'`. **Doc gap alongside
+    it:** `CLAUDE.md`'s control-server section describes job tracking
+    (PID file + live OS check, `tasklist`/`taskkill` "on Windows") as if
+    it were cross-platform, but it has only ever been verified on Windows
+    — the POSIX branch of `_pid_alive`/`_kill_pid` was never exercised
+    until this run. Not fixed here (out of scope for Brief 1); any fix has
+    to keep `JobManager`'s stateless, survives-a-server-restart design
+    (a reaper only works from the process that spawned the child, so a
+    POSIX zombie check — e.g. reading process state — is likely needed
+    alongside it, not instead of it).
+
+51. **[429 part RESOLVED -- Brief 1 3c item A: the provider's Retry-After /
+    retryDelay is now used, capped at `RATE_LIMIT_MAX_BACKOFF_SECONDS`; the
+    503/UNAVAILABLE extension below is still open] [Found 2026-11-20, Brief 1 Step 1] Every extraction 429 backs off a
+    flat 5 seconds, whatever the provider asked for.**
+    `main.py::_make_extract_fn` turns a 429 into `RateLimitError()` with no
+    `retry_after`, so `extract_worker` always falls back to
+    `crawl/pipeline.py::DEFAULT_RATE_LIMIT_BACKOFF_SECONDS` (5.0). The
+    provider's `Retry-After` header (or Gemini's `retryDelay` in the error
+    body), if any, is never read. Against a per-minute quota, 5s is likely
+    too short: the released row gets re-claimed, re-fetched and re-sent
+    into the same exhausted window. Each retry counts toward `MAX_RETRIES`,
+    so a page can end up permanently `failed` purely from rate limiting.
+    Same gap for scoring-path 429s (same exception, same default). The 429
+    path has never been exercised against a real rate limit (Brief 1 Step
+    4 is the first planned attempt). Deliberately not changed in Brief 1:
+    any fix should parse the provider's own hint first and keep the
+    "release the row, never sleep the worker" design.
+    **Extended 2026-11-20 (Brief 1 Step 2): 503/`UNAVAILABLE` is worse
+    than a 429 here: it gets no backoff at all.** A real
+    `--verify-providers` call to `gemini/gemini-3.6-flash` returned HTTP
+    503 `UNAVAILABLE` ("This model is currently experiencing high demand...
+    Please try again later"). `_make_extract_fn` only maps a 429 to
+    `RateLimitError`, so a 503 propagates as a generic exception and lands
+    in `extract_worker`'s `except Exception` branch:
+    `mark_extract_outcome(url, "failed", "extraction: ...")` with the default
+    `backoff_seconds=0.0`. The row is re-queued straight away, re-fetched
+    and re-sent into the same overloaded model, and every attempt counts
+    toward `MAX_RETRIES`. A short demand spike at the provider can
+    therefore burn every in-flight page's retries in seconds and leave
+    them permanently `failed`, and it re-hits the crawled site for each
+    retry too (a retry re-fetches; see `CLAUDE.md`). A fix belongs with
+    the 429 one above: treat transient provider errors (429, 503, likely
+    500/502/504) as retry-later with a backoff, distinct from permanent
+    errors (400/401/404). Not changed in Brief 1, and not part of Step 3's
+    scope.
+
+52. **[Found 2026-11-20, Brief 1 Step 2] Site-side HTTP 429 is retried
+    with zero backoff (the fetch-side twin of #51), and the default crawl
+    settings were too fast for docs.manim.community.** `crawl_worker`
+    handles `FetchHTTPError` with `frontier.mark_fetch_failed(url,
+    f"http_{status}")`, which takes `backoff_seconds` but defaults it to
+    0.0. Nothing passes one, and `Retry-After` is never read, so a page
+    the site answered with 429 is re-queued straight away and re-fetched.
+    Every 429'd page in the run below was hit 3 more times within seconds
+    (`retry_count` 3, `http_429`), raising the request rate at exactly the
+    point the site asked it to drop. A 429 (and a Cloudflare challenge)
+    should at least back off, and probably slow or stop the whole host,
+    not just the one row. **Measured:** a real Brief 1 Step 2 crawl of
+    `https://docs.manim.community/en/stable/` at the defaults (5 crawl
+    workers, `MAX_CONCURRENT_REQUESTS_PER_HOST=2`,
+    `DEFAULT_POLITENESS_DELAY_SECONDS=0.5`) got the seed page, then 71 of
+    its next 72 fetches were refused within ~40s: 70 × "Blocked by
+    anti-bot protection: HTTP 429 Too Many Requests", 1 × "Cloudflare JS
+    challenge". The run was stopped by hand. Earlier manim crawls in
+    `LESSONS_LEARNED.md` didn't hit this, so the site's protection or
+    their settings may have differed; one run is not a calibration.
+    Related: `Crawl-delay` is honoured when present (#9), but this site
+    specifies none, so only the 0.5s default applied. Not fixed in
+    Brief 1.
+
+53. **[Found 2026-11-20, Brief 1 Step 2] A docs-root index page can't be
+    crawled as a discovered link: `normalize_url` strips the trailing
+    slash, and the site's robots.txt only allows the slash form.**
+    docs.manim.community's robots.txt is `Disallow: /` + `Allow:
+    /en/stable/`. `crawl/scope.py::normalize_url` turns
+    `https://docs.manim.community/en/stable/` into `.../en/stable`, and
+    `crawl/robots_cache.py`'s resolver then (correctly, per RFC 9309)
+    finds no matching Allow for the path `/en/stable` and falls back to
+    `Disallow: /`. Checked offline against the real rules: `/en/stable` →
+    disallowed, `/en/stable/` and everything under it → allowed. Effect:
+    any discovered link to the section index lands as `failed`
+    (`robots_disallowed`). The page is only fetchable when it's passed
+    literally (with the slash) as a seed, because `Frontier.seed()`
+    doesn't normalize. A Brief 1 Step 2 attempt seeded with the
+    normalized form fetched nothing at all. The robots resolver is not the
+    bug. The mismatch is between URL identity (slash-stripped, deliberately,
+    so `/x` and `/x/` dedupe) and the robots check, which needs the
+    request path as it will actually be sent. Any fix has to keep the
+    dedupe and must not make the robots check more permissive than the
+    file says. Not fixed in Brief 1.
+
+54. **[Option available -- Brief 1 3c item B: `config.MAX_PAGES_COUNTS_FAILED`
+    (off by default) counts genuine failures toward the budget; default
+    behaviour unchanged]
+    **[Systemic rate-limit case also covered -- Brief 1 3c item C: the LLM
+    circuit breaker (`config.LLM_BREAKER_THRESHOLD`, off by default) holds
+    pages at its gate instead of failing them, and stops the run cleanly]** [Found 2026-11-20, Brief 1 Step 2] Failed pages don't count toward
+    `max_pages`, so a run whose pages keep failing never stops at its
+    budget.** `Frontier.claim()`'s cap counts only
+    `done`/`skipped_extract`/`mapped` rows (see #28 for the separate
+    in-flight overshoot). A page that ends `failed` frees its budget slot,
+    and the crawl claims, fetches and extracts a new page in its place.
+    **Measured:** a 20-page fastapi.tiangolo.com run whose Gemini quota ran
+    out 8 minutes in ended with **247 distinct pages, 741 fetches
+    (3 per page), 0 `done`**. It kept going for 16 more minutes with every
+    page failing. Any systemic failure (provider quota, outage, bad key
+    after a few successes) therefore turns a bounded run into an unbounded
+    crawl of the site, and an unbounded stream of billed attempts. Whether
+    failed pages should count toward the budget, or a failure rate should
+    stop the run, is a design decision. Not fixed in Brief 1 (design
+    proposal in Brief 1 Step 3c).
+
+55. **[Found 2026-11-20, Brief 1 Step 2] Per-chunk extraction units are
+    far smaller than `PARENT_CHUNK_SIZE` (2000), so pages cost many more
+    LLM calls than the config implies.** Measured on fastapi.tiangolo.com
+    (247 pages): units per page median 16, p75 28, p90 41, max 317
+    (release notes). Successful calls carried 27-1,983 chars, most under
+    300. Every unit is one sequential LLM call. At ~33s per call that's
+    roughly 9 minutes of extraction for a median page, plus proportionally
+    more quota. **Suspected cause (to be confirmed in Brief 1 Step 3a):**
+    `content/relevance.py::chunk_text` emits every fenced code block as
+    its own chunk and splits each prose gap between fences separately, so
+    code-heavy pages become many small fragments. Nothing merges adjacent
+    small pieces back up to `chunk_size`. Fence-atomicity itself is
+    deliberate (see `chunk_text`'s docstring); the fragmentation it causes
+    downstream wasn't measured before.
+
+56. **[RESOLVED -- Brief 1 3c item A: `RateLimitError.from_provider_error()`
+    keeps status, retry hint, quota hint and a redacted detail; `last_error`
+    and the timing log record them] [Found 2026-11-20, Brief 1 Step 2] The 429 response body is thrown
+    away, so the quota that was hit is never recorded.**
+    `main.py::_make_extract_fn` raises `RateLimitError() from e`: no
+    message, no `retry_after`, no body. `extract_worker` then stores only
+    the fixed string "rate_limited (extraction)" in `frontier.last_error`.
+    The original exception is reachable only as `__cause__` until the
+    handler drops it. Providers put the useful part in that body. Google
+    names the exhausted quota metric (per-minute vs per-day, free-tier vs
+    paid) and a `retryDelay`. **Cost of not having it:** a real run took
+    741 Gemini 429s over 16 minutes, and it's still unknown which quota
+    ran out or what tier the key is on. The only evidence is the timing
+    pattern. Fixing this belongs with #51 (use the provider's retry hint)
+    and should keep the stored text bounded and free of secrets. Not fixed
+    in Brief 1 (design proposal in Brief 1 Step 3c).
+
+57. **[Found 2026-11-20, Brief 1 Step 2] One page produced 72% of a run's
+    pairs, and nothing caps or balances pairs per page.** In the Step 2
+    baseline (fastapi.tiangolo.com, English, 28 pages, `per_chunk`,
+    `deepseek-v4.1-flash:cloud`), `release-notes` alone split into 317
+    units and yielded **4,308 of 5,986 pairs (72%)**. The other 27 pages
+    together produced 1,678. Extraction has no per-page pair cap, the
+    canonical file keeps everything, and export's dedup
+    (`dedup_by_question`, optional `semantic_dedup`) removes duplicates,
+    not over-representation. A dataset built from this run would be
+    mostly changelog entries. The page also took 83% of the run's
+    wall-clock (`LESSONS_LEARNED.md` #82). Options to weigh later: a
+    per-page or per-section pair cap at extraction or export, sampling at
+    split time, or flagging outlier pages in `--dataset-report`.
+    Measurement first: one run on one site is not a distribution. Not
+    changed in Brief 1.
+
+58. **[Found 2026-11-20, Brief 1 Step 3c] "Cancelled" sibling LLM calls
+    keep running and are billed: `asyncio.to_thread` can't be
+    cancelled.** `extract_fn` (and the quality/decision `chat_fn`) run
+    `llm.invoke` via `asyncio.to_thread`. Cancelling the awaiting task
+    (what 3b's `_run_in_order` does to siblings when one unit fails)
+    only abandons the future. The worker thread finishes the blocking
+    HTTP call regardless, the provider generates and bills the
+    completion, and the result is discarded. Verified offline: a task
+    awaiting `to_thread(blocking 0.5s call)` reported cancelled at 0.05s,
+    and the thread still completed. Consequences: (1) 3b's "cancel
+    siblings on a RateLimitError" stops no work; it only throws away
+    already-paid-for results, and each abandoned call keeps occupying a
+    thread-pool slot until it returns. (2) Under a provider rate limit,
+    the "cancelled" calls still hit the provider, so the effective
+    request rate doesn't drop when a page fails. The deferred Brief 1 3c
+    item D (cache finished units, and on a rate limit let in-flight calls
+    finish instead of cancelling them) is the proposed fix. Not
+    implemented: deferred by decision, no code change in Brief 1.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

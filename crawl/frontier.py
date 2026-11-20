@@ -130,6 +130,17 @@ class FrontierRow:
     retry_count: int
 
 
+# last_error of a row failed by robots.txt before any request was made
+# (crawl_worker -> mark_permanently_failed). Shared with crawl/pipeline.py
+# so the budget predicate below can tell it apart from a genuine failure.
+ROBOTS_DISALLOWED_ERROR = "robots_disallowed"
+
+# Statuses that consume max_pages. Kept in ONE place on purpose: claim()
+# and the quiescence check must agree exactly, or a run could stop claiming
+# without ever quiescing (or quiesce while still claimable).
+_BUDGET_STATUSES_SQL = "status IN ('done','skipped_extract','mapped')"
+
+
 class Frontier:
     def __init__(
         self,
@@ -138,9 +149,22 @@ class Frontier:
         max_depth: int | None = None,
         follow_gate_exempt_depth: int = FOLLOW_GATE_EXEMPT_DEPTH,
         max_retries: int = MAX_RETRIES,
+        count_failed_toward_budget: bool = False,
     ):
+        """count_failed_toward_budget (config.MAX_PAGES_COUNTS_FAILED, off
+        by default): also count terminally `failed` rows toward max_pages --
+        genuine fetch/extraction failures only, never a robots.txt disallow
+        (no request was made). Without it, a run whose pages keep failing
+        never reaches its budget and keeps claiming new pages (ROADMAP.md
+        #54). Like done rows, failed rows already in a resumed frontier.db
+        count too."""
         self._db_path = db_path
         self._max_pages = max_pages
+        self._budget_sql = (
+            f"({_BUDGET_STATUSES_SQL} OR (status = 'failed' "
+            f"AND COALESCE(last_error, '') != '{ROBOTS_DISALLOWED_ERROR}'))"
+            if count_failed_toward_budget else _BUDGET_STATUSES_SQL
+        )
         self._max_depth = max_depth
         self._follow_gate_exempt_depth = follow_gate_exempt_depth
         self._max_retries = max_retries
@@ -204,9 +228,7 @@ class Frontier:
         queued_n = (await cur.fetchone())[0]
         done_n = None
         if self._max_pages is not None:
-            cur = await self._conn.execute(
-                "SELECT COUNT(*) FROM frontier WHERE status IN ('done','skipped_extract','mapped')"
-            )
+            cur = await self._conn.execute(f"SELECT COUNT(*) FROM frontier WHERE {self._budget_sql}")
             done_n = (await cur.fetchone())[0]
         cap_reached = self._max_pages is not None and done_n >= self._max_pages
         if queued_n == 0 or cap_reached:
@@ -233,7 +255,7 @@ class Frontier:
             return None  # rows stay 'queued' in the DB -- nothing here changes their status
         now = _now()
         cur = await self._conn.execute(
-            """
+            f"""
             UPDATE frontier
             SET status = 'in_progress', updated_at = ?
             WHERE url = (
@@ -244,7 +266,7 @@ class Frontier:
             )
             AND (
                 ? IS NULL OR
-                (SELECT COUNT(*) FROM frontier WHERE status IN ('done','skipped_extract','mapped')) < ?
+                (SELECT COUNT(*) FROM frontier WHERE {self._budget_sql}) < ?
             )
             RETURNING *
             """,

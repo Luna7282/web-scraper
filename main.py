@@ -20,6 +20,8 @@ from crawl.scope import normalize_url, derive_prefix, is_in_scope
 from crawl.frontier import Frontier
 from crawl.pipeline import crawl_worker, extract_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError
 from crawl.politeness import HostPoliteness
+from crawl.timing import TimingLog, call_usage, usage_from_message
+from crawl.circuit_breaker import LlmCircuitBreaker
 from content.extraction import QA_EXTRACTION_SYSTEM_PROMPT, CODE_QA_EXTRACTION_SYSTEM_PROMPT
 from crawl.branch_select import suggest_branch_selection, BRANCH_CLASSIFICATION_SYSTEM_PROMPT
 from content.relevance import make_score_fn
@@ -226,7 +228,8 @@ async def headless_map(cfg: dict) -> dict:
     host_prefix_pairs = [(h, p) for h, p in cfg["host_prefix_pairs"]]
     scope_check = _make_scope_check(host_prefix_pairs)
 
-    frontier = Frontier(db_path, max_pages=cfg.get("max_pages"), max_depth=cfg.get("max_depth"))
+    frontier = Frontier(db_path, max_pages=cfg.get("max_pages"), max_depth=cfg.get("max_depth"),
+                        count_failed_toward_budget=config.MAX_PAGES_COUNTS_FAILED)
     await frontier.open()
     await frontier.recover_crashed()
     await frontier.seed(seeds)
@@ -279,7 +282,8 @@ async def headless_crawl(cfg: dict) -> dict:
 
     provider_name, model_name, llm, embeddings = _resolve_llm(cfg)
 
-    frontier = Frontier(db_path, max_pages=cfg.get("max_pages"), max_depth=cfg.get("max_depth"))
+    frontier = Frontier(db_path, max_pages=cfg.get("max_pages"), max_depth=cfg.get("max_depth"),
+                        count_failed_toward_budget=config.MAX_PAGES_COUNTS_FAILED)
     await frontier.open()
     await frontier.recover_crashed()
     await frontier.seed(seeds)
@@ -287,7 +291,7 @@ async def headless_crawl(cfg: dict) -> dict:
     embed_fn = _make_embed_fn(embeddings)
     intent_embedding = await embed_fn(intent) if intent else None
     score_fn = make_score_fn(intent, intent_embedding, embed_fn)
-    extract_fn = _make_extract_fn(llm)
+    extract_fn = _make_extract_fn(llm, record_usage=config.EXTRACT_TIMING_LOG)
     extraction_units_fn = make_extraction_units_fn(
         config.EXTRACTION_STRATEGY, embed_fn=embed_fn, intent_embedding=intent_embedding,
     )
@@ -334,10 +338,15 @@ async def headless_crawl(cfg: dict) -> dict:
             default_delay_seconds=config.DEFAULT_POLITENESS_DELAY_SECONDS,
         )
         fatal_errors: list[str] = []
+        timing = _start_timing_log(
+            run_dir, provider_name, model_name, crawl_workers_n, extract_workers_n,
+            cfg.get("max_pages"), quality_backend is not None,
+        )
+        breaker = _make_llm_breaker(frontier, fatal_errors, timing)
         tasks = [
             asyncio.create_task(
                 crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness,
-                             fatal_error_sink=fatal_errors)
+                             fatal_error_sink=fatal_errors, timing=timing)
             )
             for _ in range(crawl_workers_n)
         ] + [
@@ -347,7 +356,9 @@ async def headless_crawl(cfg: dict) -> dict:
                                 chunk_fn=chunk_fn, extraction_units_fn=extraction_units_fn,
                                 generation_model=model_name, extraction_strategy=config.EXTRACTION_STRATEGY.value,
                                 section_depth=config.SECTION_DEPTH, seed_prefixes=host_prefix_pairs,
-                                quality_backend=quality_backend, quality_threshold=quality_threshold)
+                                quality_backend=quality_backend, quality_threshold=quality_threshold,
+                                timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY,
+                                breaker=breaker)
             )
             for _ in range(extract_workers_n)
         ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
@@ -356,6 +367,7 @@ async def headless_crawl(cfg: dict) -> dict:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await _stop_timing_log(timing)
 
     counts = await frontier.counts_by_status()
     await frontier.close()
@@ -437,7 +449,8 @@ async def map_main(root_url: str):
     crawl_workers_n = int(Prompt.ask("Concurrent crawl workers", default="5"))
 
     os.makedirs(RUN_DIR, exist_ok=True)
-    frontier = Frontier(FRONTIER_DB_PATH, max_pages=max_pages, max_depth=max_depth)
+    frontier = Frontier(FRONTIER_DB_PATH, max_pages=max_pages, max_depth=max_depth,
+                        count_failed_toward_budget=config.MAX_PAGES_COUNTS_FAILED)
     await frontier.open()
     recovery = await frontier.recover_crashed()
     if recovery["requeued"] or recovery["failed"]:
@@ -700,6 +713,62 @@ async def _http_get_text(url: str) -> str | None:
     return await asyncio.to_thread(_get)
 
 
+def _start_timing_log(
+    run_dir: str, provider_name: str, model_name: str, crawl_workers_n: int,
+    extract_workers_n: int, max_pages: int | None, quality_scoring: bool,
+) -> TimingLog | None:
+    """None unless config.EXTRACT_TIMING_LOG -- see crawl/timing.py."""
+    if not config.EXTRACT_TIMING_LOG:
+        return None
+    timing = TimingLog(
+        os.path.join(run_dir, config.EXTRACT_TIMING_LOG_FILENAME), provider=provider_name, model=model_name,
+    )
+    timing.start()
+    timing.record(
+        "run_start", crawl_workers=crawl_workers_n, extract_workers=extract_workers_n,
+        max_pages=max_pages, extraction_strategy=config.EXTRACTION_STRATEGY.value,
+        quality_scoring=quality_scoring, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY,
+        **timing.llm_fields(),
+    )
+    console.print(f"[dim]Timing log on: {timing.path}[/dim]")
+    return timing
+
+
+def _make_llm_breaker(frontier: Frontier, fatal_errors: list[str], timing: TimingLog | None) -> LlmCircuitBreaker | None:
+    """None unless config.LLM_BREAKER_THRESHOLD > 0 (off by default) -- see
+    crawl/circuit_breaker.py. Its stop ends the run the same way a dead
+    shared browser does: a message in fatal_errors (main() reports
+    'Stopped early' and exits non-zero) and quiescence set directly; rows
+    are left resumable."""
+    if config.LLM_BREAKER_THRESHOLD <= 0:
+        return None
+
+    def on_event(kind: str, **fields) -> None:
+        console.print(f"[yellow][breaker] {kind} {fields}[/yellow]")
+        if timing is not None:
+            timing.record(kind, **fields)
+
+    def on_stop(reason: str) -> None:
+        msg = f"[FATAL] LLM circuit breaker stopped the run: {reason}"
+        print(msg)
+        fatal_errors.append(msg)
+        frontier.quiescent.set()
+
+    return LlmCircuitBreaker(
+        threshold=config.LLM_BREAKER_THRESHOLD,
+        base_cooldown=config.LLM_BREAKER_BASE_COOLDOWN_SECONDS,
+        max_cooldown=config.LLM_BREAKER_MAX_COOLDOWN_SECONDS,
+        max_trips=config.LLM_BREAKER_MAX_TRIPS,
+        stop_if_retry_after=config.LLM_BREAKER_STOP_IF_RETRY_AFTER_SECONDS,
+        on_event=on_event, on_stop=on_stop,
+    )
+
+
+async def _stop_timing_log(timing: TimingLog | None) -> None:
+    if timing is not None:
+        await timing.close()  # writes run_end (wall_seconds) and flushes
+
+
 def _make_fetch_fn(crawler: AsyncWebCrawler):
     """Shares one AsyncWebCrawler instance across every crawl_worker call
     -- matching orchestrator.py's existing pattern, not spinning up a new
@@ -766,7 +835,10 @@ _EXTRACTION_SYSTEM_PROMPTS = {
 }
 
 
-def _make_extract_fn(llm, prompt_variant: "config.ExtractionPromptVariant" = None):
+def _make_extract_fn(llm, prompt_variant: "config.ExtractionPromptVariant" = None, record_usage: bool = False):
+    """record_usage (timing only, config.EXTRACT_TIMING_LOG): publish each
+    response's token usage via crawl.timing.call_usage for extract_worker's
+    timing log. Off by default; the returned text is identical either way."""
     system_prompt = _EXTRACTION_SYSTEM_PROMPTS[prompt_variant or config.EXTRACTION_PROMPT_VARIANT]
 
     async def extract_fn(content: str) -> str:
@@ -778,8 +850,10 @@ def _make_extract_fn(llm, prompt_variant: "config.ExtractionPromptVariant" = Non
             response = await asyncio.to_thread(llm.invoke, messages)
         except Exception as e:
             if _is_rate_limit_exception(e):
-                raise RateLimitError() from e
+                raise RateLimitError.from_provider_error(e) from e
             raise
+        if record_usage:
+            call_usage.set(usage_from_message(response))
         return response.content
     return extract_fn
 
@@ -797,7 +871,7 @@ def _make_decision_chat_fn(llm):
             response = await asyncio.to_thread(llm.invoke, messages)
         except Exception as e:
             if _is_rate_limit_exception(e):
-                raise RateLimitError() from e
+                raise RateLimitError.from_provider_error(e) from e
             raise
         return response.content
     return chat_fn
@@ -813,7 +887,7 @@ def _make_classify_fn(llm):
             response = await asyncio.to_thread(llm.invoke, messages)
         except Exception as e:
             if _is_rate_limit_exception(e):
-                raise RateLimitError() from e
+                raise RateLimitError.from_provider_error(e) from e
             raise
         return response.content
     return classify_fn
@@ -941,7 +1015,8 @@ async def main():
     extract_workers_n = int(Prompt.ask("Concurrent extract workers", default="2"))
 
     os.makedirs(RUN_DIR, exist_ok=True)
-    frontier = Frontier(FRONTIER_DB_PATH, max_pages=max_pages, max_depth=max_depth)
+    frontier = Frontier(FRONTIER_DB_PATH, max_pages=max_pages, max_depth=max_depth,
+                        count_failed_toward_budget=config.MAX_PAGES_COUNTS_FAILED)
     await frontier.open()
     recovery = await frontier.recover_crashed()
     if recovery["requeued"] or recovery["failed"]:
@@ -954,7 +1029,7 @@ async def main():
     embed_fn = _make_embed_fn(embeddings)
     intent_embedding = await embed_fn(intent) if intent else None
     score_fn = make_score_fn(intent, intent_embedding, embed_fn)
-    extract_fn = _make_extract_fn(llm)
+    extract_fn = _make_extract_fn(llm, record_usage=config.EXTRACT_TIMING_LOG)
     extraction_units_fn = make_extraction_units_fn(
         config.EXTRACTION_STRATEGY, embed_fn=embed_fn, intent_embedding=intent_embedding,
     )
@@ -1001,10 +1076,15 @@ async def main():
         )
 
         fatal_errors: list[str] = []
+        timing = _start_timing_log(
+            RUN_DIR, provider_name, model_name, crawl_workers_n, extract_workers_n,
+            max_pages, quality_backend is not None,
+        )
+        breaker = _make_llm_breaker(frontier, fatal_errors, timing)
         tasks = [
             asyncio.create_task(
                 crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness,
-                             fatal_error_sink=fatal_errors)
+                             fatal_error_sink=fatal_errors, timing=timing)
             )
             for _ in range(crawl_workers_n)
         ] + [
@@ -1016,7 +1096,9 @@ async def main():
                                 extraction_strategy=config.EXTRACTION_STRATEGY.value,
                                 section_depth=config.SECTION_DEPTH,
                                 seed_prefixes=host_prefix_pairs,
-                                quality_backend=quality_backend, quality_threshold=quality_threshold)
+                                quality_backend=quality_backend, quality_threshold=quality_threshold,
+                                timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY,
+                                breaker=breaker)
             )
             for _ in range(extract_workers_n)
         ] + [
@@ -1028,6 +1110,7 @@ async def main():
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await _stop_timing_log(timing)
 
     counts = await frontier.counts_by_status()
     await frontier.close()

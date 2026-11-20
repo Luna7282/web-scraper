@@ -45,6 +45,8 @@ not by accident.
 | | `graph.py` | `discovery_graph`/`path_tree`: JSON graph projections over a frontier DB (`--graph`) |
 | | `live_status.py` | `read_live_status`: poll-friendly crawl-state snapshot, own connection (`--live-status`) |
 | | `score_report.py` | `--score-report`: relevance-score distribution from a prior run |
+| | `circuit_breaker.py` | `LlmCircuitBreaker`: opt-in (`config.LLM_BREAKER_THRESHOLD`, off by default) gate that pauses LLM calls after N consecutive 429s, stops the run on a daily-quota signal |
+| | `timing.py` | `TimingLog`: opt-in (`config.EXTRACT_TIMING_LOG`, off by default) JSONL timing of fetch/score/LLM calls → `<run_dir>/timings.jsonl` |
 | `content/` | `chrome_strip.py` | Nav/header/footer/aside/button exclusion, applied in `main.py::_make_fetch_fn` |
 | | `extraction.py` | `parse_qa_json`, the Q&A system prompt |
 | | `extraction_units.py` | Extraction-strategy chunk selection (`first_n_chars`/`per_chunk`/`top_k_chunks_by_relevance`) |
@@ -404,6 +406,17 @@ it to cap total pages ever processed against this frontier across restarts.
 Relevant to any test that resumes a capped run (step 8 exercises both the
 capped-stop path and the resume-past-cap path in one test).
 
+**What counts toward `max_pages`** is one shared predicate
+(`Frontier._budget_sql`), used by both `_locked_claim` and
+`_locked_check_quiescence`. Never write the status list out separately
+again: if the two disagree, a run can stop claiming without ever
+quiescing. By default only `done`/`skipped_extract`/`mapped` count.
+With `config.MAX_PAGES_COUNTS_FAILED` (off by default), terminally
+`failed` rows count too, except a robots.txt disallow
+(`ROBOTS_DISALLOWED_ERROR`; no request was made). Without it, a run
+whose pages keep failing never reaches its budget (`ROADMAP.md` #54).
+Like done rows, failed rows already in a resumed `frontier.db` count.
+
 **JSONL duplicate-write risk on crash-resume, and why it's handled at the
 file layer, not a DB column**: see `LESSONS_LEARNED.md` for the incident
 this traces to. Short version — `status='done'` is set by the *writer*,
@@ -647,7 +660,50 @@ extraction, real RAG index, real crash-resume).
   backoff_seconds=...)` sets `not_before` and hands the row back to
   `queued`; the worker moves on immediately. A worker `sleep`ing in place
   for a 429 blocks that concurrency slot for the full backoff — with a
-  small pool, a few 429s idle the whole stage.
+  small pool, a few 429s idle the whole stage. **The backoff is the
+  provider's own hint when it sends one**: every raise site
+  (`main.py`'s three `_make_*_fn`s, `decisions/jev.py`) builds the error
+  with `RateLimitError.from_provider_error()`, which reads
+  `retry-after-ms`/`Retry-After` or Google's body `retryDelay`, plus a
+  `quota_hint` (Google `quotaMetric`/`quotaId`) and a capped,
+  secret-redacted `detail`. `last_error` becomes "rate_limited (stage):
+  <hint>", and the timing log carries the details. The flat
+  `DEFAULT_RATE_LIMIT_BACKOFF_SECONDS` applies only when there's no
+  hint, and every backoff is capped at
+  `config.RATE_LIMIT_MAX_BACKOFF_SECONDS` (a per-day "retry in 20h"
+  would otherwise park a queued row so far out that the run never
+  reaches quiescence).
+  **The one deliberate exception: the LLM circuit breaker**
+  (`crawl/circuit_breaker.py`, `config.LLM_BREAKER_THRESHOLD`, **off by
+  default**). With it on, after N consecutive rate-limited LLM calls,
+  extract workers **wait at the breaker's gate** before any new
+  extraction or quality call, holding their pages instead of releasing
+  them. The release rule exists so one row's backoff doesn't idle a
+  worker while other work could proceed. With the breaker open, no LLM
+  work can proceed at all, so waiting is the point: it stops the "every
+  429 releases a page, the next page 429s too" spiral (`ROADMAP.md`
+  #54, `LESSONS_LEARNED.md` #81), keeps finished units, and doesn't burn
+  retry budgets.
+  - **Unaffected:** a sporadic 429 while the breaker is closed still
+    takes the normal release-the-row path.
+  - **The gate:** permits are taken *outside* the unit semaphore, so a
+    waiting call holds no slot. After the cooldown (the provider's own
+    hint, else 60s doubling, capped at 900s) one probe call decides.
+  - **Stopping:** after `LLM_BREAKER_MAX_TRIPS` trips, or at once on a
+    daily-quota signal, the run stops the way a dead browser stops it:
+    a message in `fatal_errors`, quiescence set, non-zero exit, rows left
+    resumable, never marked failed.
+  - **The daily signal is decided from the UNCAPPED provider hint**
+    (`RateLimitError.retry_after`/`quota_hint` as reported), never from
+    the 300s-capped row backoff: a quota hint naming a per-day quota, or
+    a hint of at least `LLM_BREAKER_STOP_IF_RETRY_AFTER_SECONDS`.
+  - **It never cancels in-flight calls.** They run in `asyncio.to_thread`,
+    which can't be cancelled (`ROADMAP.md` #58). They finish and report
+    their outcomes, and only a probe's failure can re-trip.
+  - **SDK retries:** with the breaker on, `ChatOpenAI`'s SDK-level
+    `max_retries` (`config.LLM_SDK_MAX_RETRIES`, default 2, unchanged) is
+    forced to 0, so every 429 reaches the breaker instead of being
+    silently retried up to twice first.
 - **`Writer` (in `storage/writer.py`) has exactly one caller: `writer_worker`.**
   `crawl_worker`/`extract_worker`'s signatures structurally cannot receive
   a `Writer` or Chroma client (enforced by
@@ -666,10 +722,18 @@ extraction, real RAG index, real crash-resume).
   instead of specificity and broke a real site's robots.txt — see
   `LESSONS_LEARNED.md` #27 before assuming a "respects robots.txt" claim
   extends to Allow-overrides-Disallow correctness without checking.
-  Per-host rate limiting/politeness delay is **not** built yet —
-  `Crawl-delay` isn't even collected by `_parse_rules()` (see
-  `ROADMAP.md` #9); none of the 5 fixture sites specify one, so this is
-  unverified against a real case, not proven safe.
+  Per-host politeness **is** built (`ROADMAP.md` #9, resolved):
+  `_parse_rules()` collects `Crawl-delay`, and `crawl_worker` passes it to
+  `crawl/politeness.py::HostPoliteness.hold()`, which caps concurrent
+  requests per host (`MAX_CONCURRENT_REQUESTS_PER_HOST`) and spaces
+  requests by the site's `Crawl-delay` when given, else
+  `DEFAULT_POLITENESS_DELAY_SECONDS`. Covered offline
+  (`tests/test_politeness.py`, `tests/test_robots_cache*.py`). Neither
+  docs.manim.community nor fastapi.tiangolo.com specifies a
+  `Crawl-delay` (checked 2026-11-20), so a real site's value hasn't been
+  exercised live. The defaults alone were too fast for
+  docs.manim.community (`ROADMAP.md` #52), and a site-side 429 is retried
+  with no backoff.
 - **Progress display** (`progress_display.py`) is read-only against the
   frontier — `counts_by_status()`/`in_progress_urls()` only ever `SELECT`.
   Safe to poll on any interval; it cannot perturb the state machine.

@@ -5120,3 +5120,347 @@ range, so the `#75` conclusion stands: Jev needs its own calibrated
 threshold, not traditional's, before it's trustworthy as a gate. What's
 different now is that the comparison is no longer confounded by feeding
 either backend noise on an unknown number of pages.
+
+### 80. Brief 1 Steps 0-1: macOS baseline (one POSIX-only control-server bug, nothing else) and opt-in extraction timing, built before measuring anything
+
+**Context.** Brief 1 is about extraction speed. `extract_worker` awaits one
+LLM call per unit, one after another, so worker count only parallelises
+across pages. `README.md`'s throughput figures (~0.75-0.79 pages/min, ~13s
+median call) were measured on `ollama_cloud/deepseek-v4-flash`. Gemini is
+the default now (#77), so those figures aren't treated as current. Nothing
+gets changed until it has been measured (Step 2), and nothing gets measured
+until timing exists (this entry).
+
+**Step 0 baseline, first run on macOS** (fresh `uv sync` from `uv.lock`, 156
+packages; suite is plain `unittest`, no pytest). 473 collected, 453 pass, 10
+fail, 10 skip. 2 more tests in `test_fetch_fn_integration` were held back
+because they need a real Chromium (not installed yet). Every failure has the
+same cause, a bug that can only show up off Windows: `server/jobs.py::_pid_alive`
+uses `os.kill(pid, 0)` on POSIX. `JobManager` never reaps its `Popen`
+children, so a finished job becomes a zombie, and `os.kill(pid, 0)` still
+succeeds against a zombie. The job reads `running` forever. Windows has no
+zombies, which is why the suite was green on `D:\scraper`. Logged as
+`ROADMAP.md` #50, not fixed (out of scope). **Lesson:** "the suite passes" so
+far meant "passes on Windows". `CLAUDE.md` describes job tracking as if it
+were cross-platform, but the POSIX branch had never actually been run.
+
+**Step 1: timing instrumentation** (`crawl/timing.py`, `config.EXTRACT_TIMING_LOG`,
+default `False`, env-overridable like `USE_SYSTEM_ONE`). When it's on,
+`main()`/`headless_crawl()` append JSON lines to `<run_dir>/timings.jsonl`.
+Events: `run_start`/`run_end`, `fetch` (timed inside the politeness gate, so
+it doesn't include waiting for a host slot), `score` (with
+`queue_wait_seconds`: fetch-complete → extract-worker pickup, which includes
+any backpressure wait to get into the queue), `extract_call` (url,
+chunk_index, chars_in, seconds, provider, model, outcome
+ok/malformed/rate_limited/error), `quality_call`, and a per-page `page`
+summary (outcome, units, pairs, extraction wall seconds).
+Decisions worth keeping:
+- **`record()` never awaits.** It's a `put_nowait` onto an unbounded queue,
+  so instrumenting a worker adds no new await points. With timing on, the
+  workers' scheduling stays the same as with it off.
+- **One drain task owns the file and writes through `asyncio.to_thread`.**
+  Only one writer at a time is what makes `to_thread` enough with no lock
+  (see `CLAUDE.md`'s event-loop section). `close()` stops it with a sentinel
+  rather than `cancel()`. Cancelling would leave a `to_thread` write running
+  in its thread, and then the final flush could append to the same file
+  concurrently.
+- **Timing must never take down a crawl.** A write error warns once and
+  drops the lines. Nothing in the drain task re-raises.
+- **The default path is the old path.** With `timing=None`, every
+  instrumentation branch is skipped. The only additions are a
+  `try/except: raise` around `extract_fn` and the quality call, which is a
+  semantic no-op. `tests/test_timing.py` (11 tests) includes a check that
+  `qa_pairs` come out identical with timing on and off. The full suite is
+  otherwise unchanged: 484 run, the same 10 #50 failures, nothing new.
+
+**Noticed while reading the code, relevant to Step 3, not acted on:**
+`_make_extract_fn` runs `llm.invoke` through `asyncio.to_thread`, so
+per-unit concurrency is bounded by the default thread pool
+(min(32, cpu+4)), not only by any semaphore. And it raises
+`RateLimitError()` without a `retry_after`, so every 429 backs off the flat
+5s `DEFAULT_RATE_LIMIT_BACKOFF_SECONDS`, whatever the provider asked for.
+
+### 81. Brief 1 Step 2: no valid baseline. Two site attempts blocked or aborted, then a Gemini quota ran out 8 minutes into the fastapi run
+
+**What was attempted.** The plan: one 20-page timed crawl (blank intent,
+per-chunk extraction, `gemini/gemini-3.6-flash`, quality scoring and RAG
+off) to measure extraction before Step 3 changes anything.
+1. **docs.manim.community, seed normalized → robots-disallowed, 0 fetches.**
+   `normalize_url` strips the trailing slash, and the site allows only
+   `/en/stable/` (`ROADMAP.md` #53). The seed has to be passed literally.
+2. **docs.manim.community, literal seed, 5 crawl workers → stopped by hand
+   at 41s.** The seed page fetched, then 71/72 fetches came back "Blocked
+   by anti-bot protection" (70 × HTTP 429, 1 × Cloudflare challenge). Each
+   429'd page was retried 3 times with no backoff (`ROADMAP.md` #52).
+3. **fastapi.tiangolo.com, 2 crawl workers, 24 min, 0 pages done.** The
+   site was fine (741/741 fetches OK, no 429s or challenges, stop rule
+   never fired). Gemini wasn't. A `--verify-providers` call right before
+   had first returned 503 `UNAVAILABLE` ("high demand") and, 5 minutes
+   later, `OK`. During the crawl: 19 extraction calls succeeded in the
+   first ~8 minutes (median 33.5s, p95 291s, max 304s; two calls took
+   ~290-300s). From t≈473s to the end, **all 741 remaining calls were
+   429s**, each returning within ~2.4s, at ~50 attempts/min for 16 minutes
+   without ever recovering. That reads as an exhausted quota window
+   (plausibly a free-tier daily cap; ~21 successful requests in total),
+   not a per-minute limit. **Not confirmed:** the 429 body, which names
+   the quota metric, is never recorded. `_make_extract_fn` raises a bare
+   `RateLimitError()` and the frontier stores only "rate_limited
+   (extraction)". The Gemini tier is still unknown.
+
+**What the failed run still showed (all relevant to Brief 1):**
+- **The 429 path, exercised for real for the first time, spirals.** A 429
+  on any unit fails the whole page. The units that already succeeded are
+  thrown away (one page had 7 OK units before its 429), the row is
+  released with the flat 5s backoff (#51), re-fetched, and every unit
+  re-sent from 0. After `MAX_RETRIES` the page is `failed`. Failed pages
+  don't count toward `max_pages`, so the run kept claiming new rows:
+  **247 distinct pages, 741 fetches, all `failed`**, against a 20-page
+  budget. Prefix `None` also let it wander into the site's translations
+  (zh/pt/es/ja ≈ half the rows).
+- **Per-chunk units are much smaller than `PARENT_CHUNK_SIZE` suggests.**
+  Successful calls carried 27-1,983 chars (most under 300). Units per
+  page: median 16, p75 28, p90 41, max 317 (the release-notes page in each
+  language). That's 6,031 units across 247 pages, each one an LLM call.
+  At ~33s median per call, sequentially, a median page is roughly 9
+  minutes of extraction. This alone dominates throughput, and quota.
+- **Hidden retries inside one timed call.** `ChatOpenAI` keeps
+  LangChain's default `max_retries=2`, so the OpenAI SDK retries 429/5xx
+  itself before `extract_fn` ever sees an error. A "rate_limited" call in
+  `timings.jsonl` was likely 3 HTTP requests, and a slow "ok" call may
+  include retries.
+- Wall-clock share: an LLM call was in flight 99.6% of the time, a fetch
+  35.4%. Distorted by the 429 churn, so not a usable baseline figure.
+
+**Why it matters.** Step 3's concurrency raises the request rate. Under
+whatever quota this key has, it would reach this failure mode sooner, not
+later. And the units-per-page finding means "calls per page" is as big a
+lever as "calls in parallel". No baseline numbers exist yet. The README's
+deepseek figures are still unverified for Gemini.
+
+### 82. Brief 1 Step 2 baseline (valid): fastapi.tiangolo.com English-only, `ollama_cloud/deepseek-v4.1-flash:cloud`, 28 pages in 42.6 min. Extraction is output-token-bound, and one page took 83% of the run
+
+**Setup.** `deepseek-v4-flash` (the README's model, and `main.py`'s
+`ollama_cloud` default) now returns HTTP 410, retired 2026-09-25. Used
+`deepseek-v4.1-flash:cloud` (same family) through the run config's `model`
+field; `main.py`'s default is unchanged. **These numbers are not directly
+comparable to the README's deepseek-v4-flash figures.** Scope: seed
+`https://fastapi.tiangolo.com/` plus an allowlist of 22 English top-level
+prefixes. The scope config has no exclude option, so this is the
+least-invasive way to keep out `/zh/ /pt/ /es/ /ja/`. 2 crawl / 2 extract
+workers, `max_pages` 20, blank intent, `per_chunk`, quality scoring and
+RAG off, timing on. Token usage was added to the timing log in this step
+(`953a299`).
+
+**Numbers.**
+- Run: 2,558s wall. **28 pages `done`, 0 failed** (20 + 8 in-flight
+  overshoot, #28). 0 rate limits, 0 errors, 0 site blocks; 28/28 fetches
+  OK (median 0.63s).
+- Extraction calls: 752 (749 OK, 3 malformed). **Median 3.78s, p95 12.6s,
+  max 21.1s**, mean 4.91s.
+- Units per page: mean 26.9, but the median page has 16. **release-notes
+  alone is 317 units, 2,133s (83% of wall-clock) and 4,308 of the 5,986
+  pairs.** Excluding it: mean 16.1 units, 57.9s per page (median 35.1s).
+- **Pages/min: 0.66 overall, 2.17 to the 20th page (9.2 min), 1.42 to the
+  27th (19.0 min).** The last 23.6 minutes were one extract worker
+  grinding through release-notes one unit at a time while the other sat
+  idle. This is the tail Step 3's per-unit concurrency targets directly.
+- Wall-clock share: an LLM call in flight 99.9% of the time (both extract
+  workers busy 44.5%, one busy 55.4%), a fetch 0.8%. Pages waited a median
+  130s (max 534s) in `content_queue` for an extract worker. Fetching is
+  not the bottleneck at all.
+- **Tokens (now logged):** input median 498 (sum 454k), **output median
+  1,212 (mean 1,668, max 8,016, sum 1.25M)**, at a median ~289 output
+  tokens/s. Calls are output-bound: output is ~2.4× input, and latency
+  tracks output length. The provider returns no reasoning-token breakdown
+  (`completion_tokens_details: null`), but a one-word "OK" ping cost 32
+  output tokens, so any hidden thinking is likely counted inside
+  `output_tokens`.
+- Units still small (#55): median 572 chars, 10th percentile 41 chars,
+  37% under 300 chars.
+
+**Why it matters.** (1) Pages/min is dominated by the largest page, not
+the average one. Per-unit concurrency (Step 3b) helps exactly there,
+fetch tuning won't. (2) Per-call cost is output generation, so fewer,
+larger units (Step 3a packing) save the per-call prompt overhead but not
+the output. Whether packing changes pair counts/quality has to be
+measured, not assumed. (3) A 4,308-pair page from one changelog is a
+dataset-balance question, out of scope here but visible now. The 28
+fetched URLs are saved in this run's `crawled_urls.json` for the Step 4
+before/after.
+
+### 83. Brief 1 Step 4: per-page unit concurrency 4 roughly doubles throughput (0.66 → 1.24 pages/min), not 4×. The provider shares capacity across concurrent calls, so per-call latency triples
+
+**Setup.** Same 28 pages as the Step 2 baseline (#82): seeded from its
+`crawled_urls.json` with `max_depth=0` (checked offline first: exactly the
+seeds are fetched, nothing else), `max_pages` 28, fresh run directory.
+`ollama_cloud/deepseek-v4.1-flash:cloud`, 2 crawl / 2 extract workers,
+`EXTRACT_UNIT_CONCURRENCY=4` (code `68a867e`), blank intent, `per_chunk`,
+quality scoring and RAG off, timing on. A stop rule covered site
+429s/challenges and LLM 429s or 3 consecutive LLM errors; it never fired.
+No strict concurrency-1 rerun (agreed: fetch was 0.8% of the baseline's
+wall-clock). All 650 units that produced pairs in both runs had
+byte-identical source text, so the inputs really were the same.
+
+| | baseline (c=1) | c=4 |
+|---|---|---|
+| wall-clock | 42.6 min | **22.5 min** |
+| pages/min, all 28 | 0.66 | **1.24** (1.9×) |
+| pages/min, without release-notes | 1.42 | 1.61 |
+| release-notes page | 2,133s | **1,058s** (2.0×) |
+| per-page s, mean / median | 132.0 / 36.8 | 84.0 / 39.0 |
+| per-page s without release-notes, mean / median | 57.9 / 35.1 | 48.0 / 30.3 |
+| call latency median / p95 / max | 3.78 / 12.6 / 21.1s | **11.18 / 21.7 / 40.5s** |
+| output tokens per call (median) | 1,212 | 1,216 |
+| per-call output speed (median) | 289 tok/s | **123 tok/s** |
+| aggregate output throughput | 490 tok/s | **950 tok/s** |
+| peak LLM calls in flight | 2 | **8** (760s at 8) |
+| calls / malformed | 752 / 3 | 752 / 1 |
+| pairs (all / without release-notes) | 5,986 / 1,678 | 6,094 / 1,717 |
+| 429s / errors / site blocks | 0 / 0 / 0 | 0 / 0 / 0 |
+
+**What it means.**
+- **The provider, not the code, set the ceiling.** Output per call is
+  unchanged, but each call ran ~2.3× slower once 8 were in flight.
+  Aggregate throughput rose ~1.9×, not 4×. `deepseek-v4.1-flash:cloud`
+  appears to share capacity across one key's concurrent calls. More
+  concurrency would likely give diminishing returns rather than a linear
+  speed-up. One run, one model; not a general claim about Ollama Cloud.
+- **The gain is concentrated where the brief predicted:** the one huge
+  page (release-notes 2.0×). Small pages (≤5 units) barely move or get
+  slightly slower per call, since they mostly ran alongside 4-8 other
+  calls.
+- **release-notes is still 78% of the wall-clock** (1,058 of 1,350s).
+  Pages/min on this site is still a function of one page.
+- **Pair quality: no change detected.** Whole-run stats match (answer
+  median 115 vs 117 chars, question 72 vs 73, word overlap of answers with
+  their source unit 0.72 vs 0.71, `source_chunk` always set). A same-unit
+  spot-check on 4 pages (encoder, deployment/versions,
+  tutorial/dependencies, release-notes) showed the same facts, PR numbers
+  and authors, reworded. Per-page pair counts moved by −9…+23 (+1.8% in
+  total), consistent with sampling noise. Temperature isn't set, and
+  concurrency doesn't touch the prompt. No baseline-vs-baseline repeat
+  exists to size that noise exactly.
+- **Measurement caveat found:** a naive interval sweep reported a peak of
+  9 (and 3 for the baseline). Both lasted 0.0s and are artefacts of
+  millisecond-rounded `ts`. Weight in-flight counts by duration before
+  quoting a peak.
+- **The 429 path was not exercised.** Doubling the request rate drew no
+  rate limit from this provider, so ROADMAP #51/#54/#56 stay unverified
+  against a real limit under concurrency.
+
+### 84. Brief 1 Step 3c design: cancelling a task does not cancel its `asyncio.to_thread` call, so 3b's "cancel siblings" stops no work
+
+**Found while designing** how to keep finished units when a page hits a
+rate limit (3c item D, now deferred). 3b, as the brief specified,
+cancels a page's sibling unit tasks when one raises (`_run_in_order` on
+an `asyncio.TaskGroup`). But each unit's LLM call is
+`await asyncio.to_thread(llm.invoke, ...)` (`main.py::_make_extract_fn`,
+same in `_make_decision_chat_fn`), and a thread can't be interrupted:
+cancelling only abandons the asyncio future.
+
+**Verified offline, not assumed:** a task awaiting
+`asyncio.to_thread(<0.5s blocking call>)`, cancelled after 0.05s,
+raised `CancelledError` immediately, and the thread completed anyway
+~0.45s later.
+
+**What that means in practice:** the "cancelled" calls still reach the
+provider, still generate, and are still billed, and their results are
+thrown away. They also hold a thread-pool slot until they return. So
+under a rate limit, a failing page doesn't actually lower the request
+rate, and the wasted spend is exactly the work item D would have kept.
+The 3b tests (`test_4_rate_limit_releases_row_with_backoff_and_cancels_siblings`)
+pass because they stub `extract_fn` with a pure `asyncio.sleep`, which
+*is* cancellable. The test proves the asyncio-level behaviour, not the
+real cost. **Lesson:** a cancellation test against an async stub says
+nothing about a call that's really a thread underneath. Check what the
+real call site awaits.
+
+**Decision:** item D (unit-result cache, and let in-flight calls finish
+instead of cancelling) deferred, with no code change. Tracked as
+`ROADMAP.md` #58. The other 3c decisions, recorded for the
+implementation that follows: A (429 body on `RateLimitError`) on by
+default. B (failed pages count toward `max_pages`, except
+robots-disallowed) behind a flag, off by default. C (circuit breaker)
+off by default, may make workers wait at its gate as a documented
+exception to "rate limits release the row". `ChatOpenAI`'s
+`max_retries` becomes config (default 2, unchanged), forced to 0 when
+the breaker is on.
+
+### 85. Brief 1 Step 3c items A-C built and tested offline: 429 details, failed-page budget, LLM circuit breaker. The 741-429 spiral is now a regression test
+
+**What shipped** (commits `feb5a1d`, `6de00c5`, `0e2a277`; defaults: A
+on, B and C off):
+- **A.** `RateLimitError.from_provider_error()` at all four raise sites
+  keeps the status, the provider's retry hint (`retry-after-ms` /
+  `Retry-After` / Google body `retryDelay`), a quota hint (Google
+  `quotaMetric`/`quotaId`) and a redacted, capped message. The row backoff
+  now follows the hint, capped at 300s.
+- **B.** `MAX_PAGES_COUNTS_FAILED` counts genuine failures toward
+  `max_pages`, never robots disallows. What counts is now one predicate
+  shared by claim() and quiescence.
+- **C.** `LlmCircuitBreaker`: N consecutive 429s → workers wait at a
+  gate → one probe → close, re-trip, or stop. It stops at once on a
+  daily-quota signal taken from the *uncapped* provider hint. It never
+  cancels in-flight calls. `ChatOpenAI` `max_retries` is now config
+  (default 2), forced to 0 with the breaker on.
+
+**The spiral, reproduced and bounded** (stub provider: 3 good calls, then
+429 forever; 30 pages, budget 5, 2+2 workers):
+
+| | 429s | fetches | pages failed | outcome |
+|---|---|---|---|---|
+| no breaker | ~87 | ~88 | 29 | burns every page it can find |
+| breaker (threshold 3, 3 trips) | 7 | 11 | 0 | clean stop, 29 pages resumable |
+
+A "retry in 20 hours" hint (72,000s, above the 300s row cap) stops the
+run in under 2s instead of looping every 300s.
+
+**Two test mistakes worth remembering:**
+1. **A helper named `run()` on a `unittest.TestCase` subclass replaced
+   the test runner's own `TestCase.run`.** Every test in those classes
+   silently didn't run: 12 of 18 reported, "OK". It was caught only
+   because the count looked short. Never name a test helper `run`, and
+   check the reported test count against the number written.
+2. **A stub provider read its shared call counter after an
+   `await asyncio.sleep`.** Concurrent calls had already bumped it, so the
+   "first 3 calls succeed" contract silently became "2". Two assertions
+   had baked in the miscount ("all 30 pages fail", "90 fetches") and only
+   broke once the stub was fixed. A concurrent stub has to capture
+   per-call state before its first await.
+
+**Still unverified:** all of this rests on documented 429 shapes and
+scripted stubs. No real 429 has been seen under concurrency (Step 4 drew
+none). The first real one is the test that matters; the timing log and
+`last_error` now record enough to judge it.
+
+### 86. Brief 1 smoke test on the branch head (after 3c items A-C): 5 real pages at unit concurrency 4, pair counts within sampling noise of Step 4
+
+**Setup.** Branch `brief-1-scraper-speed` at `5d823b9`, so 429 details on
+(A), failed-page budget and breaker off (B, C defaults).
+`ollama_cloud/deepseek-v4.1-flash:cloud`, `EXTRACT_UNIT_CONCURRENCY=4`, 2
+crawl / 2 extract workers, `max_depth` 0, fresh run directory, site and LLM
+stop rules armed (launcher re-checked against fake processes first). Five
+of the saved 28 URLs, spanning 5-25 units: generate-clients, dependencies,
+request-forms, deployment/versions, encoder. All 64 units that produced
+pairs in both runs had byte-identical source text.
+
+**Noise band, set before the run** from Step 2 vs Step 4 (identical
+inputs, 26 pages): per-page |Δpairs|/mean median 7%, p90 22%, max 67% (a
+1 → 2 page). Flag rule: > 30% **and** > 5 pairs.
+
+| page | units | Step 2 | Step 4 | smoke | Δ vs Step 4 |
+|---|---|---|---|---|---|
+| /advanced/generate-clients | 19 | 100 | 103 | 101 | −2 (2%) |
+| /tutorial/dependencies | 25 | 92 | 111 | 92 | −19 (19%) |
+| /tutorial/request-forms | 17 | 58 | 52 | 54 | +2 (4%) |
+| /deployment/versions | 10 | 28 | 29 | 29 | 0 |
+| /tutorial/encoder | 5 | 17 | 22 | 19 | −3 (15%) |
+| total | 76 | 295 | 317 | 295 | −22 (7%) |
+
+**Result: nothing flagged.** The largest move, dependencies −19, is 19%,
+inside the band. The smoke count (92) equals the Step 2 baseline exactly,
+so Step 4's 111 was the high draw, not a regression now. Run: 5/5 `done`,
+76 calls (75 OK, 1 malformed), median call 9.0s, 105s wall-clock, 0 rate
+limits, 0 errors, stop rules never fired. The A-C changes didn't change
+extraction output on the default path, as intended. Their 429 behaviour
+still hasn't met a real rate limit.
