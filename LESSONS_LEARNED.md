@@ -5249,7 +5249,7 @@ prefixes. The scope config has no exclude option, so this is the
 least-invasive way to keep out `/zh/ /pt/ /es/ /ja/`. 2 crawl / 2 extract
 workers, `max_pages` 20, blank intent, `per_chunk`, quality scoring and
 RAG off, timing on. Token usage was added to the timing log in this step
-(`953a299`).
+(`fa3535d`).
 
 **Numbers.**
 - Run: 2,558s wall. **28 pages `done`, 0 failed** (20 + 8 in-flight
@@ -5294,7 +5294,7 @@ before/after.
 `crawled_urls.json` with `max_depth=0` (checked offline first: exactly the
 seeds are fetched, nothing else), `max_pages` 28, fresh run directory.
 `ollama_cloud/deepseek-v4.1-flash:cloud`, 2 crawl / 2 extract workers,
-`EXTRACT_UNIT_CONCURRENCY=4` (code `68a867e`), blank intent, `per_chunk`,
+`EXTRACT_UNIT_CONCURRENCY=4` (code `3b9eb33`), blank intent, `per_chunk`,
 quality scoring and RAG off, timing on. A stop rule covered site
 429s/challenges and LLM 429s or 3 consecutive LLM errors; it never fired.
 No strict concurrency-1 rerun (agreed: fetch was 0.8% of the baseline's
@@ -5388,7 +5388,7 @@ the breaker is on.
 
 ### 85. Brief 1 Step 3c items A-C built and tested offline: 429 details, failed-page budget, LLM circuit breaker. The 741-429 spiral is now a regression test
 
-**What shipped** (commits `feb5a1d`, `6de00c5`, `0e2a277`; defaults: A
+**What shipped** (commits `04b72d0`, `042b320`, `9372528`; defaults: A
 on, B and C off):
 - **A.** `RateLimitError.from_provider_error()` at all four raise sites
   keeps the status, the provider's retry hint (`retry-after-ms` /
@@ -5435,7 +5435,7 @@ none). The first real one is the test that matters; the timing log and
 
 ### 86. Brief 1 smoke test on the branch head (after 3c items A-C): 5 real pages at unit concurrency 4, pair counts within sampling noise of Step 4
 
-**Setup.** Branch `brief-1-scraper-speed` at `5d823b9`, so 429 details on
+**Setup.** Branch `brief-1-scraper-speed` at `ece1b82`, so 429 details on
 (A), failed-page budget and breaker off (B, C defaults).
 `ollama_cloud/deepseek-v4.1-flash:cloud`, `EXTRACT_UNIT_CONCURRENCY=4`, 2
 crawl / 2 extract workers, `max_depth` 0, fresh run directory, site and LLM
