@@ -1126,6 +1126,21 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     stop the run, is a design decision. Not fixed in Brief 1 (design
     proposal in Brief 1 Step 3c).
 
+55. **[Found 2026-11-20, Brief 1 Step 2] Per-chunk extraction units are
+    far smaller than `PARENT_CHUNK_SIZE` (2000), so pages cost many more
+    LLM calls than the config implies.** Measured on fastapi.tiangolo.com
+    (247 pages): units per page median 16, p75 28, p90 41, max 317
+    (release notes). Successful calls carried 27-1,983 chars, most under
+    300. Every unit is one sequential LLM call. At ~33s per call that's
+    roughly 9 minutes of extraction for a median page, plus proportionally
+    more quota. **Suspected cause (to be confirmed in Brief 1 Step 3a):**
+    `content/relevance.py::chunk_text` emits every fenced code block as
+    its own chunk and splits each prose gap between fences separately, so
+    code-heavy pages become many small fragments. Nothing merges adjacent
+    small pieces back up to `chunk_size`. Fence-atomicity itself is
+    deliberate (see `chunk_text`'s docstring); the fragmentation it causes
+    downstream wasn't measured before.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
