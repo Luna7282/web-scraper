@@ -5432,3 +5432,35 @@ run in under 2s instead of looping every 300s.
 scripted stubs. No real 429 has been seen under concurrency (Step 4 drew
 none). The first real one is the test that matters; the timing log and
 `last_error` now record enough to judge it.
+
+### 86. Brief 1 smoke test on the branch head (after 3c items A-C): 5 real pages at unit concurrency 4, pair counts within sampling noise of Step 4
+
+**Setup.** Branch `brief-1-scraper-speed` at `5d823b9`, so 429 details on
+(A), failed-page budget and breaker off (B, C defaults).
+`ollama_cloud/deepseek-v4.1-flash:cloud`, `EXTRACT_UNIT_CONCURRENCY=4`, 2
+crawl / 2 extract workers, `max_depth` 0, fresh run directory, site and LLM
+stop rules armed (launcher re-checked against fake processes first). Five
+of the saved 28 URLs, spanning 5-25 units: generate-clients, dependencies,
+request-forms, deployment/versions, encoder. All 64 units that produced
+pairs in both runs had byte-identical source text.
+
+**Noise band, set before the run** from Step 2 vs Step 4 (identical
+inputs, 26 pages): per-page |Δpairs|/mean median 7%, p90 22%, max 67% (a
+1 → 2 page). Flag rule: > 30% **and** > 5 pairs.
+
+| page | units | Step 2 | Step 4 | smoke | Δ vs Step 4 |
+|---|---|---|---|---|---|
+| /advanced/generate-clients | 19 | 100 | 103 | 101 | −2 (2%) |
+| /tutorial/dependencies | 25 | 92 | 111 | 92 | −19 (19%) |
+| /tutorial/request-forms | 17 | 58 | 52 | 54 | +2 (4%) |
+| /deployment/versions | 10 | 28 | 29 | 29 | 0 |
+| /tutorial/encoder | 5 | 17 | 22 | 19 | −3 (15%) |
+| total | 76 | 295 | 317 | 295 | −22 (7%) |
+
+**Result: nothing flagged.** The largest move, dependencies −19, is 19%,
+inside the band. The smoke count (92) equals the Step 2 baseline exactly,
+so Step 4's 111 was the high draw, not a regression now. Run: 5/5 `done`,
+76 calls (75 OK, 1 malformed), median call 9.0s, 105s wall-clock, 0 rate
+limits, 0 errors, stop rules never fired. The A-C changes didn't change
+extraction output on the default path, as intended. Their 429 behaviour
+still hasn't met a real rate limit.
