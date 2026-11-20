@@ -1071,6 +1071,27 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     specifies none, so only the 0.5s default applied. Not fixed in
     Brief 1.
 
+53. **[Found 2026-11-20, Brief 1 Step 2] A docs-root index page can't be
+    crawled as a discovered link: `normalize_url` strips the trailing
+    slash, and the site's robots.txt only allows the slash form.**
+    docs.manim.community's robots.txt is `Disallow: /` + `Allow:
+    /en/stable/`. `crawl/scope.py::normalize_url` turns
+    `https://docs.manim.community/en/stable/` into `.../en/stable`, and
+    `crawl/robots_cache.py`'s resolver then (correctly, per RFC 9309)
+    finds no matching Allow for the path `/en/stable` and falls back to
+    `Disallow: /`. Checked offline against the real rules: `/en/stable` →
+    disallowed, `/en/stable/` and everything under it → allowed. Effect:
+    any discovered link to the section index lands as `failed`
+    (`robots_disallowed`). The page is only fetchable when it's passed
+    literally (with the slash) as a seed, because `Frontier.seed()`
+    doesn't normalize. A Brief 1 Step 2 attempt seeded with the
+    normalized form fetched nothing at all. The robots resolver is not the
+    bug. The mismatch is between URL identity (slash-stripped, deliberately,
+    so `/x` and `/x/` dedupe) and the robots check, which needs the
+    request path as it will actually be sent. Any fix has to keep the
+    dedupe and must not make the robots check more permissive than the
+    file says. Not fixed in Brief 1.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
