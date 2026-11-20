@@ -5385,3 +5385,50 @@ off by default, may make workers wait at its gate as a documented
 exception to "rate limits release the row". `ChatOpenAI`'s
 `max_retries` becomes config (default 2, unchanged), forced to 0 when
 the breaker is on.
+
+### 85. Brief 1 Step 3c items A-C built and tested offline: 429 details, failed-page budget, LLM circuit breaker. The 741-429 spiral is now a regression test
+
+**What shipped** (commits `feb5a1d`, `6de00c5`, `0e2a277`; defaults: A
+on, B and C off):
+- **A.** `RateLimitError.from_provider_error()` at all four raise sites
+  keeps the status, the provider's retry hint (`retry-after-ms` /
+  `Retry-After` / Google body `retryDelay`), a quota hint (Google
+  `quotaMetric`/`quotaId`) and a redacted, capped message. The row backoff
+  now follows the hint, capped at 300s.
+- **B.** `MAX_PAGES_COUNTS_FAILED` counts genuine failures toward
+  `max_pages`, never robots disallows. What counts is now one predicate
+  shared by claim() and quiescence.
+- **C.** `LlmCircuitBreaker`: N consecutive 429s → workers wait at a
+  gate → one probe → close, re-trip, or stop. It stops at once on a
+  daily-quota signal taken from the *uncapped* provider hint. It never
+  cancels in-flight calls. `ChatOpenAI` `max_retries` is now config
+  (default 2), forced to 0 with the breaker on.
+
+**The spiral, reproduced and bounded** (stub provider: 3 good calls, then
+429 forever; 30 pages, budget 5, 2+2 workers):
+
+| | 429s | fetches | pages failed | outcome |
+|---|---|---|---|---|
+| no breaker | ~87 | ~88 | 29 | burns every page it can find |
+| breaker (threshold 3, 3 trips) | 7 | 11 | 0 | clean stop, 29 pages resumable |
+
+A "retry in 20 hours" hint (72,000s, above the 300s row cap) stops the
+run in under 2s instead of looping every 300s.
+
+**Two test mistakes worth remembering:**
+1. **A helper named `run()` on a `unittest.TestCase` subclass replaced
+   the test runner's own `TestCase.run`.** Every test in those classes
+   silently didn't run: 12 of 18 reported, "OK". It was caught only
+   because the count looked short. Never name a test helper `run`, and
+   check the reported test count against the number written.
+2. **A stub provider read its shared call counter after an
+   `await asyncio.sleep`.** Concurrent calls had already bumped it, so the
+   "first 3 calls succeed" contract silently became "2". Two assertions
+   had baked in the miscount ("all 30 pages fail", "90 fetches") and only
+   broke once the stub was fixed. A concurrent stub has to capture
+   per-call state before its first await.
+
+**Still unverified:** all of this rests on documented 429 shapes and
+scripted stubs. No real 429 has been seen under concurrency (Step 4 drew
+none). The first real one is the test that matters; the timing log and
+`last_error` now record enough to judge it.
