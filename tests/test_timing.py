@@ -19,7 +19,7 @@ from crawl.pipeline import (
     crawl_worker,
     extract_worker,
 )
-from crawl.timing import TimingLog
+from crawl.timing import TimingLog, call_usage, usage_from_message
 from decisions.types import NoulAnswer
 
 SEED = "https://x.test/a"
@@ -307,6 +307,82 @@ class TestTimingOffByDefault(unittest.TestCase):
         with patch.object(main.config, "EXTRACT_TIMING_LOG", False):
             self.assertIsNone(main._start_timing_log("/nonexistent", "gemini", "m", 1, 1, None, False))
         self.assertFalse(os.path.exists("/nonexistent"))
+
+
+
+class TestTokenUsageCapture(unittest.IsolatedAsyncioTestCase):
+    """Usage is published by extract_fn via crawl.timing.call_usage and
+    attached to that call's extract_call event -- never a previous call's."""
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "timings.jsonl")
+        self.frontier = Frontier(":memory:", max_retries=3)
+        await self.frontier.open()
+        await self.frontier.seed([(SEED, None)])
+
+    async def asyncTearDown(self):
+        await self.frontier.close()
+        self.tmp.cleanup()
+
+    async def test_usage_attached_per_call_and_not_leaked_to_the_next(self):
+        async def usage_extract(unit):
+            raw = await extract_fn(unit)
+            if unit == UNITS[0]:  # only the first unit reports usage
+                call_usage.set({"input_tokens": 10, "output_tokens": 20,
+                                "total_tokens": 30, "reasoning_tokens": 15})
+            return raw
+
+        timing = TimingLog(self.path)
+        timing.start()
+        cq, rq = asyncio.Queue(maxsize=4), asyncio.Queue(maxsize=4)
+        tasks = [
+            asyncio.create_task(extract_worker(
+                self.frontier, cq, rq, score_fn, usage_extract, 0.5, 0.5,
+                extraction_units_fn=units_fn, poll_interval=0.01, timing=timing,
+            )),
+            asyncio.create_task(recrawl_stub(self.frontier, cq, CONTENT)),
+        ]
+        for _ in range(200):
+            if rq.qsize() >= 1:
+                break
+            await asyncio.sleep(0.01)
+        await cancel_all(tasks)
+        await timing.close()
+
+        calls = [e for e in read_events(self.path) if e["event"] == "extract_call"]
+        self.assertEqual(calls[0]["usage"]["reasoning_tokens"], 15)
+        self.assertIsNone(calls[1]["usage"])
+        self.assertIsNone(calls[2]["usage"])
+
+    def test_usage_from_message_reads_reasoning_tokens(self):
+        from langchain_core.messages import AIMessage
+        msg = AIMessage(content="x", usage_metadata={
+            "input_tokens": 3, "output_tokens": 5, "total_tokens": 8,
+            "output_token_details": {"reasoning": 4},
+        })
+        self.assertEqual(usage_from_message(msg), {
+            "input_tokens": 3, "output_tokens": 5, "total_tokens": 8, "reasoning_tokens": 4,
+        })
+        self.assertIsNone(usage_from_message(AIMessage(content="x")))
+
+    async def test_make_extract_fn_publishes_usage_only_when_asked(self):
+        from unittest.mock import MagicMock
+
+        from langchain_core.messages import AIMessage
+
+        import main
+        fake_llm = MagicMock()
+        fake_llm.invoke.return_value = AIMessage(content="[]", usage_metadata={
+            "input_tokens": 1, "output_tokens": 2, "total_tokens": 3,
+        })
+
+        call_usage.set(None)
+        self.assertEqual(await main._make_extract_fn(fake_llm)("text"), "[]")
+        self.assertIsNone(call_usage.get())  # default: nothing published
+
+        self.assertEqual(await main._make_extract_fn(fake_llm, record_usage=True)("text"), "[]")
+        self.assertEqual(call_usage.get()["total_tokens"], 3)
 
 
 if __name__ == "__main__":
