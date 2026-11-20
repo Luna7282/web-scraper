@@ -14,6 +14,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 import config
+import headless
 from llm_factory import get_llm
 from crawl.discovery import discover_branches, fetch_page_links
 from crawl.scope import normalize_url, derive_prefix, is_in_scope
@@ -198,7 +199,7 @@ _DEFAULT_MODEL_BY_PROVIDER = {
 }
 
 
-def _resolve_llm(cfg: dict):
+def _resolve_llm(cfg: dict, api_key: str | None = None):
     # gemini is the default extraction provider as of 2026-09-22 -- every
     # measurement before this point (Phase 2/3 figures in LESSONS_LEARNED.md,
     # the extraction-prompt tuning in content/extraction.py) used
@@ -207,7 +208,7 @@ def _resolve_llm(cfg: dict):
     # the same check against gemini first -- see CLAUDE.md.
     provider_name = cfg.get("provider", "gemini")
     model_name = cfg.get("model") or _DEFAULT_MODEL_BY_PROVIDER[provider_name]
-    llm, embeddings = get_llm(provider_name, model_name)
+    llm, embeddings = get_llm(provider_name, model_name, api_key=api_key)
     return provider_name, model_name, llm, embeddings
 
 
@@ -263,7 +264,7 @@ async def headless_map(cfg: dict) -> dict:
     return {"mode": "map", "counts_by_status": counts, "fatal_errors": fatal_errors}
 
 
-async def headless_crawl(cfg: dict) -> dict:
+async def headless_crawl(cfg: dict, api_key: str | None = None) -> dict:
     """Non-interactive equivalent of main() -- same worker wiring, same
     RAG/threshold/provider logic, just no Prompt.ask calls. See
     headless_map's docstring for the seeds/host_prefix_pairs contract and
@@ -280,7 +281,7 @@ async def headless_crawl(cfg: dict) -> dict:
     scope_check = _make_scope_check(host_prefix_pairs)
     intent = cfg.get("intent") or None
 
-    provider_name, model_name, llm, embeddings = _resolve_llm(cfg)
+    provider_name, model_name, llm, embeddings = _resolve_llm(cfg, api_key=api_key)
 
     frontier = Frontier(db_path, max_pages=cfg.get("max_pages"), max_depth=cfg.get("max_depth"),
                         count_failed_toward_budget=config.MAX_PAGES_COUNTS_FAILED)
@@ -374,12 +375,41 @@ async def headless_crawl(cfg: dict) -> dict:
     return {"mode": "crawl", "counts_by_status": counts, "fatal_errors": fatal_errors}
 
 
-async def headless_run(cfg: dict) -> dict:
+async def headless_run(cfg: dict, api_key: str | None = None) -> dict:
     if cfg["mode"] == "map":
         return await headless_map(cfg)
     if cfg["mode"] == "crawl":
-        return await headless_crawl(cfg)
+        return await headless_crawl(cfg, api_key=api_key)
     raise ValueError(f"unknown headless mode: {cfg['mode']!r}")
+
+
+def headless_v1_entry(cfg: dict, run=None, out=None, err=None, environ=None) -> int:
+    """Headless contract v1 (headless.py): validate, apply the effective
+    settings for this run only, run, map the outcome to an exit code. A bad
+    config is one line on stderr and exit 2 -- no traceback. `run`, `out`,
+    `err` and `environ` are injectable for tests."""
+    out = sys.stdout if out is None else out
+    err = sys.stderr if err is None else err
+    environ = os.environ if environ is None else environ
+    try:
+        hr = headless.validate(cfg, environ)
+    except headless.HeadlessConfigError as e:
+        print(f"config error: {e}", file=err)
+        return headless.EXIT_CONFIG_ERROR
+    api_key = environ[hr.api_key_env].strip() if hr.api_key_env else None
+    run = headless_run if run is None else run
+    try:
+        with headless.applied_settings(hr.effective):
+            config.validate_system_one_config()
+            result = asyncio.run(run(hr.cfg, api_key=api_key))
+    except config.SystemOneConfigError as e:
+        print(f"config error: {e}", file=err)
+        return headless.EXIT_CONFIG_ERROR
+    except KeyboardInterrupt:
+        print("Interrupted.", file=err)
+        return headless.EXIT_INTERRUPTED
+    print(json.dumps(result), file=out)
+    return headless.EXIT_STOPPED_EARLY if result.get("fatal_errors") else headless.EXIT_OK
 
 
 async def map_main(root_url: str):
@@ -1323,6 +1353,9 @@ if __name__ == "__main__":
         elif args.headless_config:
             with open(args.headless_config, encoding="utf-8") as f:
                 cfg = json.load(f)
+            if headless.is_versioned(cfg):
+                sys.exit(headless_v1_entry(cfg))
+            # Legacy headless (no contract_version): exactly as before.
             result = asyncio.run(headless_run(cfg))
             print(json.dumps(result))
             if result.get("fatal_errors"):

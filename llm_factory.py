@@ -39,10 +39,15 @@ def get_llm(
     model_name: str = "deepseek-v4-flash",
     embedding_model_name: str = "nomic-embed-text",
     max_retries: int | None = None,
+    api_key: str | None = None,
 ):
     """max_retries: the openai SDK's own silent retries. None = config's
     effective value (LLM_SDK_MAX_RETRIES, default 2 -- the SDK default, so
-    unchanged; 0 when the LLM circuit breaker is on)."""
+    unchanged; 0 when the LLM circuit breaker is on).
+
+    api_key: an explicit key for this run (headless contract v1's
+    `api_key_env`), used instead of the provider's usual environment variable.
+    None = today's behaviour. Never logged."""
     provider = LLMProvider(provider_name.lower())
     config = get_llm_config(provider)
 
@@ -56,7 +61,7 @@ def get_llm(
     #    the existing retry path.
     llm = ChatOpenAI(
         model=model_name,
-        api_key=config.api_key if config.api_key else "dummy",
+        api_key=api_key or (config.api_key if config.api_key else "dummy"),
         base_url=config.base_url,
         timeout=LLM_EXTRACT_TIMEOUT_SECONDS,
         max_retries=effective_llm_sdk_max_retries() if max_retries is None else max_retries,
