@@ -648,7 +648,19 @@ extraction, real RAG index, real crash-resume).
   backoff_seconds=...)` sets `not_before` and hands the row back to
   `queued`; the worker moves on immediately. A worker `sleep`ing in place
   for a 429 blocks that concurrency slot for the full backoff — with a
-  small pool, a few 429s idle the whole stage.
+  small pool, a few 429s idle the whole stage. **The backoff is the
+  provider's own hint when it sends one**: every raise site
+  (`main.py`'s three `_make_*_fn`s, `decisions/jev.py`) builds the error
+  with `RateLimitError.from_provider_error()`, which reads
+  `retry-after-ms`/`Retry-After` or Google's body `retryDelay`, plus a
+  `quota_hint` (Google `quotaMetric`/`quotaId`) and a capped,
+  secret-redacted `detail`. `last_error` becomes "rate_limited (stage):
+  <hint>", and the timing log carries the details. The flat
+  `DEFAULT_RATE_LIMIT_BACKOFF_SECONDS` applies only when there's no
+  hint, and every backoff is capped at
+  `config.RATE_LIMIT_MAX_BACKOFF_SECONDS` (a per-day "retry in 20h"
+  would otherwise park a queued row so far out that the run never
+  reaches quiescence).
 - **`Writer` (in `storage/writer.py`) has exactly one caller: `writer_worker`.**
   `crawl_worker`/`extract_worker`'s signatures structurally cannot receive
   a `Writer` or Chroma client (enforced by

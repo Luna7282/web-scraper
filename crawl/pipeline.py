@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import math
+import re
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -20,7 +22,7 @@ if TYPE_CHECKING:
     from decisions import DecisionBackend
 
 from storage.canonical import build_canonical_record, detect_license_signal, extract_page_title
-from config import MAX_RETRIES, get_threshold
+from config import MAX_RETRIES, RATE_LIMIT_MAX_BACKOFF_SECONDS, get_threshold
 from content.extraction import MalformedExtractionError, parse_qa_json
 from crawl.frontier import Frontier, FrontierRow
 from crawl.politeness import HostPoliteness
@@ -62,9 +64,157 @@ class BrowserDriverError(Exception):
 
 
 class RateLimitError(Exception):
-    def __init__(self, retry_after: float | None = None):
+    """A provider said "slow down" (429, or Jev's 529). Carries what the
+    provider told us about it -- see rate_limit_details() -- so the backoff
+    can use the provider's own retry hint and the stored error says which
+    quota was hit (ROADMAP.md #51/#56). Every field is optional: a bare
+    RateLimitError() still means "back off by the default"."""
+
+    def __init__(
+        self, retry_after: float | None = None, status_code: int | None = None,
+        quota_hint: str | None = None, detail: str | None = None,
+    ):
         self.retry_after = retry_after
+        self.status_code = status_code
+        self.quota_hint = quota_hint
+        self.detail = detail
         super().__init__(f"rate limited, retry_after={retry_after}")
+
+    @classmethod
+    def from_provider_error(cls, source) -> RateLimitError:
+        """Build from an openai.APIStatusError (or anything with .response/
+        .body) or a raw requests/httpx response. Never raises."""
+        return cls(**rate_limit_details(source))
+
+    def summary(self) -> str:
+        """Short, bounded, secret-redacted text for frontier.last_error."""
+        return self.quota_hint or self.detail or ""
+
+    def details(self) -> dict:
+        return {"status_code": self.status_code, "retry_after": self.retry_after,
+                "quota_hint": self.quota_hint, "detail": self.detail}
+
+
+# --- 429 parsing (ROADMAP.md #56) -------------------------------------------
+# Same key shapes .githooks/pre-commit blocks, plus bearer tokens: anything
+# that looks like a credential is replaced before an error excerpt can reach
+# frontier.db or timings.jsonl.
+_SECRET_SHAPED = re.compile(
+    r"nvapi-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{20,}"
+    r"|[A-Za-z0-9]{32,}\.[A-Za-z0-9_-]{16,}|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{8,}"
+)
+RATE_LIMIT_DETAIL_MAX_CHARS = 300
+_GOOGLE_DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)s\s*$")
+
+
+def _redact_and_cap(text: str) -> str:
+    text = _SECRET_SHAPED.sub("[redacted]", " ".join(text.split()))
+    if len(text) > RATE_LIMIT_DETAIL_MAX_CHARS:
+        text = text[: RATE_LIMIT_DETAIL_MAX_CHARS - 1] + "…"
+    return text
+
+
+def _positive_finite(value) -> float | None:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) and f > 0 else None
+
+
+def _header(headers, name: str) -> str | None:
+    try:
+        value = headers.get(name)
+    except Exception:  # noqa: BLE001 -- a malformed/mock headers object must not break error handling
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _retry_after_from_headers(headers) -> float | None:
+    """retry-after-ms, then Retry-After as seconds or an HTTP date -- the
+    same precedence the openai SDK itself uses."""
+    ms = _positive_finite(_header(headers, "retry-after-ms"))
+    if ms is not None:
+        return ms / 1000
+    raw = _header(headers, "retry-after")
+    if raw is None:
+        return None
+    seconds = _positive_finite(raw)
+    if seconds is not None:
+        return seconds
+    try:
+        from email.utils import parsedate_to_datetime
+        delta = parsedate_to_datetime(raw).timestamp() - time.time()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return delta if delta > 0 else None
+
+
+def _walk(node, depth: int = 0):
+    """Every dict in a parsed error body (Gemini's OpenAI-compatible
+    endpoint returns a list of {"error": ...}; the openai SDK may pass the
+    inner error object or the whole body). Depth-capped."""
+    if depth > 6:
+        return
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _walk(value, depth + 1)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk(item, depth + 1)
+
+
+def rate_limit_details(source) -> dict:
+    """What a provider's rate-limit response says: status_code,
+    retry_after (seconds: retry-after-ms / Retry-After headers first, then
+    a Google RetryInfo `retryDelay` like "12s" in the body), quota_hint
+    (Google QuotaFailure quotaMetric/quotaId -- names per-minute vs
+    per-day and free-tier quotas), detail (the provider's message,
+    whitespace-collapsed, secret-redacted, capped). Headers are never
+    copied. Never raises: unknown shapes just yield Nones."""
+    response = getattr(source, "response", None) or source
+    status = getattr(source, "status_code", None) or getattr(response, "status_code", None)
+    headers = getattr(response, "headers", None)
+    body = getattr(source, "body", None)
+    if body is None and response is not None and not isinstance(response, (str, bytes)):
+        try:
+            body = response.json()
+        except Exception:  # noqa: BLE001 -- not JSON / mock / already consumed: no body
+            body = None
+
+    retry_after = _retry_after_from_headers(headers) if headers is not None else None
+    quota, message = [], None
+    for node in _walk(body):
+        if retry_after is None and isinstance(node.get("retryDelay"), str):
+            m = _GOOGLE_DURATION.match(node["retryDelay"])
+            if m:
+                retry_after = _positive_finite(m.group(1))
+        for key in ("quotaMetric", "quotaId"):
+            if isinstance(node.get(key), str) and node[key] not in quota:
+                quota.append(node[key])
+        if message is None and isinstance(node.get("message"), str):
+            message = node["message"]
+    if message is None and isinstance(body, str):
+        message = body
+    return {
+        "status_code": status if isinstance(status, int) else None,
+        "retry_after": retry_after,
+        "quota_hint": _redact_and_cap(", ".join(quota)) if quota else None,
+        "detail": _redact_and_cap(message) if message else None,
+    }
+
+
+def _rate_limit_backoff(e: RateLimitError) -> float:
+    """The provider's own hint when it gave one, else the old flat default;
+    capped so a per-day retryDelay can't park a row for hours (a queued row
+    with a far not_before keeps the run from ever reaching quiescence)."""
+    return min(e.retry_after or DEFAULT_RATE_LIMIT_BACKOFF_SECONDS, RATE_LIMIT_MAX_BACKOFF_SECONDS)
+
+
+def _rate_limit_reason(stage: str, e: RateLimitError) -> str:
+    summary = e.summary()
+    return f"rate_limited ({stage}): {summary}" if summary else f"rate_limited ({stage})"
 
 
 @dataclass
@@ -118,16 +268,23 @@ def _since(started: float) -> float:
     return round(time.perf_counter() - started, 4)
 
 
+def _call_outcome(e: Exception) -> tuple[str, dict]:
+    """(outcome, extra timing fields) for a failed LLM call."""
+    if isinstance(e, RateLimitError):
+        return "rate_limited", {"rate_limit": e.details()}
+    return "error", {"error": type(e).__name__}
+
+
 def _record_extract_call(
     timing: TimingLog | None, url: str, chunk_index: int, unit: str, started: float,
-    outcome: str, seconds: float | None = None,
+    outcome: str, seconds: float | None = None, **extra,
 ) -> None:
     if timing is None:
         return
     timing.record(
         "extract_call", url=url, chunk_index=chunk_index, chars_in=len(unit),
         seconds=seconds if seconds is not None else _since(started),
-        outcome=outcome, usage=call_usage.get(), **timing.llm_fields(),
+        outcome=outcome, usage=call_usage.get(), **extra, **timing.llm_fields(),
     )
 
 
@@ -288,10 +445,10 @@ async def extract_worker(
                     )
                 except Exception as e:
                     if timing is not None:
+                        outcome, extra = _call_outcome(e)
                         timing.record(
                             "quality_call", url=url, chunk_index=chunk_index,
-                            seconds=_since(quality_started),
-                            outcome="rate_limited" if isinstance(e, RateLimitError) else "error",
+                            seconds=_since(quality_started), outcome=outcome, **extra,
                         )
                     raise
                 if timing is not None:
@@ -315,8 +472,8 @@ async def extract_worker(
                 try:
                     raw_response = await extract_fn(unit)
                 except Exception as e:
-                    _record_extract_call(timing, url, chunk_index, unit, call_started,
-                                         "rate_limited" if isinstance(e, RateLimitError) else "error")
+                    outcome, extra = _call_outcome(e)
+                    _record_extract_call(timing, url, chunk_index, unit, call_started, outcome, **extra)
                     raise
                 call_seconds = _since(call_started)
             try:
@@ -379,8 +536,7 @@ async def extract_worker(
             score = await score_fn(url, content)
         except RateLimitError as e:
             await frontier.mark_extract_outcome(
-                url, "failed", "rate_limited (scoring)",
-                backoff_seconds=e.retry_after or DEFAULT_RATE_LIMIT_BACKOFF_SECONDS,
+                url, "failed", _rate_limit_reason("scoring", e), backoff_seconds=_rate_limit_backoff(e),
             )
             await frontier.content_done(content_queue)
             continue
@@ -441,8 +597,7 @@ async def extract_worker(
             _record_page(timing, url, "rate_limited", units=len(units),
                          pairs=sum(len(r) for r in unit_results if r), started=extraction_started)
             await frontier.mark_extract_outcome(
-                url, "failed", "rate_limited (extraction)",
-                backoff_seconds=e.retry_after or DEFAULT_RATE_LIMIT_BACKOFF_SECONDS,
+                url, "failed", _rate_limit_reason("extraction", e), backoff_seconds=_rate_limit_backoff(e),
             )
             await frontier.content_done(content_queue)
             continue

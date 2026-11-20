@@ -1031,7 +1031,9 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     POSIX zombie check — e.g. reading process state — is likely needed
     alongside it, not instead of it).
 
-51. **[Found 2026-11-20, Brief 1 Step 1] Every extraction 429 backs off a
+51. **[429 part RESOLVED -- Brief 1 3c item A: the provider's Retry-After /
+    retryDelay is now used, capped at `RATE_LIMIT_MAX_BACKOFF_SECONDS`; the
+    503/UNAVAILABLE extension below is still open] [Found 2026-11-20, Brief 1 Step 1] Every extraction 429 backs off a
     flat 5 seconds, whatever the provider asked for.**
     `main.py::_make_extract_fn` turns a 429 into `RateLimitError()` with no
     `retry_after`, so `extract_worker` always falls back to
@@ -1141,7 +1143,9 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     deliberate (see `chunk_text`'s docstring); the fragmentation it causes
     downstream wasn't measured before.
 
-56. **[Found 2026-11-20, Brief 1 Step 2] The 429 response body is thrown
+56. **[RESOLVED -- Brief 1 3c item A: `RateLimitError.from_provider_error()`
+    keeps status, retry hint, quota hint and a redacted detail; `last_error`
+    and the timing log record them] [Found 2026-11-20, Brief 1 Step 2] The 429 response body is thrown
     away, so the quota that was hit is never recorded.**
     `main.py::_make_extract_fn` raises `RateLimitError() from e`: no
     message, no `retry_after`, no body. `extract_worker` then stores only

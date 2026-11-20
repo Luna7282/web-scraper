@@ -54,7 +54,8 @@ class JevBackend(DecisionBackend):
             # rate-limit-releases-the-row contract every other LLM call in
             # this codebase already follows (crawl/pipeline.py's
             # RateLimitError -> mark_extract_outcome(..., backoff_seconds=)).
-            raise RateLimitError(retry_after=None)
+            # The provider's own retry hint / message, if any (ROADMAP #56).
+            raise RateLimitError.from_provider_error(response)
         if response.status_code == 401:
             raise DecisionError("Jev: missing or invalid TYPESAFE_API_KEY (401)")
         if response.status_code == 422:

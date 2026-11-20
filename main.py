@@ -814,7 +814,7 @@ def _make_extract_fn(llm, prompt_variant: "config.ExtractionPromptVariant" = Non
             response = await asyncio.to_thread(llm.invoke, messages)
         except Exception as e:
             if _is_rate_limit_exception(e):
-                raise RateLimitError() from e
+                raise RateLimitError.from_provider_error(e) from e
             raise
         if record_usage:
             call_usage.set(usage_from_message(response))
@@ -835,7 +835,7 @@ def _make_decision_chat_fn(llm):
             response = await asyncio.to_thread(llm.invoke, messages)
         except Exception as e:
             if _is_rate_limit_exception(e):
-                raise RateLimitError() from e
+                raise RateLimitError.from_provider_error(e) from e
             raise
         return response.content
     return chat_fn
@@ -851,7 +851,7 @@ def _make_classify_fn(llm):
             response = await asyncio.to_thread(llm.invoke, messages)
         except Exception as e:
             if _is_rate_limit_exception(e):
-                raise RateLimitError() from e
+                raise RateLimitError.from_provider_error(e) from e
             raise
         return response.content
     return classify_fn

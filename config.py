@@ -89,6 +89,14 @@ EXTRACT_TIMING_LOG_FILENAME = "timings.jsonl"
 # today. Env-overridable like EXTRACT_TIMING_LOG.
 EXTRACT_UNIT_CONCURRENCY = int(os.getenv("EXTRACT_UNIT_CONCURRENCY", "1"))
 
+# Upper bound on a rate-limit backoff (crawl/pipeline.py::_rate_limit_backoff).
+# A 429's own retry hint (Retry-After / Google retryDelay) is used when the
+# provider sends one -- ROADMAP.md #51 -- but a per-day quota can say "retry
+# in 20 hours", and a queued row parked that far out keeps the run from ever
+# reaching quiescence. Longer outages are the circuit breaker's job, not a
+# single row's backoff.
+RATE_LIMIT_MAX_BACKOFF_SECONDS = 300.0
+
 # Network timeouts for the two real HTTP call sites behind asyncio.to_thread
 # in llm_factory.py (LESSONS_LEARNED.md #56, ROADMAP.md #40) -- neither had
 # any timeout at all before this: LocalOllamaEmbeddings' requests.post()
