@@ -523,6 +523,36 @@ live run, then confirmed against one anyway (#61): pausing mid-crawl froze
 `counts_by_status` completely across three `--live-status` polls, job
 stayed `running` the whole time, and unpausing resumed immediately.
 
+## Headless contract v1 (`headless.py`, Brief 3A)
+
+`--headless-config` has two contracts, chosen by one key.
+- **No `contract_version`: legacy headless, exactly as before.** This is
+  what the control server sends (with an extra `root_url` key, ignored).
+  Never make legacy stricter: that breaks the server.
+- **`"contract_version": 1`: strict v1.**
+  - Unknown keys are refused, all listed by name.
+  - Behaviour settings (`extract_unit_concurrency`,
+    `max_pages_counts_failed`, `llm_breaker_threshold`,
+    `llm_sdk_max_retries`, `use_system_one`, `system_one_provider`,
+    `extract_timing_log`) go in a `"settings"` object, resolved **config
+    value > environment variable > default**, with each value's source
+    recorded.
+  - `headless.applied_settings()` writes them onto the `config` module for
+    the run and restores them after. That's safe because every reader uses
+    `config.X` at call time: keep it that way, and don't import these
+    settings by name.
+  - `"api_key_env"` names the environment variable holding this run's key.
+    The value goes only into `get_llm(..., api_key=)`, never into the
+    config dict, `result.json`, errors or logs.
+  - Any other version is a config error.
+- **v1 exit codes** (`headless.EXIT_*`): 0 ok, 1 stopped early
+  (`fatal_errors`), 2 config error (one line on stderr, no traceback),
+  130 SIGINT, 143 SIGTERM. Legacy keeps 0 / 1, and Ctrl-C there still
+  exits 0.
+- **Tests that apply settings must restore `config`.**
+  `tests/test_headless_contract.py`'s `ConfigGuard` fails a test that
+  leaves it changed.
+
 ## Control server (`server/`)
 
 Local HTTP control layer — `uv run python server.py`, Flask,

@@ -5464,3 +5464,35 @@ so Step 4's 111 was the high draw, not a regression now. Run: 5/5 `done`,
 limits, 0 errors, stop rules never fired. The A-C changes didn't change
 extraction output on the default path, as intended. Their 429 behaviour
 still hasn't met a real rate limit.
+
+### 87. Brief 3A Step 1: headless contract v1. The control server is a second headless client, so "required" had to mean "required to opt in"
+
+**Built** (`9f9f98c` code, `0ec9cd8` tests; branch `brief-3a-contract`,
+not merged): `headless.py`. `contract_version`, strict keys, settings in
+the config with config > env > default precedence (sources recorded), an
+API key named by `api_key_env`, exit codes 0 / 1 / 2 / 130 (143 with
+Step 3). 17 tests; full suite 559, only the 10 known #50 failures.
+
+**What reading the code found before writing any (Step 0):**
+- **`server/app.py` launches `main.py --headless-config` too,** with no
+  version and an extra `root_url` key `headless_crawl` never reads. A brief
+  that says "`contract_version` required in headless mode" *and* "the
+  control server behaves exactly as today" can't have both literally. The
+  resolution, approved: no `contract_version` = legacy, untouched; `1` = v1.
+  A subprocess test pins it: a legacy config with `root_url` and a bad mode
+  still gives today's ValueError traceback and exit 1.
+- **Every reader of the behaviour settings uses `config.X` at call time**
+  (`main.py`, `decisions/dispatch.py`, the `effective_llm_sdk_max_retries()`
+  function), and none imports them by name. That's what makes "apply the
+  effective settings to the config module for one run" safe, rather than
+  threading a settings object through every caller.
+- **foundry's adapter writes files into the scraper run_dir before
+  launching,** so Step 2's "refuse a non-empty run_dir" must mean "contains
+  scraper state".
+
+**Decisions worth keeping:** `bool` is refused where an int is expected
+(`True` is an `int` in Python, so `extract_unit_concurrency: true` would
+otherwise mean 1). Env values are parsed exactly as `config.py` parses them
+at import, so precedence never changes how a value is read. A
+`ConfigGuard` on every settings test fails if the config module is left
+changed (owner's addition).

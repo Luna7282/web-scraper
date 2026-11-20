@@ -284,6 +284,14 @@ section for the design reasoning.
 - **`--discover-json URL`** / **`--headless-config CONFIG_JSON`** — the
   non-interactive equivalents of the interactive prompts, meant for the
   control server (below) to drive as subprocesses, not for typing by hand.
+  A config **with** `"contract_version": 1` is the strict v1 contract
+  (`headless.py`): unknown keys are refused, behaviour settings live in a
+  `"settings"` object (config value > environment > default), and the API
+  key is named by `"api_key_env"`. Exit codes: **0** ok, **1** stopped early,
+  **2** config error (one line on stderr, no traceback), **130**
+  interrupted (SIGINT), **143** stopped by SIGTERM. A config **without**
+  `contract_version` is legacy headless, unchanged (exit 0 / 1). That's
+  what the control server sends.
 
 ## Architecture
 
