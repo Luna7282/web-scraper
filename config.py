@@ -75,6 +75,20 @@ EXTRACTION_PROMPT_VARIANT = ExtractionPromptVariant.STANDARD
 EXTRACT_TIMING_LOG = os.getenv("EXTRACT_TIMING_LOG", "false").strip().lower() == "true"
 EXTRACT_TIMING_LOG_FILENAME = "timings.jsonl"
 
+# How many of ONE page's extraction units (and, with sample-quality scoring
+# on, its pair-scoring calls) extract_worker keeps in flight at once, under
+# one asyncio.Semaphore (crawl/pipeline.py). 1 = the original strictly
+# sequential per-unit loop, unchanged. Worker count (extract_workers) only
+# parallelises across pages; this parallelises within one, which is what a
+# single huge page (one 317-unit page took 83% of the Brief 1 Step 2
+# baseline, LESSONS_LEARNED.md #82) needs. Each in-flight call occupies one
+# asyncio.to_thread slot (extract_fn runs llm.invoke in a thread), so
+# extract_workers x this must stay well under the default thread pool
+# (min(32, cpu_count + 4)); it also multiplies the request rate the provider
+# sees -- see ROADMAP.md #51/#54 for what a provider rate limit does to a run
+# today. Env-overridable like EXTRACT_TIMING_LOG.
+EXTRACT_UNIT_CONCURRENCY = int(os.getenv("EXTRACT_UNIT_CONCURRENCY", "1"))
+
 # Network timeouts for the two real HTTP call sites behind asyncio.to_thread
 # in llm_factory.py (LESSONS_LEARNED.md #56, ROADMAP.md #40) -- neither had
 # any timeout at all before this: LocalOllamaEmbeddings' requests.post()

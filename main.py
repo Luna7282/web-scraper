@@ -353,7 +353,7 @@ async def headless_crawl(cfg: dict) -> dict:
                                 generation_model=model_name, extraction_strategy=config.EXTRACTION_STRATEGY.value,
                                 section_depth=config.SECTION_DEPTH, seed_prefixes=host_prefix_pairs,
                                 quality_backend=quality_backend, quality_threshold=quality_threshold,
-                                timing=timing)
+                                timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY)
             )
             for _ in range(extract_workers_n)
         ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
@@ -721,7 +721,8 @@ def _start_timing_log(
     timing.record(
         "run_start", crawl_workers=crawl_workers_n, extract_workers=extract_workers_n,
         max_pages=max_pages, extraction_strategy=config.EXTRACTION_STRATEGY.value,
-        quality_scoring=quality_scoring, **timing.llm_fields(),
+        quality_scoring=quality_scoring, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY,
+        **timing.llm_fields(),
     )
     console.print(f"[dim]Timing log on: {timing.path}[/dim]")
     return timing
@@ -1058,7 +1059,7 @@ async def main():
                                 section_depth=config.SECTION_DEPTH,
                                 seed_prefixes=host_prefix_pairs,
                                 quality_backend=quality_backend, quality_threshold=quality_threshold,
-                                timing=timing)
+                                timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY)
             )
             for _ in range(extract_workers_n)
         ] + [

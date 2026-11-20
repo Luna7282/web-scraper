@@ -8,6 +8,7 @@ tests/test_crawl_worker.py, tests/test_extract_worker.py.
 from __future__ import annotations
 
 import asyncio
+import functools
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -77,6 +78,38 @@ FetchFn = Callable[[str], Awaitable[tuple[str, list[str]]]]  # url -> (html, raw
 ScoreFn = Callable[[str, str], Awaitable[float]]  # (url, content) -> relevance score
 ExtractFn = Callable[[str], Awaitable[str]]  # content -> raw LLM response text
 ScopeCheck = Callable[[str], bool]
+
+
+async def _run_in_order(factories: list[Callable[[], Awaitable]]) -> list:
+    """Run every factory's coroutine concurrently in one TaskGroup and
+    return their results in factory order (not completion order). Any
+    failure cancels the rest (TaskGroup semantics) and is re-raised as the
+    plain exception -- not an ExceptionGroup -- so callers keep their
+    ordinary `except RateLimitError` / `except Exception` handling. If
+    several calls failed before cancellation landed, a RateLimitError wins:
+    it's the one failure with its own retry-later path (release the row with
+    backoff), and reporting a sibling's error instead would skip it.
+    Cancelling the caller cancels every child; nothing is left running."""
+    results: list = [None] * len(factories)
+
+    async def run(index: int, factory: Callable[[], Awaitable]) -> None:
+        results[index] = await factory()
+
+    try:
+        async with asyncio.TaskGroup() as tg:
+            for index, factory in enumerate(factories):
+                tg.create_task(run(index, factory))
+    except ExceptionGroup as group:
+        leaves = _leaf_exceptions(group)
+        raise next((e for e in leaves if isinstance(e, RateLimitError)), leaves[0]) from None
+    return results
+
+
+def _leaf_exceptions(group: BaseExceptionGroup) -> list[BaseException]:
+    leaves: list[BaseException] = []
+    for e in group.exceptions:
+        leaves.extend(_leaf_exceptions(e) if isinstance(e, BaseExceptionGroup) else [e])
+    return leaves
 
 
 # Timing helpers (crawl/timing.py, config.EXTRACT_TIMING_LOG). Every one is
@@ -229,7 +262,109 @@ async def extract_worker(
     quality_backend: DecisionBackend | None = None,
     quality_threshold: float | None = None,
     timing: TimingLog | None = None,
+    unit_concurrency: int = 1,
 ) -> None:
+    """unit_concurrency (config.EXTRACT_UNIT_CONCURRENCY, default 1): how
+    many of one page's extraction units -- and, with a quality_backend, its
+    pair-scoring calls -- may be in flight at once. 1 is the original
+    strictly-sequential behaviour; see the comment at the extraction loop."""
+    if unit_concurrency < 1:
+        raise ValueError(f"unit_concurrency must be >= 1, got {unit_concurrency}")
+
+    def make_unit_processor(url, section, page_title, timestamp, crawl_date, license_signal):
+        """Per-page closures over this page's fields (built once per page,
+        before the loop variables move on)."""
+        async def score_pair(chunk_index: int, pair: dict, sem: asyncio.Semaphore | None):
+            """One quality-scoring call. Not caught here -- a DecisionError/
+            RateLimitError falls through to the same except blocks below that
+            handle extract_fn's failures (fail loudly, mark_extract_outcome(...,
+            'failed', reason), never a silent fallback to keeping the pair)."""
+            async with sem if sem is not None else nullcontext():
+                quality_started = time.perf_counter()
+                try:
+                    answer = await quality_backend.noul(
+                        f"Instruction: {pair['instruction']}\nResponse: {pair['response']}",
+                        "Is this a good instruction-response training pair?",
+                    )
+                except Exception as e:
+                    if timing is not None:
+                        timing.record(
+                            "quality_call", url=url, chunk_index=chunk_index,
+                            seconds=_since(quality_started),
+                            outcome="rate_limited" if isinstance(e, RateLimitError) else "error",
+                        )
+                    raise
+                if timing is not None:
+                    timing.record("quality_call", url=url, chunk_index=chunk_index,
+                                  seconds=_since(quality_started), outcome="ok")
+            return answer.value, answer.method
+
+        async def process_unit(chunk_index: int, unit: str, sem: asyncio.Semaphore | None) -> list[dict] | None:
+            """One extraction unit: one extract_fn call, parse, optional
+            quality scoring. Returns the unit's canonical records, or None if
+            its response was malformed -- one bad unit doesn't fail the whole
+            page (each unit is an independent LLM call; a page only fails
+            below if literally none of its units parsed). Any other exception
+            propagates. With a semaphore, a permit is held only around each
+            LLM call -- never while waiting on this unit's own quality calls,
+            which need permits too (holding one there could deadlock)."""
+            if timing is not None:
+                call_usage.set(None)  # never attribute a previous call's usage to this one
+            async with sem if sem is not None else nullcontext():
+                call_started = time.perf_counter()
+                try:
+                    raw_response = await extract_fn(unit)
+                except Exception as e:
+                    _record_extract_call(timing, url, chunk_index, unit, call_started,
+                                         "rate_limited" if isinstance(e, RateLimitError) else "error")
+                    raise
+                call_seconds = _since(call_started)
+            try:
+                pairs = parse_qa_json(raw_response)
+            except MalformedExtractionError:
+                _record_extract_call(timing, url, chunk_index, unit, call_started, "malformed",
+                                     seconds=call_seconds)
+                return None
+            _record_extract_call(timing, url, chunk_index, unit, call_started, "ok", seconds=call_seconds)
+
+            scores = [(None, None)] * len(pairs)
+            if quality_backend is not None:
+                if sem is None:
+                    scores = [await score_pair(chunk_index, pair, None) for pair in pairs]
+                else:
+                    scores = await _run_in_order(
+                        [functools.partial(score_pair, chunk_index, pair, sem) for pair in pairs]
+                    )
+            records = []
+            for pair, (quality_score, quality_method) in zip(pairs, scores):
+                if quality_backend is not None:
+                    # None (the default): per-method threshold, looked up by
+                    # the answering backend's own method -- Jev/Laya/
+                    # traditional score quality on different distributions
+                    # (see config.DECISION_THRESHOLDS), so reusing one fixed
+                    # number regardless of which backend answered would be
+                    # the same category error dedup's shared 0.4 threshold
+                    # turned out to be. An explicit quality_threshold still
+                    # overrides this for every method, same as before.
+                    active_threshold = (
+                        quality_threshold if quality_threshold is not None
+                        else get_threshold("sample_quality", quality_method)
+                    )
+                    if quality_score < active_threshold:
+                        continue
+                records.append(build_canonical_record(
+                    question=pair["instruction"], answer=pair["response"],
+                    source_chunk=unit, chunk_index=chunk_index, source_url=url, section=section,
+                    page_title=page_title, generation_model=generation_model,
+                    extraction_strategy=extraction_strategy,
+                    timestamp=timestamp, crawl_date=crawl_date,
+                    license_signal=license_signal,
+                    quality_score=quality_score, quality_decision_method=quality_method,
+                ))
+            return records
+
+        return process_unit
+
     while True:
         try:
             url, content = await asyncio.wait_for(content_queue.get(), timeout=poll_interval)
@@ -281,87 +416,30 @@ async def extract_worker(
         now = datetime.now(timezone.utc)
         timestamp, crawl_date = now.isoformat(), now.date().isoformat()
 
-        qa_pairs: list[dict] = []
-        parsed_any_unit = False
         extraction_started = time.perf_counter()
+
+        process_unit = make_unit_processor(url, section, page_title, timestamp, crawl_date, license_signal)
+
+
+        # unit_concurrency == 1 (config.EXTRACT_UNIT_CONCURRENCY's default):
+        # strictly sequential, exactly the pre-concurrency behaviour -- a
+        # failing unit stops the page before any later unit is called.
+        # > 1: every unit runs concurrently under one semaphore; results land
+        # in their chunk_index slot, so output order never depends on which
+        # call finished first. The first failure cancels the sibling calls.
+        unit_results: list[list[dict] | None] = []
         try:
-            for chunk_index, unit in enumerate(units):
-                if timing is not None:
-                    call_usage.set(None)  # never attribute a previous call's usage to this one
-                call_started = time.perf_counter()
-                try:
-                    raw_response = await extract_fn(unit)
-                except Exception as e:
-                    _record_extract_call(timing, url, chunk_index, unit, call_started,
-                                         "rate_limited" if isinstance(e, RateLimitError) else "error")
-                    raise
-                call_seconds = _since(call_started)
-                try:
-                    pairs = parse_qa_json(raw_response)
-                except MalformedExtractionError:
-                    _record_extract_call(timing, url, chunk_index, unit, call_started, "malformed",
-                                         seconds=call_seconds)
-                    # One bad unit doesn't fail the whole page -- each unit
-                    # is an independent LLM call; a page only fails below
-                    # if literally none of its units parsed.
-                    continue
-                _record_extract_call(timing, url, chunk_index, unit, call_started, "ok",
-                                     seconds=call_seconds)
-                parsed_any_unit = True
-                for pair in pairs:
-                    quality_score, quality_method = None, None
-                    if quality_backend is not None:
-                        # Not caught here -- a DecisionError/RateLimitError
-                        # from this call falls through to the same
-                        # except blocks below that already handle
-                        # extract_fn's failures identically (fail loudly,
-                        # mark_extract_outcome(..., 'failed', reason),
-                        # never a silent fallback to keeping the pair).
-                        quality_started = time.perf_counter()
-                        try:
-                            answer = await quality_backend.noul(
-                                f"Instruction: {pair['instruction']}\nResponse: {pair['response']}",
-                                "Is this a good instruction-response training pair?",
-                            )
-                        except Exception as e:
-                            if timing is not None:
-                                timing.record(
-                                    "quality_call", url=url, chunk_index=chunk_index,
-                                    seconds=_since(quality_started),
-                                    outcome="rate_limited" if isinstance(e, RateLimitError) else "error",
-                                )
-                            raise
-                        if timing is not None:
-                            timing.record("quality_call", url=url, chunk_index=chunk_index,
-                                          seconds=_since(quality_started), outcome="ok")
-                        quality_score, quality_method = answer.value, answer.method
-                        # None (the default): per-method threshold, looked
-                        # up by the answering backend's own method -- Jev/
-                        # Laya/traditional score quality on different
-                        # distributions (see config.DECISION_THRESHOLDS),
-                        # so reusing one fixed number regardless of which
-                        # backend answered would be the same category
-                        # error dedup's shared 0.4 threshold turned out to
-                        # be. An explicit quality_threshold still overrides
-                        # this for every method, same as before.
-                        active_threshold = (
-                            quality_threshold if quality_threshold is not None
-                            else get_threshold("sample_quality", quality_method)
-                        )
-                        if quality_score < active_threshold:
-                            continue
-                    qa_pairs.append(build_canonical_record(
-                        question=pair["instruction"], answer=pair["response"],
-                        source_chunk=unit, chunk_index=chunk_index, source_url=url, section=section,
-                        page_title=page_title, generation_model=generation_model,
-                        extraction_strategy=extraction_strategy,
-                        timestamp=timestamp, crawl_date=crawl_date,
-                        license_signal=license_signal,
-                        quality_score=quality_score, quality_decision_method=quality_method,
-                    ))
+            if unit_concurrency > 1:
+                sem = asyncio.Semaphore(unit_concurrency)
+                unit_results = await _run_in_order(
+                    [functools.partial(process_unit, i, unit, sem) for i, unit in enumerate(units)]
+                )
+            else:
+                for chunk_index, unit in enumerate(units):
+                    unit_results.append(await process_unit(chunk_index, unit, None))
         except RateLimitError as e:
-            _record_page(timing, url, "rate_limited", units=len(units), pairs=len(qa_pairs),
-                         started=extraction_started)
+            _record_page(timing, url, "rate_limited", units=len(units),
+                         pairs=sum(len(r) for r in unit_results if r), started=extraction_started)
             await frontier.mark_extract_outcome(
                 url, "failed", "rate_limited (extraction)",
                 backoff_seconds=e.retry_after or DEFAULT_RATE_LIMIT_BACKOFF_SECONDS,
@@ -369,11 +447,14 @@ async def extract_worker(
             await frontier.content_done(content_queue)
             continue
         except Exception as e:
-            _record_page(timing, url, "error", units=len(units), pairs=len(qa_pairs),
-                         started=extraction_started)
+            _record_page(timing, url, "error", units=len(units),
+                         pairs=sum(len(r) for r in unit_results if r), started=extraction_started)
             await frontier.mark_extract_outcome(url, "failed", f"extraction: {type(e).__name__}: {e}")
             await frontier.content_done(content_queue)
             continue
+
+        qa_pairs = [record for result in unit_results if result is not None for record in result]
+        parsed_any_unit = any(result is not None for result in unit_results)
 
         if units and not parsed_any_unit:
             _record_page(timing, url, "malformed", units=len(units), pairs=0, started=extraction_started)
