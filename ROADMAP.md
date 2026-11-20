@@ -1031,6 +1031,22 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     POSIX zombie check — e.g. reading process state — is likely needed
     alongside it, not instead of it).
 
+51. **[Found 2026-11-20, Brief 1 Step 1] Every extraction 429 backs off a
+    flat 5 seconds, whatever the provider asked for.**
+    `main.py::_make_extract_fn` turns a 429 into `RateLimitError()` with no
+    `retry_after`, so `extract_worker` always falls back to
+    `crawl/pipeline.py::DEFAULT_RATE_LIMIT_BACKOFF_SECONDS` (5.0). The
+    provider's `Retry-After` header (or Gemini's `retryDelay` in the error
+    body), if any, is never read. Against a per-minute quota, 5s is likely
+    too short: the released row gets re-claimed, re-fetched and re-sent
+    into the same exhausted window. Each retry counts toward `MAX_RETRIES`,
+    so a page can end up permanently `failed` purely from rate limiting.
+    Same gap for scoring-path 429s (same exception, same default). The 429
+    path has never been exercised against a real rate limit (Brief 1 Step
+    4 is the first planned attempt). Deliberately not changed in Brief 1:
+    any fix should parse the provider's own hint first and keep the
+    "release the row, never sleep the worker" design.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
