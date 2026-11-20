@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 from storage.canonical import build_canonical_record, detect_license_signal, extract_page_title
 from config import MAX_RETRIES, RATE_LIMIT_MAX_BACKOFF_SECONDS, get_threshold
 from content.extraction import MalformedExtractionError, parse_qa_json
+from crawl.circuit_breaker import BreakerStopped, LlmCircuitBreaker
 from crawl.frontier import ROBOTS_DISALLOWED_ERROR, Frontier, FrontierRow
 from crawl.politeness import HostPoliteness
 from crawl.robots_cache import RobotsCache
@@ -251,7 +252,13 @@ async def _run_in_order(factories: list[Callable[[], Awaitable]]) -> list:
                 tg.create_task(run(index, factory))
     except ExceptionGroup as group:
         leaves = _leaf_exceptions(group)
-        raise next((e for e in leaves if isinstance(e, RateLimitError)), leaves[0]) from None
+        # BreakerStopped first (the run is ending; never mark the page failed),
+        # then RateLimitError (its own retry-later path), then the first error.
+        for kind in (BreakerStopped, RateLimitError):
+            match = next((e for e in leaves if isinstance(e, kind)), None)
+            if match is not None:
+                raise match from None
+        raise leaves[0] from None
     return results
 
 
@@ -420,11 +427,21 @@ async def extract_worker(
     quality_threshold: float | None = None,
     timing: TimingLog | None = None,
     unit_concurrency: int = 1,
+    breaker: LlmCircuitBreaker | None = None,
 ) -> None:
     """unit_concurrency (config.EXTRACT_UNIT_CONCURRENCY, default 1): how
     many of one page's extraction units -- and, with a quality_backend, its
     pair-scoring calls -- may be in flight at once. 1 is the original
-    strictly-sequential behaviour; see the comment at the extraction loop."""
+    strictly-sequential behaviour; see the comment at the extraction loop.
+
+    breaker (config.LLM_BREAKER_THRESHOLD, off by default; crawl/
+    circuit_breaker.py): every extraction/quality LLM call first acquires a
+    permit -- outside the semaphore, so a waiting call holds no slot -- and
+    reports its outcome. A rate limit while the breaker is open sends that
+    same call back to the gate (finished units are kept, the page's retry
+    budget isn't spent); a sporadic 429 with the breaker closed takes the
+    original release-the-row path. BreakerStopped ends this worker without
+    marking the page failed (it stays in_progress, resumable)."""
     if unit_concurrency < 1:
         raise ValueError(f"unit_concurrency must be >= 1, got {unit_concurrency}")
 
@@ -436,25 +453,31 @@ async def extract_worker(
             RateLimitError falls through to the same except blocks below that
             handle extract_fn's failures (fail loudly, mark_extract_outcome(...,
             'failed', reason), never a silent fallback to keeping the pair)."""
-            async with sem if sem is not None else nullcontext():
-                quality_started = time.perf_counter()
-                try:
-                    answer = await quality_backend.noul(
-                        f"Instruction: {pair['instruction']}\nResponse: {pair['response']}",
-                        "Is this a good instruction-response training pair?",
-                    )
-                except Exception as e:
-                    if timing is not None:
-                        outcome, extra = _call_outcome(e)
-                        timing.record(
-                            "quality_call", url=url, chunk_index=chunk_index,
-                            seconds=_since(quality_started), outcome=outcome, **extra,
+            while True:
+                permit = await breaker.acquire() if breaker is not None else None
+                async with sem if sem is not None else nullcontext():
+                    quality_started = time.perf_counter()
+                    try:
+                        answer = await quality_backend.noul(
+                            f"Instruction: {pair['instruction']}\nResponse: {pair['response']}",
+                            "Is this a good instruction-response training pair?",
                         )
-                    raise
-                if timing is not None:
-                    timing.record("quality_call", url=url, chunk_index=chunk_index,
-                                  seconds=_since(quality_started), outcome="ok")
-            return answer.value, answer.method
+                    except Exception as e:
+                        if timing is not None:
+                            outcome, extra = _call_outcome(e)
+                            timing.record(
+                                "quality_call", url=url, chunk_index=chunk_index,
+                                seconds=_since(quality_started), outcome=outcome, **extra,
+                            )
+                        if breaker is not None and breaker.failure(permit, e):
+                            continue  # back to the gate; retry this same call
+                        raise
+                    if timing is not None:
+                        timing.record("quality_call", url=url, chunk_index=chunk_index,
+                                      seconds=_since(quality_started), outcome="ok")
+                if breaker is not None:
+                    breaker.success(permit)
+                return answer.value, answer.method
 
         async def process_unit(chunk_index: int, unit: str, sem: asyncio.Semaphore | None) -> list[dict] | None:
             """One extraction unit: one extract_fn call, parse, optional
@@ -465,17 +488,24 @@ async def extract_worker(
             propagates. With a semaphore, a permit is held only around each
             LLM call -- never while waiting on this unit's own quality calls,
             which need permits too (holding one there could deadlock)."""
-            if timing is not None:
-                call_usage.set(None)  # never attribute a previous call's usage to this one
-            async with sem if sem is not None else nullcontext():
-                call_started = time.perf_counter()
-                try:
-                    raw_response = await extract_fn(unit)
-                except Exception as e:
-                    outcome, extra = _call_outcome(e)
-                    _record_extract_call(timing, url, chunk_index, unit, call_started, outcome, **extra)
-                    raise
-                call_seconds = _since(call_started)
+            while True:
+                permit = await breaker.acquire() if breaker is not None else None
+                if timing is not None:
+                    call_usage.set(None)  # never attribute a previous call's usage to this one
+                async with sem if sem is not None else nullcontext():
+                    call_started = time.perf_counter()
+                    try:
+                        raw_response = await extract_fn(unit)
+                    except Exception as e:
+                        outcome, extra = _call_outcome(e)
+                        _record_extract_call(timing, url, chunk_index, unit, call_started, outcome, **extra)
+                        if breaker is not None and breaker.failure(permit, e):
+                            continue  # back to the gate; retry this same unit
+                        raise
+                    call_seconds = _since(call_started)
+                if breaker is not None:
+                    breaker.success(permit)
+                break
             try:
                 pairs = parse_qa_json(raw_response)
             except MalformedExtractionError:
@@ -593,6 +623,13 @@ async def extract_worker(
             else:
                 for chunk_index, unit in enumerate(units):
                     unit_results.append(await process_unit(chunk_index, unit, None))
+        except BreakerStopped:
+            # The run is ending (main.py's on_stop sets quiescence). Leave
+            # the row in_progress -- recover_crashed() requeues it on resume
+            # -- and never count this as a page failure.
+            _record_page(timing, url, "breaker_stopped", units=len(units),
+                         pairs=sum(len(r) for r in unit_results if r), started=extraction_started)
+            return
         except RateLimitError as e:
             _record_page(timing, url, "rate_limited", units=len(units),
                          pairs=sum(len(r) for r in unit_results if r), started=extraction_started)

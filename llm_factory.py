@@ -1,6 +1,9 @@
 from crawl4ai import cache_context
 from langchain_openai import ChatOpenAI
-from config import LLMProvider, get_llm_config, LLM_EXTRACT_TIMEOUT_SECONDS, OLLAMA_EMBED_TIMEOUT_SECONDS
+from config import (
+    LLMProvider, get_llm_config, LLM_EXTRACT_TIMEOUT_SECONDS, OLLAMA_EMBED_TIMEOUT_SECONDS,
+    effective_llm_sdk_max_retries,
+)
 import requests
 
 # Custom native embedding class that bypasses OpenAI SDK transport bugs entirely
@@ -34,8 +37,12 @@ class LocalOllamaEmbeddings:
 def get_llm(
     provider_name: str,
     model_name: str = "deepseek-v4-flash",
-    embedding_model_name: str = "nomic-embed-text"
+    embedding_model_name: str = "nomic-embed-text",
+    max_retries: int | None = None,
 ):
+    """max_retries: the openai SDK's own silent retries. None = config's
+    effective value (LLM_SDK_MAX_RETRIES, default 2 -- the SDK default, so
+    unchanged; 0 when the LLM circuit breaker is on)."""
     provider = LLMProvider(provider_name.lower())
     config = get_llm_config(provider)
 
@@ -52,6 +59,7 @@ def get_llm(
         api_key=config.api_key if config.api_key else "dummy",
         base_url=config.base_url,
         timeout=LLM_EXTRACT_TIMEOUT_SECONDS,
+        max_retries=effective_llm_sdk_max_retries() if max_retries is None else max_retries,
     )
 
     # 2. Embedding model -> always native local Ollama HTTP, regardless of

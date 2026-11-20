@@ -21,6 +21,7 @@ from crawl.frontier import Frontier
 from crawl.pipeline import crawl_worker, extract_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError
 from crawl.politeness import HostPoliteness
 from crawl.timing import TimingLog, call_usage, usage_from_message
+from crawl.circuit_breaker import LlmCircuitBreaker
 from content.extraction import QA_EXTRACTION_SYSTEM_PROMPT, CODE_QA_EXTRACTION_SYSTEM_PROMPT
 from crawl.branch_select import suggest_branch_selection, BRANCH_CLASSIFICATION_SYSTEM_PROMPT
 from content.relevance import make_score_fn
@@ -341,6 +342,7 @@ async def headless_crawl(cfg: dict) -> dict:
             run_dir, provider_name, model_name, crawl_workers_n, extract_workers_n,
             cfg.get("max_pages"), quality_backend is not None,
         )
+        breaker = _make_llm_breaker(frontier, fatal_errors, timing)
         tasks = [
             asyncio.create_task(
                 crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness,
@@ -355,7 +357,8 @@ async def headless_crawl(cfg: dict) -> dict:
                                 generation_model=model_name, extraction_strategy=config.EXTRACTION_STRATEGY.value,
                                 section_depth=config.SECTION_DEPTH, seed_prefixes=host_prefix_pairs,
                                 quality_backend=quality_backend, quality_threshold=quality_threshold,
-                                timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY)
+                                timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY,
+                                breaker=breaker)
             )
             for _ in range(extract_workers_n)
         ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
@@ -731,6 +734,36 @@ def _start_timing_log(
     return timing
 
 
+def _make_llm_breaker(frontier: Frontier, fatal_errors: list[str], timing: TimingLog | None) -> LlmCircuitBreaker | None:
+    """None unless config.LLM_BREAKER_THRESHOLD > 0 (off by default) -- see
+    crawl/circuit_breaker.py. Its stop ends the run the same way a dead
+    shared browser does: a message in fatal_errors (main() reports
+    'Stopped early' and exits non-zero) and quiescence set directly; rows
+    are left resumable."""
+    if config.LLM_BREAKER_THRESHOLD <= 0:
+        return None
+
+    def on_event(kind: str, **fields) -> None:
+        console.print(f"[yellow][breaker] {kind} {fields}[/yellow]")
+        if timing is not None:
+            timing.record(kind, **fields)
+
+    def on_stop(reason: str) -> None:
+        msg = f"[FATAL] LLM circuit breaker stopped the run: {reason}"
+        print(msg)
+        fatal_errors.append(msg)
+        frontier.quiescent.set()
+
+    return LlmCircuitBreaker(
+        threshold=config.LLM_BREAKER_THRESHOLD,
+        base_cooldown=config.LLM_BREAKER_BASE_COOLDOWN_SECONDS,
+        max_cooldown=config.LLM_BREAKER_MAX_COOLDOWN_SECONDS,
+        max_trips=config.LLM_BREAKER_MAX_TRIPS,
+        stop_if_retry_after=config.LLM_BREAKER_STOP_IF_RETRY_AFTER_SECONDS,
+        on_event=on_event, on_stop=on_stop,
+    )
+
+
 async def _stop_timing_log(timing: TimingLog | None) -> None:
     if timing is not None:
         await timing.close()  # writes run_end (wall_seconds) and flushes
@@ -1047,6 +1080,7 @@ async def main():
             RUN_DIR, provider_name, model_name, crawl_workers_n, extract_workers_n,
             max_pages, quality_backend is not None,
         )
+        breaker = _make_llm_breaker(frontier, fatal_errors, timing)
         tasks = [
             asyncio.create_task(
                 crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness,
@@ -1063,7 +1097,8 @@ async def main():
                                 section_depth=config.SECTION_DEPTH,
                                 seed_prefixes=host_prefix_pairs,
                                 quality_backend=quality_backend, quality_threshold=quality_threshold,
-                                timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY)
+                                timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY,
+                                breaker=breaker)
             )
             for _ in range(extract_workers_n)
         ] + [

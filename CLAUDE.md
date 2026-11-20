@@ -45,6 +45,7 @@ not by accident.
 | | `graph.py` | `discovery_graph`/`path_tree`: JSON graph projections over a frontier DB (`--graph`) |
 | | `live_status.py` | `read_live_status`: poll-friendly crawl-state snapshot, own connection (`--live-status`) |
 | | `score_report.py` | `--score-report`: relevance-score distribution from a prior run |
+| | `circuit_breaker.py` | `LlmCircuitBreaker`: opt-in (`config.LLM_BREAKER_THRESHOLD`, off by default) gate that pauses LLM calls after N consecutive 429s, stops the run on a daily-quota signal |
 | | `timing.py` | `TimingLog`: opt-in (`config.EXTRACT_TIMING_LOG`, off by default) JSONL timing of fetch/score/LLM calls → `<run_dir>/timings.jsonl` |
 | `content/` | `chrome_strip.py` | Nav/header/footer/aside/button exclusion, applied in `main.py::_make_fetch_fn` |
 | | `extraction.py` | `parse_qa_json`, the Q&A system prompt |
@@ -672,6 +673,37 @@ extraction, real RAG index, real crash-resume).
   `config.RATE_LIMIT_MAX_BACKOFF_SECONDS` (a per-day "retry in 20h"
   would otherwise park a queued row so far out that the run never
   reaches quiescence).
+  **The one deliberate exception: the LLM circuit breaker**
+  (`crawl/circuit_breaker.py`, `config.LLM_BREAKER_THRESHOLD`, **off by
+  default**). With it on, after N consecutive rate-limited LLM calls,
+  extract workers **wait at the breaker's gate** before any new
+  extraction or quality call, holding their pages instead of releasing
+  them. The release rule exists so one row's backoff doesn't idle a
+  worker while other work could proceed. With the breaker open, no LLM
+  work can proceed at all, so waiting is the point: it stops the "every
+  429 releases a page, the next page 429s too" spiral (`ROADMAP.md`
+  #54, `LESSONS_LEARNED.md` #81), keeps finished units, and doesn't burn
+  retry budgets.
+  - **Unaffected:** a sporadic 429 while the breaker is closed still
+    takes the normal release-the-row path.
+  - **The gate:** permits are taken *outside* the unit semaphore, so a
+    waiting call holds no slot. After the cooldown (the provider's own
+    hint, else 60s doubling, capped at 900s) one probe call decides.
+  - **Stopping:** after `LLM_BREAKER_MAX_TRIPS` trips, or at once on a
+    daily-quota signal, the run stops the way a dead browser stops it:
+    a message in `fatal_errors`, quiescence set, non-zero exit, rows left
+    resumable, never marked failed.
+  - **The daily signal is decided from the UNCAPPED provider hint**
+    (`RateLimitError.retry_after`/`quota_hint` as reported), never from
+    the 300s-capped row backoff: a quota hint naming a per-day quota, or
+    a hint of at least `LLM_BREAKER_STOP_IF_RETRY_AFTER_SECONDS`.
+  - **It never cancels in-flight calls.** They run in `asyncio.to_thread`,
+    which can't be cancelled (`ROADMAP.md` #58). They finish and report
+    their outcomes, and only a probe's failure can re-trip.
+  - **SDK retries:** with the breaker on, `ChatOpenAI`'s SDK-level
+    `max_retries` (`config.LLM_SDK_MAX_RETRIES`, default 2, unchanged) is
+    forced to 0, so every 429 reaches the breaker instead of being
+    silently retried up to twice first.
 - **`Writer` (in `storage/writer.py`) has exactly one caller: `writer_worker`.**
   `crawl_worker`/`extract_worker`'s signatures structurally cannot receive
   a `Writer` or Chroma client (enforced by
