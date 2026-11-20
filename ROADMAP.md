@@ -1141,6 +1141,21 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     deliberate (see `chunk_text`'s docstring); the fragmentation it causes
     downstream wasn't measured before.
 
+56. **[Found 2026-11-20, Brief 1 Step 2] The 429 response body is thrown
+    away, so the quota that was hit is never recorded.**
+    `main.py::_make_extract_fn` raises `RateLimitError() from e`: no
+    message, no `retry_after`, no body. `extract_worker` then stores only
+    the fixed string "rate_limited (extraction)" in `frontier.last_error`.
+    The original exception is reachable only as `__cause__` until the
+    handler drops it. Providers put the useful part in that body. Google
+    names the exhausted quota metric (per-minute vs per-day, free-tier vs
+    paid) and a `retryDelay`. **Cost of not having it:** a real run took
+    741 Gemini 429s over 16 minutes, and it's still unknown which quota
+    ran out or what tier the key is on. The only evidence is the timing
+    pattern. Fixing this belongs with #51 (use the provider's retry hint)
+    and should keep the stored text bounded and free of secrets. Not fixed
+    in Brief 1 (design proposal in Brief 1 Step 3c).
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
