@@ -19,7 +19,8 @@ kinds written by crawl/pipeline.py and main.py:
   fetch                 -- url, seconds, outcome (ok / exception class name)
   score                 -- url, seconds, queue_wait_seconds
   extract_call          -- url, chunk_index, chars_in, seconds, provider,
-                           model, outcome (ok / malformed / rate_limited / error)
+                           model, outcome (ok / malformed / rate_limited / error),
+                           usage (token counts from the response, or null)
   quality_call          -- url, chunk_index, seconds, outcome
   page                  -- url, outcome, units, pairs, extraction_seconds
 """
@@ -29,8 +30,36 @@ import asyncio
 import json
 import os
 import time
+from contextvars import ContextVar
 
 _STOP = object()
+
+# Token usage of the most recent extraction LLM call, published by
+# main.py::_make_extract_fn (only when built with record_usage=True, i.e.
+# when timing is on) and read back by extract_worker right after it awaits
+# extract_fn. A ContextVar rather than a return value so extract_fn's
+# `content -> str` contract is unchanged: a value set inside an awaited
+# coroutine is visible to its caller in the same task, and each task gets
+# its own copy, so concurrent calls in separate tasks never see each
+# other's usage.
+call_usage: ContextVar[dict | None] = ContextVar("call_usage", default=None)
+
+
+def usage_from_message(message) -> dict | None:
+    """Token counts from a LangChain chat response, or None if the provider
+    reported none. reasoning_tokens is the provider's thinking-token count
+    when it reports one (OpenAI-compatible `completion_tokens_details.
+    reasoning_tokens`, surfaced by LangChain as output_token_details.reasoning)."""
+    meta = getattr(message, "usage_metadata", None)
+    if not meta:
+        return None
+    details = meta.get("output_token_details") or {}
+    return {
+        "input_tokens": meta.get("input_tokens"),
+        "output_tokens": meta.get("output_tokens"),
+        "total_tokens": meta.get("total_tokens"),
+        "reasoning_tokens": details.get("reasoning"),
+    }
 
 
 def _append_lines(path: str, events: list[dict]) -> None:

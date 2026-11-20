@@ -20,7 +20,7 @@ from crawl.scope import normalize_url, derive_prefix, is_in_scope
 from crawl.frontier import Frontier
 from crawl.pipeline import crawl_worker, extract_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError
 from crawl.politeness import HostPoliteness
-from crawl.timing import TimingLog
+from crawl.timing import TimingLog, call_usage, usage_from_message
 from content.extraction import QA_EXTRACTION_SYSTEM_PROMPT, CODE_QA_EXTRACTION_SYSTEM_PROMPT
 from crawl.branch_select import suggest_branch_selection, BRANCH_CLASSIFICATION_SYSTEM_PROMPT
 from content.relevance import make_score_fn
@@ -288,7 +288,7 @@ async def headless_crawl(cfg: dict) -> dict:
     embed_fn = _make_embed_fn(embeddings)
     intent_embedding = await embed_fn(intent) if intent else None
     score_fn = make_score_fn(intent, intent_embedding, embed_fn)
-    extract_fn = _make_extract_fn(llm)
+    extract_fn = _make_extract_fn(llm, record_usage=config.EXTRACT_TIMING_LOG)
     extraction_units_fn = make_extraction_units_fn(
         config.EXTRACTION_STRATEGY, embed_fn=embed_fn, intent_embedding=intent_embedding,
     )
@@ -798,7 +798,10 @@ _EXTRACTION_SYSTEM_PROMPTS = {
 }
 
 
-def _make_extract_fn(llm, prompt_variant: "config.ExtractionPromptVariant" = None):
+def _make_extract_fn(llm, prompt_variant: "config.ExtractionPromptVariant" = None, record_usage: bool = False):
+    """record_usage (timing only, config.EXTRACT_TIMING_LOG): publish each
+    response's token usage via crawl.timing.call_usage for extract_worker's
+    timing log. Off by default; the returned text is identical either way."""
     system_prompt = _EXTRACTION_SYSTEM_PROMPTS[prompt_variant or config.EXTRACTION_PROMPT_VARIANT]
 
     async def extract_fn(content: str) -> str:
@@ -812,6 +815,8 @@ def _make_extract_fn(llm, prompt_variant: "config.ExtractionPromptVariant" = Non
             if _is_rate_limit_exception(e):
                 raise RateLimitError() from e
             raise
+        if record_usage:
+            call_usage.set(usage_from_message(response))
         return response.content
     return extract_fn
 
@@ -986,7 +991,7 @@ async def main():
     embed_fn = _make_embed_fn(embeddings)
     intent_embedding = await embed_fn(intent) if intent else None
     score_fn = make_score_fn(intent, intent_embedding, embed_fn)
-    extract_fn = _make_extract_fn(llm)
+    extract_fn = _make_extract_fn(llm, record_usage=config.EXTRACT_TIMING_LOG)
     extraction_units_fn = make_extraction_units_fn(
         config.EXTRACTION_STRATEGY, embed_fn=embed_fn, intent_embedding=intent_embedding,
     )

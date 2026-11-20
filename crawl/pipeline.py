@@ -25,6 +25,7 @@ from crawl.frontier import Frontier, FrontierRow
 from crawl.politeness import HostPoliteness
 from crawl.robots_cache import RobotsCache
 from crawl.scope import normalize_url
+from crawl.timing import call_usage
 from content.sectioning import DEFAULT_SECTION_DEPTH, derive_section
 from storage.writer import Writer
 
@@ -93,7 +94,7 @@ def _record_extract_call(
     timing.record(
         "extract_call", url=url, chunk_index=chunk_index, chars_in=len(unit),
         seconds=seconds if seconds is not None else _since(started),
-        outcome=outcome, **timing.llm_fields(),
+        outcome=outcome, usage=call_usage.get(), **timing.llm_fields(),
     )
 
 
@@ -285,6 +286,8 @@ async def extract_worker(
         extraction_started = time.perf_counter()
         try:
             for chunk_index, unit in enumerate(units):
+                if timing is not None:
+                    call_usage.set(None)  # never attribute a previous call's usage to this one
                 call_started = time.perf_counter()
                 try:
                     raw_response = await extract_fn(unit)
