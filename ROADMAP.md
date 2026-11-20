@@ -1110,6 +1110,22 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     dedupe and must not make the robots check more permissive than the
     file says. Not fixed in Brief 1.
 
+54. **[Found 2026-11-20, Brief 1 Step 2] Failed pages don't count toward
+    `max_pages`, so a run whose pages keep failing never stops at its
+    budget.** `Frontier.claim()`'s cap counts only
+    `done`/`skipped_extract`/`mapped` rows (see #28 for the separate
+    in-flight overshoot). A page that ends `failed` frees its budget slot,
+    and the crawl claims, fetches and extracts a new page in its place.
+    **Measured:** a 20-page fastapi.tiangolo.com run whose Gemini quota ran
+    out 8 minutes in ended with **247 distinct pages, 741 fetches
+    (3 per page), 0 `done`**. It kept going for 16 more minutes with every
+    page failing. Any systemic failure (provider quota, outage, bad key
+    after a few successes) therefore turns a bounded run into an unbounded
+    crawl of the site, and an unbounded stream of billed attempts. Whether
+    failed pages should count toward the budget, or a failure rate should
+    stop the run, is a design decision. Not fixed in Brief 1 (design
+    proposal in Brief 1 Step 3c).
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
