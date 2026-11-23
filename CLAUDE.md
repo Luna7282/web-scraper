@@ -676,6 +676,24 @@ legacy runs take today's code paths (the v2 branches are all behind
     fetches the URL in the form it was first discovered (trailing slash
     kept, `scope.fetch_form`). Identity stays `normalize_url`. The mapping
     lives in a v2-only side table, `fetch_urls`.
+- **Step 2 (done):**
+  - **Preflights** (`preflight.py`): they run before any page work, behind
+    the v2-only settings `provider_preflight` and `embeddings_preflight`.
+    - **Provider:** one tiny call, only when the run will make calls. A
+      retired model (410, or a 404 naming the model) or a rejected key
+      (401/403) raises `PreflightFailed`: `config_error`, exit 2. Anything
+      else is a recorded warning.
+    - **Embeddings:** only when the run needs them (intent, RAG,
+      top_k). Any failure fails the run, and the message lists remedies.
+  - **Dry pass (`dry_run: true`):** the chat provider is never constructed.
+    `estimate_worker` makes extract_worker's score and follow decisions,
+    runs the real chunker, and marks pages `mapped`. It writes
+    `estimate.json`, whose token basis is in `config.ESTIMATE_*`, measured
+    from the Brief 2c run. A dry pass can't be resumed into a real run, and
+    can't be combined with `resume`.
+  - **Cost** (`crawl/cost.py`): `result.json` has a `cost` section counting
+    every call attempt by outcome, per provider, model and role, plus 5xx
+    releases. A token total is null when no call reported it, never 0.
 - **Tests that spawn the real `main.py`** must use a config that can't run
   (an unsupported version, a never-existing run_dir). When version 2
   became valid, one such test silently ran a real v2 crawl

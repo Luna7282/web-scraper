@@ -5682,3 +5682,31 @@ test **ran a real v2 crawl** into `/tmp/x`:
 **Side effect:** foundry's drift guard fails while this branch is checked
 out (`SUPPORTED_CONTRACT_VERSIONS (1, 2)` vs its `(1,)`). The guard should
 accept a scraper that still supports v1 (foundry ROADMAP #13).
+
+### 92. Brief 3B Step 2 and the network guard: the guard paid for itself on its first run
+
+**Network guard** (`b13a69d`): any non-localhost socket, DNS lookup or
+Chromium launch fails a fast-suite test. That holds in child Pythons too
+(via `sitecustomize` on `PYTHONPATH`), and when the code under test
+swallows the error. On its first run it found:
+- **Two tests launching real Chromium in the fast suite**
+  (`test_fetch_fn_integration`, offline `raw:` HTML). They're in the slow
+  suite now, marked allowed.
+- **A real call during Step 2:** the Step 1 v2 run test, once the provider
+  preflight existed, tried to reach ollama.com. It was blocked before any
+  connection. The preflight is now off in that test, and preflight has its
+  own fake-provider tests.
+
+**Byte-identity** (`50355c6`): before this, "v1 rows unchanged" was only
+checked by key order. Now a deterministic headless run is compared
+byte-for-byte with output from `git archive 1112ad7`, for v1 and legacy.
+
+**Step 2** (`da3b04b`):
+- **Preflights,** the **dry pass** and **cost accounting** (CLAUDE.md,
+  contract v2).
+- **Token basis, measured not assumed:** 4.215 input chars per token
+  including the system prompt, and output = 2.4504 × input. Both come from
+  the Brief 2c run's 52 calls, all of which reported usage.
+- **Deviation:** dry-pass pages are `mapped`, not a new status. The
+  frontier's `status` CHECK constraint lives in `CREATE TABLE`, so a new
+  status would change every new `frontier.db`, legacy included.
