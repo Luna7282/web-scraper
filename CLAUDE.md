@@ -630,6 +630,24 @@ stayed `running` the whole time, and unpausing resumed immediately.
   and the SIGKILL kill-mid-append loop, about 70s) are skipped by default.
   Run `RUN_SLOW_TESTS=1 uv run python -m unittest discover -s tests` before
   merging anything that touches headless, signals or the writer.
+- **Network guard (fast suite):** `tests/test_000_network_guard.py`, which
+  discovery imports first, installs `tests/netguard.py`.
+  - **What fails a test:** any non-localhost connection or DNS lookup, and
+    any Playwright/Chromium launch.
+  - **Where it applies:** in the test process, and in every child Python
+    (via `tests/netguard_site/sitecustomize.py` on `PYTHONPATH`).
+  - **Swallowed violations count:** the test fails even if the code caught
+    the exception.
+  - **Opting out:** mark a test `@allow_network`, which is only for the slow
+    tests: `RUN_SLOW_TESTS=1` real-signal tests and the two real-Chromium
+    `raw:` HTML fetch tests.
+  - **Single-module runs** (`-m unittest tests.x`) aren't guarded unless that
+    module imports the guard.
+- **v1 and legacy rows are byte-checked:** `tests/test_v1_golden.py` runs a
+  deterministic headless run and compares `canonical.jsonl` byte-for-byte
+  with `tests/golden/*_main_1112ad7.jsonl`, produced by
+  `tests/golden/make_rows.py` from a `git archive` of pre-3B `main`.
+  Never regenerate them from the branch under test.
 - **Tests that apply settings must restore `config`.**
   `tests/test_headless_contract.py`'s `ConfigGuard` fails a test that
   leaves it changed.
