@@ -503,6 +503,7 @@ async def extract_worker(
     llm_unavailable_max_releases: int = 0,
     record_builder: Callable[..., dict] | None = None,
     cost=None,
+    balancer=None,
 ) -> None:
     """unit_concurrency (config.EXTRACT_UNIT_CONCURRENCY, default 1): how
     many of one page's extraction units -- and, with a quality_backend, its
@@ -533,7 +534,13 @@ async def extract_worker(
     cost (headless contract v2 only, crawl.cost.CostLedger): every
     extraction and quality call attempt is recorded by outcome, with the
     token usage the response reported; 5xx page releases too. None: nothing
-    recorded, exactly as before."""
+    recorded, exactly as before.
+
+    balancer (headless contract v2 only, content.balance.Balancer): after
+    the relevance gate, a page detected as low-value with action "skip" is
+    marked skipped_extract with no extraction calls; after extraction, the
+    page's rows are capped (per page, per source, low-value cap) before they
+    go to the writer. None: no balancing, exactly as before."""
     if unit_concurrency < 1:
         raise ValueError(f"unit_concurrency must be >= 1, got {unit_concurrency}")
 
@@ -698,6 +705,13 @@ async def extract_worker(
             await frontier.content_done(content_queue)
             continue
 
+        low_value = balancer.classify(url, content, extract_page_title(content)) if balancer is not None else None
+        if low_value is not None and low_value.action == "skip":
+            _record_page(timing, url, "skipped_low_value", units=0, pairs=0, started=None)
+            await frontier.mark_extract_outcome(url, "skipped_extract")
+            await frontier.content_done(content_queue)
+            continue
+
         try:
             units = await extraction_units_fn(content) if extraction_units_fn else [content]
         except Exception as e:
@@ -783,6 +797,8 @@ async def extract_worker(
             continue
 
         _record_page(timing, url, "ok", units=len(units), pairs=len(qa_pairs), started=extraction_started)
+        if balancer is not None:
+            qa_pairs = balancer.apply(url, qa_pairs, low_value)
         chunks = chunk_fn(content) if chunk_fn is not None else None
         await frontier.put_results(results_queue, ExtractionResult(url=url, qa_pairs=qa_pairs, chunks=chunks))
         await frontier.content_done(content_queue)
@@ -801,6 +817,7 @@ async def estimate_worker(
     extraction_units_fn: Callable[[str], Awaitable[list[str]]] | None,
     pages: dict,
     poll_interval: float = POLL_INTERVAL,
+    balancer=None,
 ) -> None:
     """Dry pass (headless contract v2 `dry_run: true`): extract_worker's
     decisions without its LLM calls. Same score, same follow/promote, same
@@ -826,6 +843,12 @@ async def estimate_worker(
         await frontier.score_and_resolve_children(url, score, score >= follow_threshold)
         if score < extract_threshold:
             pages[url] = {"skipped": f"relevance {score:.3f} below extract_threshold {extract_threshold}"}
+            await frontier.mark_extract_outcome(url, "skipped_extract")
+            await frontier.content_done(content_queue)
+            continue
+        low_value = balancer.classify(url, content, extract_page_title(content)) if balancer is not None else None
+        if low_value is not None and low_value.action == "skip":
+            pages[url] = {"skipped": low_value.describe()}
             await frontier.mark_extract_outcome(url, "skipped_extract")
             await frontier.content_done(content_queue)
             continue

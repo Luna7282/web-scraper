@@ -52,7 +52,7 @@ V1_KEYS = ("contract_version", "run_id", "resume", "settings", "api_key_env")
 ALLOWED_KEYS = frozenset(RUN_KEYS + V1_KEYS)
 # Contract v2 (Brief 3B) = every v1 key plus these. A v1 config using one is
 # refused as an unknown key, exactly as before.
-V2_KEYS = ("model_pinned_version", "dry_run")
+V2_KEYS = ("model_pinned_version", "dry_run", "low_value_overrides")
 ALLOWED_KEYS_BY_VERSION = {1: ALLOWED_KEYS, 2: frozenset(ALLOWED_KEYS | set(V2_KEYS))}
 MODES = ("crawl", "map")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -94,6 +94,13 @@ SETTINGS: dict[str, Setting] = {
 SETTINGS_V2_ONLY: dict[str, Setting] = {
     "provider_preflight": Setting("PROVIDER_PREFLIGHT", "SCRAPER_PROVIDER_PREFLIGHT", bool, True),
     "embeddings_preflight": Setting("EMBEDDINGS_PREFLIGHT", "SCRAPER_EMBEDDINGS_PREFLIGHT", bool, True),
+    # Step 3 source balancing (content/balance.py). Defaults from the Step 3
+    # recompute on the Brief 1 / Brief 2c datasets (LESSONS_LEARNED #93).
+    "max_rows_per_page": Setting("MAX_ROWS_PER_PAGE", "SCRAPER_MAX_ROWS_PER_PAGE", int, 100, allow_none=True),
+    "max_rows_per_source": Setting("MAX_ROWS_PER_SOURCE", "SCRAPER_MAX_ROWS_PER_SOURCE", int, None,
+                                   allow_none=True),
+    "low_value_policy": Setting("LOW_VALUE_POLICY", "SCRAPER_LOW_VALUE_POLICY", str, "cap"),
+    "low_value_max_rows": Setting("LOW_VALUE_MAX_ROWS", "SCRAPER_LOW_VALUE_MAX_ROWS", int, 25, allow_none=True),
 }
 ALL_SETTINGS: dict[str, Setting] = {**SETTINGS, **SETTINGS_V2_ONLY}
 
@@ -103,7 +110,9 @@ def settings_for(version: int) -> dict[str, Setting]:
 
 
 _MINIMUMS = {"extract_unit_concurrency": 1, "llm_breaker_threshold": 0, "llm_sdk_max_retries": 0,
-             "stop_grace_seconds": 0, "llm_unavailable_max_releases": 0}
+             "stop_grace_seconds": 0, "llm_unavailable_max_releases": 0,
+             "max_rows_per_page": 1, "max_rows_per_source": 1, "low_value_max_rows": 1}
+_CHOICES = {"low_value_policy": ("skip", "cap", "keep")}
 
 
 @dataclass(frozen=True)
@@ -149,6 +158,8 @@ def validate(cfg: dict, environ: Mapping[str, str] | None = None) -> HeadlessRun
         raise HeadlessConfigError("model_pinned_version must be a non-empty string")
     if "dry_run" in cfg and not isinstance(cfg["dry_run"], bool):
         raise HeadlessConfigError("dry_run must be true or false")
+    if "low_value_overrides" in cfg:
+        _check_overrides(cfg["low_value_overrides"])
     if cfg.get("dry_run") and cfg.get("resume"):
         raise HeadlessConfigError("a dry pass needs its own run_dir: dry_run and resume can't be combined")
     api_key_env = cfg.get("api_key_env")
@@ -160,6 +171,16 @@ def validate(cfg: dict, environ: Mapping[str, str] | None = None) -> HeadlessRun
     return HeadlessRun(cfg=dict(cfg), contract_version=version,
                        effective=resolve_settings(cfg.get("settings", {}), environ, version),
                        api_key_env=api_key_env)
+
+
+def _check_overrides(value) -> None:
+    """{"keep": [prefix, ...], "skip": [prefix, ...]}; a prefix is a full URL
+    prefix or a path prefix starting with "/"."""
+    if not isinstance(value, dict) or set(value) - {"keep", "skip"}:
+        raise HeadlessConfigError('low_value_overrides must be an object with only "keep" and "skip" lists')
+    for kind, prefixes in value.items():
+        if not isinstance(prefixes, list) or not all(isinstance(p, str) and p.strip() for p in prefixes):
+            raise HeadlessConfigError(f"low_value_overrides.{kind} must be a list of non-empty URL or path prefixes")
 
 
 def _check_pairs(name: str, value) -> None:
@@ -198,12 +219,16 @@ def _check_value(name: str, spec: Setting, value):
         raise HeadlessConfigError(f"settings.{name} must be a string")
     if name in _MINIMUMS and value < _MINIMUMS[name]:
         raise HeadlessConfigError(f"settings.{name} must be >= {_MINIMUMS[name]}")
+    if name in _CHOICES and value not in _CHOICES[name]:
+        raise HeadlessConfigError(f"settings.{name} must be one of {list(_CHOICES[name])}")
     return value
 
 
 def _parse_env(name: str, spec: Setting, raw: str):
     """Same parsing config.py uses at import ("true" for bools, int() for ints)."""
     raw = raw.strip()
+    if spec.allow_none and spec.kind is int and raw.lower() in ("none", "null"):  # v2 caps: "off"
+        return None
     if spec.kind is bool:
         return raw.lower() == "true"
     if spec.kind is int:
@@ -213,7 +238,7 @@ def _parse_env(name: str, spec: Setting, raw: str):
             raise HeadlessConfigError(f"environment variable {spec.env_var}={raw!r} is not an integer "
                                       f"(for settings.{name})") from None
         return _check_value(name, spec, value)
-    return raw
+    return _check_value(name, spec, raw)
 
 
 @contextmanager
@@ -370,7 +395,7 @@ def build_result(*, outcome: str, exit_code: int, contract_version: int | None, 
     if run_result.get("stop") is not None:
         result["signal"] = run_result.get("stopped_by_signal")
         result["stop"] = run_result["stop"]
-    for key in ("sources", "preflight", "cost", "dry_run", "estimate"):   # contract v2 only
+    for key in ("sources", "preflight", "cost", "balance", "dry_run", "estimate"):   # contract v2 only
         if run_result.get(key) is not None:
             result[key] = run_result[key]
     if error is not None:

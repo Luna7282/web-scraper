@@ -140,6 +140,29 @@ ESTIMATE_BASIS = ("Brief 2c real run 2026-11-23: fastapi.tiangolo.com, 3 pages, 
                   "ollama_cloud deepseek-v4.1-flash:cloud, qa prompt; 4.215 input chars/token, "
                   "output = 2.4504 x input tokens. One run, one model, one prompt.")
 
+# Brief 3B Step 3: source balancing (contract v2 only, content/balance.py;
+# headless.SETTINGS_V2_ONLY overrides per run, and its defaults are what a v2
+# run gets -- these module values are read only by v2). Caps are per record
+# type. None = no cap. Keep rule: round-robin across a page's units.
+MAX_ROWS_PER_PAGE = None
+MAX_ROWS_PER_SOURCE = None
+LOW_VALUE_POLICY = "keep"         # "skip" | "cap" | "keep"
+LOW_VALUE_MAX_ROWS = None
+# Low-value page heuristic (content/balance.py::detect_low_value). Segments
+# match one whole URL path segment (extension dropped); titles are regexes
+# against the lowercased page title.
+LOW_VALUE_CHANGELOG_SEGMENTS = frozenset({
+    "changelog", "changelogs", "change-log", "changes", "release-notes", "releasenotes", "release_notes",
+    "releases", "release-history", "whatsnew", "whats-new", "what-s-new", "news", "history"})
+LOW_VALUE_INDEX_SEGMENTS = frozenset({
+    "genindex", "py-modindex", "modindex", "tags", "tag", "categories", "category", "archive", "archives",
+    "sitemap", "search", "authors"})
+LOW_VALUE_CHANGELOG_TITLES = (r"\brelease notes?\b", r"\bchange ?log\b", r"\bwhat'?s new\b", r"\brelease history\b")
+LOW_VALUE_INDEX_TITLES = (r"^index\b", r"\bmodule index\b", r"\bsite ?map\b", r"\barchives?\b", r"^tags?\b")
+LOW_VALUE_MIN_VERSION_HEADINGS = 3
+LOW_VALUE_MIN_LINK_LINES = 20
+LOW_VALUE_LINK_LINE_SHARE = 0.5
+
 # Brief 3B Step 1 (contract v2 source records, crawl/sources.py): AI crawlers
 # whose explicit robots.txt groups are reported as an AI-training signal.
 # Reported only -- the scraper's own requests don't use these names.

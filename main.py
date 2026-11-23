@@ -26,6 +26,7 @@ from crawl.frontier import ROBOTS_DISALLOWED_ERROR, Frontier
 from crawl.sources import SourceRecorder
 from crawl.cost import CostLedger
 from estimate import build_estimate
+from content.balance import Balancer, BalanceSettings
 from preflight import PreflightFailed, embeddings_preflight, needs_embeddings, provider_preflight
 from storage.canonical import build_canonical_record_v2
 from crawl.pipeline import crawl_worker, extract_worker, estimate_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError, ProviderUnavailableError, TRANSIENT_PROVIDER_STATUSES
@@ -372,6 +373,9 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
     robots_cache = RobotsCache(_recording_text_fetch(recorder, _http_fetch or _http_get_status_text)
                                if v2 else _http_get_text)
     record_builder = _make_v2_record_builder(context, provider_name, model_name, llm) if v2 else None
+    balancer = Balancer(BalanceSettings.from_config(cfg.get("low_value_overrides"))) if v2 else None
+    if balancer is not None and not dry and os.path.exists(canonical_path):  # resume: count rows already written
+        balancer.seed_written(await asyncio.to_thread(_read_jsonl_rows, canonical_path))
 
     quality_backend = (make_quality_backend(_make_decision_chat_fn(llm))
                        if cfg.get("enable_quality_scoring") and not dry else None)
@@ -444,7 +448,8 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
         if dry:
             tasks += [asyncio.create_task(
                 estimate_worker(frontier, content_queue, score_fn, cfg.get("extract_threshold", 0.0),
-                                cfg.get("follow_threshold", 0.0), extraction_units_fn, dry_pages))
+                                cfg.get("follow_threshold", 0.0), extraction_units_fn, dry_pages,
+                                balancer=balancer))
                 for _ in range(extract_workers_n)]
         else:
             tasks += [
@@ -458,7 +463,7 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
                                 timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY,
                                 breaker=breaker, scraper_version=context.scraper_version if context else None,
                                 llm_unavailable_max_releases=config.LLM_UNAVAILABLE_MAX_RELEASES,
-                                record_builder=record_builder, cost=cost)
+                                record_builder=record_builder, cost=cost, balancer=balancer)
             )
             for _ in range(extract_workers_n)
             ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
@@ -495,6 +500,8 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
         result["preflight"] = preflight_info
     if cost is not None:
         result["cost"] = cost.to_dict()
+    if balancer is not None:
+        result["balance"] = balancer.report()
     if dry:
         estimate = build_estimate(
             dry_pages, provider=provider_name, model=model_name,
@@ -954,6 +961,18 @@ def _recording_text_fetch(recorder: SourceRecorder, fetch_status_text):
 
 SOURCES_FILE = "sources.json"
 ESTIMATE_FILE = "estimate.json"
+
+
+def _read_jsonl_rows(path: str) -> list[dict]:
+    """Rows of a canonical.jsonl (a cut tail line is skipped: v1/v2 resume moves it aside first)."""
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    return rows
 
 
 def _write_json_atomic(path: str, data) -> None:

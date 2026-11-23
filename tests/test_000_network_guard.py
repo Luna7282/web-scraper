@@ -46,8 +46,10 @@ class TestNetworkGuard(unittest.TestCase):
         server = socket.socket()
         server.bind(("127.0.0.1", 0))
         server.listen(1)
-        threading.Thread(target=lambda: server.accept()[0].close(), daemon=True).start()
+        accepted = threading.Thread(target=lambda: server.accept()[0].close(), daemon=True)
+        accepted.start()
         client = socket.create_connection(server.getsockname(), timeout=5)
+        accepted.join(timeout=5)  # close the server only after accept() returned
         client.close()
         server.close()
         socket.getaddrinfo("localhost", 80)
