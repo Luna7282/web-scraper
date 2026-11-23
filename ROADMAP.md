@@ -1276,6 +1276,19 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     workaround and the extra context tokens can go, and `qa@1` stops spending
     calls on code-only fragments.
 
+66. **[Found 2026-11-23, Brief 3B Step 6] docs.manim.community now puts
+    automated browsers behind a Cloudflare JS challenge (served as HTTP 429).**
+    The first page request of a v2 dry pass got it, and `stop_on_site_429`
+    stopped the run. We must not try to get past bot protection. For the
+    scraper, this means:
+    - classify a challenge page as its own fetch outcome, `blocked_by_site`,
+      rather than a plain 429 retry;
+    - report it in the source record;
+    - never retry it.
+
+    Earlier manim numbers in this file came from before the challenge
+    existed.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

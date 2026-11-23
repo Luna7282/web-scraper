@@ -5831,3 +5831,29 @@ group: it's killed via `killpg` on the child's own PID, never by name.
   question asked on both `/tutorial/` and `/features/`.
 - **Caveat:** this is one small dataset. The 0.9 threshold isn't
   calibrated beyond it.
+
+### 96. Brief 3B Step 6: the fastapi dry pass matched the estimate exactly; docs.manim.community is behind a Cloudflare bot challenge, and the 429 stop rule caught it on the first request
+
+**Run safety settings** (`416a882`): `crawl_delay_seconds`, a floor under
+per-host spacing, and `stop_on_site_429`, covering pages and `robots.txt`.
+In v2, a page crawl4ai reports as a success with status ≥ 400 is an HTTP
+error, never content.
+
+**Dry pass 1: fastapi, 3 pages, `qa@1` + `code_example@1`, caps and
+verifiers on, delay 1s, stop on 429:**
+- **Calls:** 72 extraction calls (52 + 20) plus 1 preflight, the same as
+  the offline estimate from the saved units.
+- **Unchanged pages:** the page fingerprints equal the first dry pass's.
+  Licence is `none_found` now (ROADMAP #63).
+
+**Dry pass 2: docs.manim.community, 3 pages under `/en/stable/`:**
+- **Result:** `stopped_early`, exit 1, on the first page request. crawl4ai
+  logged "Blocked by anti-bot protection: Cloudflare JS challenge", status
+  429. It was not a rate limit: it was our first request.
+- **Load on the site:** `robots.txt` plus that one request. The other two
+  pages were waiting on the 1s spacing and were never requested.
+- **Decision:** a bot challenge is the site saying no to automated
+  crawling. We don't try to get past it (ROADMAP #66).
+
+**As instructed, Step 6 stopped at the first stop rule.** Neither real run
+happened, and no key was loaded.
