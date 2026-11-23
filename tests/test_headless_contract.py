@@ -152,14 +152,14 @@ class TestV1EntryExitCodes(ConfigGuard):
     def test_ok_stopped_early_interrupted(self):
         seen = {}
 
-        async def ok(cfg, api_key=None):
+        async def ok(cfg, api_key=None, context=None):
             seen["concurrency"] = config.EXTRACT_UNIT_CONCURRENCY  # the run sees the applied settings
             return {"mode": "crawl", "counts_by_status": {"done": 2}, "fatal_errors": []}
 
-        async def early(cfg, api_key=None):
+        async def early(cfg, api_key=None, context=None):
             return {"mode": "crawl", "counts_by_status": {}, "fatal_errors": ["[FATAL] breaker stop"]}
 
-        async def interrupted(cfg, api_key=None):
+        async def interrupted(cfg, api_key=None, context=None):
             raise KeyboardInterrupt
 
         code, out, _ = self.entry(v1(settings={"extract_unit_concurrency": 4}), ok)
@@ -169,7 +169,7 @@ class TestV1EntryExitCodes(ConfigGuard):
         self.assertEqual(self.entry(v1(), interrupted)[0], headless.EXIT_INTERRUPTED)
 
     def test_config_errors_exit_2_with_one_line_and_never_run(self):
-        async def must_not_run(cfg, api_key=None):
+        async def must_not_run(cfg, api_key=None, context=None):
             raise AssertionError("ran despite a config error")
 
         code, out, err = self.entry(v1(max_pagez=5), must_not_run)
@@ -183,7 +183,7 @@ class TestV1EntryExitCodes(ConfigGuard):
     def test_api_key_reaches_the_run_and_is_never_printed(self):
         seen = {}
 
-        async def run(cfg, api_key=None):
+        async def run(cfg, api_key=None, context=None):
             seen["api_key"] = api_key
             return {"mode": "crawl", "counts_by_status": {}, "fatal_errors": []}
 

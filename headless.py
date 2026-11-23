@@ -20,11 +20,17 @@ call time, and nothing imports these settings by name.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import secrets
+import subprocess
+import time
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 
 import config
 
@@ -194,3 +200,132 @@ def applied_settings(effective: dict):
 def settings_snapshot() -> dict:
     """The config attributes v1 settings touch (for guards and tests)."""
     return {spec.config_attr: getattr(config, spec.config_attr) for spec in SETTINGS.values()}
+
+
+# ---------------------------------------------------------------------------
+# Step 2: run identity, scraper version, run_dir state, result.json
+# ---------------------------------------------------------------------------
+REPO_DIR = Path(__file__).resolve().parent
+FALLBACK_VERSION = "0.1.0"   # pyproject.toml's static version, used when git can't answer
+# Files that mean "this run_dir already holds a scraper run". Anything else
+# (e.g. foundry's headless_config.json and run.log) doesn't count.
+STATE_FILES = ("frontier.db", "canonical.jsonl", "timings.jsonl", "result.json")
+RESULT_FILE = "result.json"
+ERROR_MESSAGE_MAX = 200
+_ABS_PATH = re.compile(r"(?:[A-Za-z]:\\|/)(?:[^\s'\"<>|]+)")
+
+
+@dataclass(frozen=True)
+class RunContext:
+    """What a v1 run knows about itself, passed to headless_run (legacy: None)."""
+    run_id: str
+    scraper_version: str
+
+
+def new_run_id(clock=time.time) -> str:
+    return f"{datetime.fromtimestamp(clock(), UTC):%Y%m%dT%H%M%SZ}-{secrets.token_hex(3)}"
+
+
+def scraper_version(run=subprocess.run, repo: Path = REPO_DIR) -> dict:
+    """git short commit + dirty flag of this checkout, else the static version.
+    `version` is the one string rows and results carry."""
+    def git(*args):
+        try:
+            done = run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    commit = git("rev-parse", "--short", "HEAD")
+    status = git("status", "--porcelain", "--untracked-files=no")
+    if not commit:
+        return {"commit": None, "dirty": None, "version": f"{FALLBACK_VERSION}+unknown"}
+    dirty = bool(status) if status is not None else None
+    return {"commit": commit, "dirty": dirty, "version": commit + ("+dirty" if dirty else "")}
+
+
+def state_files(run_dir: str | Path) -> list[str]:
+    run_dir = Path(run_dir)
+    return [name for name in STATE_FILES if (run_dir / name).exists()]
+
+
+def prepare_run_dir(cfg: dict, clock=time.time) -> str | None:
+    """Enforce the resume rule and archive a previous result. Returns the
+    previous run id on resume ("unknown" if it can't be read), None for a
+    fresh run. Raises HeadlessConfigError."""
+    run_dir = Path(cfg["run_dir"])
+    found = state_files(run_dir)
+    resume = cfg.get("resume", False)
+    if found and not resume:
+        raise HeadlessConfigError(f"run_dir already holds a scraper run ({', '.join(found)}); "
+                                  f'set "resume": true to continue it, or use an empty run_dir')
+    if resume and not found:
+        raise HeadlessConfigError('"resume": true but run_dir holds no scraper run to resume')
+    if not resume:
+        return None
+    previous = run_dir / RESULT_FILE
+    prev_id = "unknown"
+    if previous.exists():
+        try:
+            value = json.loads(previous.read_text(encoding="utf-8")).get("run_id")
+            if isinstance(value, str) and _RUN_ID.match(value):
+                prev_id = value
+        except (OSError, ValueError, AttributeError):
+            pass
+        archive = run_dir / f"result.{prev_id}.json"
+        if prev_id == "unknown" or archive.exists():
+            archive = run_dir / f"result.{prev_id}-{datetime.fromtimestamp(clock(), UTC):%Y%m%dT%H%M%SZ}.json"
+        previous.replace(archive)
+    return prev_id
+
+
+def describe_error(exc: BaseException) -> dict:
+    """Exception type and a short message with absolute paths and key-shaped
+    strings removed -- safe for result.json."""
+    from crawl.pipeline import _SECRET_SHAPED
+    message = " ".join(str(exc).split())
+    message = _SECRET_SHAPED.sub("[redacted]", _ABS_PATH.sub("<path>", message))
+    if len(message) > ERROR_MESSAGE_MAX:
+        message = message[: ERROR_MESSAGE_MAX - 1] + "…"
+    return {"type": type(exc).__name__, "message": message}
+
+
+def build_result(*, outcome: str, exit_code: int, contract_version: int | None, run_id: str | None,
+                 version: dict, effective: dict | None, mode: str | None, api_key_env: str | None,
+                 environ: Mapping[str, str], started_at: str, run_result: dict | None = None,
+                 error: dict | None = None, resumed_from_run_id: str | None = None) -> dict:
+    run_result = run_result or {}
+    result = {
+        "contract_version": contract_version, "run_id": run_id, "mode": mode,
+        "outcome": outcome, "exit_code": exit_code,
+        "scraper_version": version["version"], "scraper_commit": version["commit"],
+        "scraper_dirty": version["dirty"],
+        "settings": effective or {},
+        "counts_by_status": run_result.get("counts_by_status", {}),
+        "fatal_errors": run_result.get("fatal_errors", []),
+        "api_key_env": None if api_key_env is None else
+        {"name": api_key_env, "set": bool((environ.get(api_key_env) or "").strip())},
+        "started_at": started_at,
+        "finished_at": datetime.now(UTC).isoformat(timespec="seconds"),
+    }
+    if resumed_from_run_id is not None:
+        result["resumed_from_run_id"] = resumed_from_run_id
+    if error is not None:
+        result["error"] = error
+    return result
+
+
+def write_result(run_dir: str | Path, result: dict) -> bool:
+    """Atomic: temp file + rename. False (never raises) if it can't be written."""
+    run_dir = Path(run_dir)
+    tmp = run_dir / f".{RESULT_FILE}.tmp"
+    try:
+        tmp.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(run_dir / RESULT_FILE)
+        return True
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False

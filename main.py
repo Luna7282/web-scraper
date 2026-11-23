@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+from datetime import UTC, datetime
 import json
 import os
 import sys
@@ -264,7 +265,7 @@ async def headless_map(cfg: dict) -> dict:
     return {"mode": "map", "counts_by_status": counts, "fatal_errors": fatal_errors}
 
 
-async def headless_crawl(cfg: dict, api_key: str | None = None) -> dict:
+async def headless_crawl(cfg: dict, api_key: str | None = None, context: "headless.RunContext | None" = None) -> dict:
     """Non-interactive equivalent of main() -- same worker wiring, same
     RAG/threshold/provider logic, just no Prompt.ask calls. See
     headless_map's docstring for the seeds/host_prefix_pairs contract and
@@ -342,6 +343,7 @@ async def headless_crawl(cfg: dict, api_key: str | None = None) -> dict:
         timing = _start_timing_log(
             run_dir, provider_name, model_name, crawl_workers_n, extract_workers_n,
             cfg.get("max_pages"), quality_backend is not None,
+            run_id=context.run_id if context else None,
         )
         breaker = _make_llm_breaker(frontier, fatal_errors, timing)
         tasks = [
@@ -359,7 +361,7 @@ async def headless_crawl(cfg: dict, api_key: str | None = None) -> dict:
                                 section_depth=config.SECTION_DEPTH, seed_prefixes=host_prefix_pairs,
                                 quality_backend=quality_backend, quality_threshold=quality_threshold,
                                 timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY,
-                                breaker=breaker)
+                                breaker=breaker, scraper_version=context.scraper_version if context else None)
             )
             for _ in range(extract_workers_n)
         ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
@@ -375,41 +377,81 @@ async def headless_crawl(cfg: dict, api_key: str | None = None) -> dict:
     return {"mode": "crawl", "counts_by_status": counts, "fatal_errors": fatal_errors}
 
 
-async def headless_run(cfg: dict, api_key: str | None = None) -> dict:
+async def headless_run(cfg: dict, api_key: str | None = None, context: "headless.RunContext | None" = None) -> dict:
     if cfg["mode"] == "map":
         return await headless_map(cfg)
     if cfg["mode"] == "crawl":
-        return await headless_crawl(cfg, api_key=api_key)
+        return await headless_crawl(cfg, api_key=api_key, context=context)
     raise ValueError(f"unknown headless mode: {cfg['mode']!r}")
 
 
-def headless_v1_entry(cfg: dict, run=None, out=None, err=None, environ=None) -> int:
-    """Headless contract v1 (headless.py): validate, apply the effective
-    settings for this run only, run, map the outcome to an exit code. A bad
-    config is one line on stderr and exit 2 -- no traceback. `run`, `out`,
-    `err` and `environ` are injectable for tests."""
+def headless_v1_entry(cfg: dict, run=None, out=None, err=None, environ=None, version=None) -> int:
+    """Headless contract v1 (headless.py): validate, check the run_dir, apply
+    the effective settings for this run only, run, write result.json, map the
+    outcome to an exit code. result.json is written for every outcome --
+    ok, stopped early, interrupted, crashed, and a config error when the
+    run_dir exists but holds no earlier run (never overwriting one). If it
+    can't be written, the exit code is still right and the result line still
+    goes to stdout. A bad config is one line on stderr, no traceback.
+    `run`, `out`, `err`, `environ`, `version` are injectable for tests."""
     out = sys.stdout if out is None else out
     err = sys.stderr if err is None else err
     environ = os.environ if environ is None else environ
+    version = headless.scraper_version() if version is None else version
+    started_at = datetime.now(UTC).isoformat(timespec="seconds")
+    run_dir = cfg.get("run_dir") if isinstance(cfg, dict) and isinstance(cfg.get("run_dir"), str) else None
+
+    def finish(outcome, code, *, hr=None, run_id=None, run_result=None, error=None, resumed_from=None,
+               print_line=True):
+        result = headless.build_result(
+            outcome=outcome, exit_code=code, contract_version=hr.contract_version if hr else cfg.get("contract_version"),
+            run_id=run_id, version=version, effective=hr.effective if hr else None,
+            mode=cfg.get("mode") if isinstance(cfg, dict) else None,
+            api_key_env=hr.api_key_env if hr else None, environ=environ, started_at=started_at,
+            run_result=run_result, error=error, resumed_from_run_id=resumed_from)
+        writable_target = run_dir and os.path.isdir(run_dir) and not (
+            outcome == "config_error" and headless.state_files(run_dir))  # never clobber an earlier run's result
+        if writable_target and not headless.write_result(run_dir, result):
+            print(f"warning: could not write {headless.RESULT_FILE} in the run_dir", file=err)
+        if print_line:
+            print(json.dumps(result), file=out)
+        return code
+
     try:
         hr = headless.validate(cfg, environ)
     except headless.HeadlessConfigError as e:
         print(f"config error: {e}", file=err)
-        return headless.EXIT_CONFIG_ERROR
+        return finish("config_error", headless.EXIT_CONFIG_ERROR, error={"type": "HeadlessConfigError",
+                      "message": str(e)}, print_line=False)
+    run_id = hr.cfg.get("run_id") or headless.new_run_id()
+    try:
+        resumed_from = headless.prepare_run_dir(hr.cfg)
+    except headless.HeadlessConfigError as e:
+        print(f"config error: {e}", file=err)
+        return finish("config_error", headless.EXIT_CONFIG_ERROR, hr=hr, run_id=run_id,
+                      error={"type": "HeadlessConfigError", "message": str(e)}, print_line=False)
     api_key = environ[hr.api_key_env].strip() if hr.api_key_env else None
+    context = headless.RunContext(run_id=run_id, scraper_version=version["version"])
     run = headless_run if run is None else run
+    common = {"hr": hr, "run_id": run_id, "resumed_from": resumed_from}
     try:
         with headless.applied_settings(hr.effective):
             config.validate_system_one_config()
-            result = asyncio.run(run(hr.cfg, api_key=api_key))
+            result = asyncio.run(run(hr.cfg, api_key=api_key, context=context))
     except config.SystemOneConfigError as e:
         print(f"config error: {e}", file=err)
-        return headless.EXIT_CONFIG_ERROR
+        return finish("config_error", headless.EXIT_CONFIG_ERROR, error=headless.describe_error(e),
+                      print_line=False, **common)
     except KeyboardInterrupt:
         print("Interrupted.", file=err)
-        return headless.EXIT_INTERRUPTED
-    print(json.dumps(result), file=out)
-    return headless.EXIT_STOPPED_EARLY if result.get("fatal_errors") else headless.EXIT_OK
+        return finish("interrupted", headless.EXIT_INTERRUPTED, **common)
+    except Exception as e:  # noqa: BLE001 -- any crash still gets a result.json and a clean exit code
+        described = headless.describe_error(e)
+        print(f"crashed: {described['type']}: {described['message']}", file=err)
+        return finish("crashed", headless.EXIT_STOPPED_EARLY, error=described, **common)
+    if result.get("fatal_errors"):
+        return finish("stopped_early", headless.EXIT_STOPPED_EARLY, run_result=result, **common)
+    return finish("ok", headless.EXIT_OK, run_result=result, **common)
 
 
 async def map_main(root_url: str):
@@ -745,13 +787,14 @@ async def _http_get_text(url: str) -> str | None:
 
 def _start_timing_log(
     run_dir: str, provider_name: str, model_name: str, crawl_workers_n: int,
-    extract_workers_n: int, max_pages: int | None, quality_scoring: bool,
+    extract_workers_n: int, max_pages: int | None, quality_scoring: bool, run_id: str | None = None,
 ) -> TimingLog | None:
     """None unless config.EXTRACT_TIMING_LOG -- see crawl/timing.py."""
     if not config.EXTRACT_TIMING_LOG:
         return None
     timing = TimingLog(
         os.path.join(run_dir, config.EXTRACT_TIMING_LOG_FILENAME), provider=provider_name, model=model_name,
+        run_id=run_id,
     )
     timing.start()
     timing.record(
