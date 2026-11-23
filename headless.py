@@ -34,6 +34,7 @@ from pathlib import Path
 
 import config
 import generators
+import verifiers
 
 SUPPORTED_CONTRACT_VERSIONS = (1, 2)
 
@@ -53,7 +54,7 @@ V1_KEYS = ("contract_version", "run_id", "resume", "settings", "api_key_env")
 ALLOWED_KEYS = frozenset(RUN_KEYS + V1_KEYS)
 # Contract v2 (Brief 3B) = every v1 key plus these. A v1 config using one is
 # refused as an unknown key, exactly as before.
-V2_KEYS = ("model_pinned_version", "dry_run", "low_value_overrides", "generators")
+V2_KEYS = ("model_pinned_version", "dry_run", "low_value_overrides", "generators", "verifiers")
 ALLOWED_KEYS_BY_VERSION = {1: ALLOWED_KEYS, 2: frozenset(ALLOWED_KEYS | set(V2_KEYS))}
 MODES = ("crawl", "map")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -102,6 +103,9 @@ SETTINGS_V2_ONLY: dict[str, Setting] = {
                                    allow_none=True),
     "low_value_policy": Setting("LOW_VALUE_POLICY", "SCRAPER_LOW_VALUE_POLICY", str, "cap"),
     "low_value_max_rows": Setting("LOW_VALUE_MAX_ROWS", "SCRAPER_LOW_VALUE_MAX_ROWS", int, 25, allow_none=True),
+    # Step 5: at most this many external@1 verifier processes at once.
+    "external_verifier_concurrency": Setting("EXTERNAL_VERIFIER_CONCURRENCY",
+                                             "SCRAPER_EXTERNAL_VERIFIER_CONCURRENCY", int, 2),
 }
 ALL_SETTINGS: dict[str, Setting] = {**SETTINGS, **SETTINGS_V2_ONLY}
 
@@ -112,7 +116,8 @@ def settings_for(version: int) -> dict[str, Setting]:
 
 _MINIMUMS = {"extract_unit_concurrency": 1, "llm_breaker_threshold": 0, "llm_sdk_max_retries": 0,
              "stop_grace_seconds": 0, "llm_unavailable_max_releases": 0,
-             "max_rows_per_page": 1, "max_rows_per_source": 1, "low_value_max_rows": 1}
+             "max_rows_per_page": 1, "max_rows_per_source": 1, "low_value_max_rows": 1,
+             "external_verifier_concurrency": 1}
 _CHOICES = {"low_value_policy": ("skip", "cap", "keep")}
 
 
@@ -161,11 +166,12 @@ def validate(cfg: dict, environ: Mapping[str, str] | None = None) -> HeadlessRun
         raise HeadlessConfigError("dry_run must be true or false")
     if "low_value_overrides" in cfg:
         _check_overrides(cfg["low_value_overrides"])
-    if "generators" in cfg:
-        try:
-            generators.validate_specs(cfg["generators"])
-        except ValueError as e:
-            raise HeadlessConfigError(str(e)) from None
+    for key, module in (("generators", generators), ("verifiers", verifiers)):
+        if key in cfg:
+            try:
+                module.validate_specs(cfg[key])
+            except ValueError as e:
+                raise HeadlessConfigError(str(e)) from None
     if cfg.get("dry_run") and cfg.get("resume"):
         raise HeadlessConfigError("a dry pass needs its own run_dir: dry_run and resume can't be combined")
     api_key_env = cfg.get("api_key_env")
@@ -401,7 +407,7 @@ def build_result(*, outcome: str, exit_code: int, contract_version: int | None, 
     if run_result.get("stop") is not None:
         result["signal"] = run_result.get("stopped_by_signal")
         result["stop"] = run_result["stop"]
-    for key in ("sources", "preflight", "cost", "balance", "dry_run", "estimate"):   # contract v2 only
+    for key in ("sources", "preflight", "cost", "balance", "verification", "dry_run", "estimate"):  # v2 only
         if run_result.get(key) is not None:
             result[key] = run_result[key]
     if error is not None:

@@ -28,6 +28,8 @@ from estimate import build_estimate
 from content.balance import Balancer, BalanceSettings
 from generators import USER_PREFIX as GENERATOR_USER_PREFIX
 from generators import build as build_generators
+from verifiers import VerifierRunner
+from verifiers import build as build_verifiers
 from preflight import PreflightFailed, embeddings_preflight, needs_embeddings, provider_preflight
 from storage.canonical import build_canonical_record_v2
 from crawl.pipeline import crawl_worker, extract_worker, estimate_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError, ProviderUnavailableError, TRANSIENT_PROVIDER_STATUSES
@@ -384,8 +386,12 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
                                if v2 else _http_get_text)
     record_builder = _make_v2_record_builder(context, provider_name, model_name, llm) if v2 else None
     balancer = Balancer(BalanceSettings.from_config(cfg.get("low_value_overrides"))) if v2 else None
-    if balancer is not None and not dry and os.path.exists(canonical_path):  # resume: count rows already written
-        balancer.seed_written(await asyncio.to_thread(_read_jsonl_rows, canonical_path))
+    verifier_runner = (VerifierRunner(build_verifiers(cfg.get("verifiers")), config.EXTERNAL_VERIFIER_CONCURRENCY)
+                       if v2 and not dry else None)
+    if balancer is not None and not dry and os.path.exists(canonical_path):  # resume: rows already written
+        written = await asyncio.to_thread(_read_jsonl_rows, canonical_path)
+        balancer.seed_written(written)
+        verifier_runner.seed_written(written)
 
     quality_backend = (make_quality_backend(_make_decision_chat_fn(llm))
                        if cfg.get("enable_quality_scoring") and not dry else None)
@@ -474,7 +480,7 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
                                 breaker=breaker, scraper_version=context.scraper_version if context else None,
                                 llm_unavailable_max_releases=config.LLM_UNAVAILABLE_MAX_RELEASES,
                                 record_builder=record_builder, cost=cost, balancer=balancer,
-                                generators=gens if v2 else None, llm_call=llm_call)
+                                generators=gens if v2 else None, llm_call=llm_call, verifiers=verifier_runner)
             )
             for _ in range(extract_workers_n)
             ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
@@ -513,6 +519,8 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
         result["cost"] = cost.to_dict()
     if balancer is not None:
         result["balance"] = balancer.report()
+    if verifier_runner is not None:
+        result["verification"] = verifier_runner.report()
     if dry:
         estimate = build_estimate(
             dry_pages, provider=provider_name, model=model_name, generators=gens,

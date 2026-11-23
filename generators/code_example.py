@@ -8,9 +8,12 @@ instruction / code pairs. Generic across any site with code in it.
     in a unit and its explanation in the previous one (measured on
     fastapi: 20 of 52 units have fenced code, many of them 27-char units
     holding only the block).
-  - Rows: instruction, code (copied verbatim from the unit), language,
-    explanation. Whether `code` really is verbatim is checked by the
-    schema verifier (Step 5), not trusted here.
+  - Rows: instruction, code (copied verbatim from what was sent), language,
+    explanation, and `context` -- the exact preceding-unit text sent with
+    the unit ("" if none). With the row's source_chunk, page_title and
+    source_url, sent_text(row) rebuilds the exact request text (capped as
+    the worker caps it), so schema@1's "code appears in what was sent"
+    check is repeatable from the row alone.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from __future__ import annotations
 import re
 
 import config
-from generators import Generator, PageContext, parse_json_array
+from generators import USER_PREFIX, Generator, PageContext, parse_json_array
 
 _FENCED = re.compile(r"^\s*```", re.MULTILINE)
 
@@ -39,22 +42,37 @@ class CodeExampleV1(Generator):
     name, version, record_type = "code_example", 1, "code_example"
     system_prompt = SYSTEM_PROMPT
     schema = {  # noqa: RUF012
-        "type": "object", "required": ["instruction", "code", "language", "explanation"],
+        "type": "object", "required": ["instruction", "code", "language", "explanation", "context"],
         "properties": {"instruction": {"type": "string", "minLength": 1}, "code": {"type": "string", "minLength": 1},
-                       "language": {"type": "string"}, "explanation": {"type": "string"}},
+                       "language": {"type": "string"}, "explanation": {"type": "string"},
+                       "context": {"type": "string"}},
     }
 
     def wants(self, unit: str, page: PageContext, index: int) -> bool:
         return bool(_FENCED.search(unit))
 
-    def request(self, unit: str, page: PageContext, index: int) -> tuple[str, str]:
+    @staticmethod
+    def context_for(page: PageContext, index: int) -> str:
         previous = page.units[index - 1] if 0 < index <= len(page.units) else ""
-        context = previous[-config.CODE_EXAMPLE_CONTEXT_CHARS:] if previous else ""
-        text = (f"CONTEXT (earlier in the page {page.title or page.url}):\n{context}\n\nTEXT:\n{unit}"
-                if context else f"TEXT:\n{unit}")
-        return self.system_prompt, text
+        return previous[-config.CODE_EXAMPLE_CONTEXT_CHARS:] if previous else ""
+
+    @staticmethod
+    def compose(context: str, unit: str, page_label: str) -> str:
+        return f"CONTEXT (earlier in the page {page_label}):\n{context}\n\nTEXT:\n{unit}" if context else f"TEXT:\n{unit}"
+
+    @classmethod
+    def sent_text(cls, row: dict) -> str:
+        """The exact text the provider received for this row's call (after the
+        system prompt): USER_PREFIX + the request text capped at MAX_EXTRACT_CHARS."""
+        text = cls.compose(row.get("context") or "", row.get("source_chunk") or "",
+                           row.get("page_title") or row.get("source_url") or "")
+        return USER_PREFIX + text[:config.MAX_EXTRACT_CHARS]
+
+    def request(self, unit: str, page: PageContext, index: int) -> tuple[str, str]:
+        return self.system_prompt, self.compose(self.context_for(page, index), unit, page.title or page.url)
 
     def parse(self, raw: str, unit: str, page: PageContext, index: int) -> list[dict]:
+        context = self.context_for(page, index)
         out = []
         for item in parse_json_array(raw):
             if not isinstance(item, dict):
@@ -66,5 +84,5 @@ class CodeExampleV1(Generator):
             explanation = item.get("explanation")
             out.append({"instruction": instruction, "code": code,
                         "language": language if isinstance(language, str) and language.strip() else "unknown",
-                        "explanation": explanation if isinstance(explanation, str) else ""})
+                        "explanation": explanation if isinstance(explanation, str) else "", "context": context})
         return out

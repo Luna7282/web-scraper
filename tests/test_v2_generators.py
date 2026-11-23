@@ -139,6 +139,7 @@ class TestQaV1IsTodaysExtraction(unittest.TestCase):
             cfg = {"contract_version": 2, "mode": "crawl", "run_dir": tmp, "seeds": [[f"http://{HOST}/p0", None]],
                    "host_prefix_pairs": [[HOST, "/"]], "provider": "ollama_cloud", "model": "golden-model",
                    "max_pages": 3, "crawl_workers": 1, "extract_workers": 1, "intent": "", "run_id": "golden-run",
+                   "verifiers": [],  # generator output only; verification is Step 5's tests
                    "settings": {"llm_breaker_threshold": 0, "provider_preflight": False}}
 
             async def runner(c, api_key=None, context=None):
@@ -191,8 +192,11 @@ class TestCodeExampleV1(unittest.TestCase):
             {"instruction": "No code"}, {"code": "x"}, "junk",
             {"instruction": "Print", "code": "print(1)"}])
         self.assertEqual(CodeExampleV1().parse("Here you go:\n" + raw, "", page(), 0), [
-            {"instruction": "Start the server", "code": "uv run app", "language": "bash", "explanation": "Runs it."},
-            {"instruction": "Print", "code": "print(1)", "language": "unknown", "explanation": ""}])
+            {"instruction": "Start the server", "code": "uv run app", "language": "bash", "explanation": "Runs it.",
+             "context": ""},
+            {"instruction": "Print", "code": "print(1)", "language": "unknown", "explanation": "", "context": ""}])
+        rows = CodeExampleV1().parse(raw, "```\nuv run app\n```", page(("Run it with uv:", "```\nuv run app\n```")), 1)
+        self.assertEqual(rows[0]["context"], "Run it with uv:")  # the exact preceding text that was sent
         self.assertEqual(CodeExampleV1().parse("[]", "", page(), 0), [])
         with self.assertRaises(MalformedExtractionError):
             CodeExampleV1().parse("no json here", "", page(), 0)

@@ -1265,6 +1265,17 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     selection after the run (Step 0 decision 2, option (b)), not a cap before
     the writer.
 
+65. **[Found 2026-11-23, Brief 3B Step 4] The chunker splits code from its
+    explanation; link this to unit packing (`scraper_changes_needed.md` item
+    15, Brief 3C).** On fastapi, 20 of 52 units hold fenced code, and several
+    are 27-character units holding only a code block, with the prose that
+    explains it in the unit before. `code_example@1` works around it by sending
+    up to 1,500 characters of the preceding unit as context (stored on the row
+    as `context`, so schema@1's grounding check stays exact). Unit packing
+    should keep a code block together with its lead-in text. Then the
+    workaround and the extra context tokens can go, and `qa@1` stops spending
+    calls on code-only fragments.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

@@ -168,6 +168,14 @@ LOW_VALUE_LINK_LINE_SHARE = 0.5
 # puts a code block alone in a unit and its explanation in the one before.
 CODE_EXAMPLE_CONTEXT_CHARS = 1500
 
+# Brief 3B Step 5: verifiers (contract v2, verifiers/).
+VERIFY_MIN_ANSWER_LENGTH = 20            # schema@1 on qa rows: export_formats' default minimum
+NEAR_DUPLICATE_THRESHOLD = 0.9           # near_duplicate@1: token-set (Jaccard) similarity
+EXTERNAL_VERIFIER_CONCURRENCY = 2        # headless setting external_verifier_concurrency overrides per run
+EXTERNAL_VERIFIER_DEFAULT_TIMEOUT = 30
+EXTERNAL_VERIFIER_MAX_TIMEOUT = 600
+EXTERNAL_VERIFIER_MAX_STDOUT_BYTES = 65_536
+
 # Brief 3B Step 1 (contract v2 source records, crawl/sources.py): AI crawlers
 # whose explicit robots.txt groups are reported as an AI-training signal.
 # Reported only -- the scraper's own requests don't use these names.

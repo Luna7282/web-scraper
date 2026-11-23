@@ -507,6 +507,7 @@ async def extract_worker(
     balancer=None,
     generators: list | None = None,
     llm_call: Callable[[str, str], Awaitable[str]] | None = None,
+    verifiers=None,
 ) -> None:
     """unit_concurrency (config.EXTRACT_UNIT_CONCURRENCY, default 1): how
     many of one page's extraction units -- and, with a quality_backend, its
@@ -551,7 +552,13 @@ async def extract_worker(
     semaphore, cost and timing path (timing events and cost rows carry the
     generator id), and record_builder is called with generator=. A unit
     fails as malformed only if every attempted generator's answer was
-    unreadable. None: extract_fn, exactly as before."""
+    unreadable. None: extract_fn, exactly as before.
+
+    verifiers (headless contract v2 only, verifiers.VerifierRunner): a
+    page's rows are verified after generation and before balancing; rows
+    failing an on_fail=drop verifier are removed, the rest carry their
+    verdicts. Rows finally sent to the writer are committed (near_duplicate's
+    "seen"). None: no verification, exactly as before."""
     if generators is not None and (llm_call is None or record_builder is None):
         raise ValueError("generators need llm_call and record_builder")
     if unit_concurrency < 1:
@@ -875,8 +882,12 @@ async def extract_worker(
             continue
 
         _record_page(timing, url, "ok", units=len(units), pairs=len(qa_pairs), started=extraction_started)
+        if verifiers is not None:
+            qa_pairs = await verifiers.run(url, qa_pairs)
         if balancer is not None:
             qa_pairs = balancer.apply(url, qa_pairs, low_value)
+        if verifiers is not None:
+            verifiers.commit(qa_pairs)
         chunks = chunk_fn(content) if chunk_fn is not None else None
         await frontier.put_results(results_queue, ExtractionResult(url=url, qa_pairs=qa_pairs, chunks=chunks))
         await frontier.content_done(content_queue)
