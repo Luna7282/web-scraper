@@ -560,6 +560,9 @@ stayed `running` the whole time, and unpausing resumed immediately.
   - **The breaker only sees 429s.** A 5xx neither trips it nor resets its
     count. With the breaker on, the SDK no longer retries 5xx either, so the
     release path is what absorbs a provider's 503 spike.
+- **`SCRAPER_LOAD_DOTENV=0`** (`config.py`): skip `web-scraper/.env`
+  entirely. foundry sets it and passes settings in the config and the key
+  via `api_key_env`. Unset or any other value: `.env` loads as before.
 - **v1 exit codes** (`headless.EXIT_*`): 0 ok, 1 stopped early
   (`fatal_errors`), 2 config error (one line on stderr, no traceback),
   130 SIGINT, 143 SIGTERM. Legacy keeps 0 / 1, and Ctrl-C there still

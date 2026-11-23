@@ -4,7 +4,13 @@ from enum import Enum
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-load_dotenv()
+# SCRAPER_LOAD_DOTENV=0 (Brief 3A, approved in Step 0): don't read
+# web-scraper/.env at all -- a launcher (foundry) passes everything the run
+# needs itself, settings in the v1 config and the key via api_key_env. Any
+# other value, or unset: load .env as always (it never overrides a variable
+# that is already set).
+if os.getenv("SCRAPER_LOAD_DOTENV", "").strip() != "0":
+    load_dotenv()
 
 # Frontier / crawl-pipeline knobs (frontier.py).
 MAX_RETRIES = 3
