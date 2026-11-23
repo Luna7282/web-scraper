@@ -523,6 +523,117 @@ live run, then confirmed against one anyway (#61): pausing mid-crawl froze
 `counts_by_status` completely across three `--live-status` polls, job
 stayed `running` the whole time, and unpausing resumed immediately.
 
+## Headless contract v1 (`headless.py`, Brief 3A)
+
+`--headless-config` has two contracts, chosen by one key.
+- **No `contract_version`: legacy headless, exactly as before.** This is
+  what the control server sends (with an extra `root_url` key, ignored).
+  Never make legacy stricter: that breaks the server.
+- **`"contract_version": 1`: strict v1.**
+  - Unknown keys are refused, all listed by name.
+  - Behaviour settings (`extract_unit_concurrency`,
+    `max_pages_counts_failed`, `llm_breaker_threshold`,
+    `llm_sdk_max_retries`, `use_system_one`, `system_one_provider`,
+    `extract_timing_log`) go in a `"settings"` object, resolved **config
+    value > environment variable > default**, with each value's source
+    recorded.
+  - `headless.applied_settings()` writes them onto the `config` module for
+    the run and restores them after. That's safe because every reader uses
+    `config.X` at call time: keep it that way, and don't import these
+    settings by name.
+  - `"api_key_env"` names the environment variable holding this run's key.
+    The value goes only into `get_llm(..., api_key=)`, never into the
+    config dict, `result.json`, errors or logs.
+  - Any other version is a config error.
+- **v1 safe defaults (Step 4, item 18)**, v1 only. `config.py` and legacy
+  keep today's values; a config value or env variable can still turn each
+  one off.
+  - `max_pages_counts_failed`: on.
+  - `llm_breaker_threshold`: 5. This also forces SDK retries to 0.
+  - `site_retry_backoff`: on. A site's 429/503 re-queues the page after the
+    site's `Retry-After`, else 5s doubling per retry, capped at 300s. It
+    still counts as a retry.
+  - `llm_unavailable_max_releases`: 5. An LLM 500/502/503/504 releases the
+    page with the provider's hint or 5s doubling, **without** using a
+    retry, at most 5 times per page per run (counted in memory). The next
+    one fails the page: "gave up after 5 releases".
+  - **The breaker only sees 429s.** A 5xx neither trips it nor resets its
+    count. With the breaker on, the SDK no longer retries 5xx either, so the
+    release path is what absorbs a provider's 503 spike.
+- **`SCRAPER_LOAD_DOTENV=0`** (`config.py`): skip `web-scraper/.env`
+  entirely. foundry sets it and passes settings in the config and the key
+  via `api_key_env`. Unset or any other value: `.env` loads as before.
+- **v1 exit codes** (`headless.EXIT_*`): 0 ok, 1 stopped early
+  (`fatal_errors`), 2 config error (one line on stderr, no traceback),
+  130 SIGINT, 143 SIGTERM. Legacy keeps 0 / 1, and Ctrl-C there still
+  exits 0.
+- **v1 run identity and outputs (Step 2):**
+  - **`run_id`:** from the config, else generated.
+  - **`result.json`:** written atomically for every outcome: `ok`,
+    `stopped_early`, `interrupted`, `crashed`, and `config_error` when the
+    run_dir exists and holds no earlier run (**never clobber an earlier
+    result**, and never create a missing run_dir). It holds the contract
+    version, run id, scraper version (git commit + dirty flag, else
+    `0.1.0+unknown`), outcome and exit code, effective settings with
+    sources, counts, fatal errors, the key variable's name and set/not-set,
+    and for a crash the error type plus a message with paths and keys
+    removed. The same result is the stdout line, even if the file can't be
+    written.
+  - **Resume:** a run_dir holding scraper state (`frontier.db`,
+    `canonical.jsonl`, `timings.jsonl`, `result.json`; other files don't
+    count) is refused unless `"resume": true`, and `resume` with nothing to
+    resume is refused. On resume the old result is kept as
+    `result.<previous run id>.json` and the new one records
+    `resumed_from_run_id`.
+  - **Stamps:** timing events carry `run_id`, and canonical rows carry
+    `scraper_version`, in v1 only. Legacy output is byte-identical, so pass
+    `None` for both outside v1.
+- **Graceful stop, v1 crawl runs (Step 3, `crawl/graceful.py`):** handlers are
+  installed only when a v1 `RunContext` is present. Legacy and map runs keep
+  the default signal behaviour.
+  - **First SIGTERM/SIGINT:** the frontier stops handing out rows
+    (`begin_drain`, in memory only). Claimed pages get
+    `settings.stop_grace_seconds` (default 30) to finish and be written.
+    Then the workers are cancelled, rows still claimed go back to `queued`
+    without a retry (`release_in_progress`), and leaving the
+    `AsyncWebCrawler` context closes Chromium. Exit 143 / 130.
+  - **Second signal:** a minimal `result.json` (`stopped_immediately`),
+    then `os._exit`, with no cleanup.
+- **Canonical rows are appended one page per `O_APPEND` write plus fsync**
+  (`storage/writer.py::append_page_atomically`), in every mode. The old
+  text-mode `writelines` left a partial page in 39 of 80 measured SIGKILLs,
+  and `Writer` then treats that URL as written on resume, so the missing
+  rows are lost for good. On a v1 resume, a cut tail (still possible in
+  principle) is moved to `canonical.tail.<run_id>.bin`, never deleted.
+- **Leftover browser processes and recovery** (measured on macOS with real
+  Chromium, `LESSONS_LEARNED.md` #89):
+  - **Graceful stop:** nothing is left behind.
+  - **After a second signal:** Playwright's Node driver closes the browser
+    itself within about 0.25s once it sees its parent gone.
+  - **Real leftovers only happen if the driver is killed hard** (SIGKILL to
+    the group). Chromium runs in its **own process group**, so a group
+    signal never reaches it, and it can outlive the scraper.
+  - **Recovery:** the launcher must record the scraper's descendants (PID +
+    creation time) *before* signalling, then kill survivors by those
+    recorded PIDs, matching the creation time. foundry's `procs.stop` does
+    exactly this. **Never kill by name or command line**: `pkill chrome`
+    would also kill the user's own browser. Without a recorded tree, inspect
+    (`ps -o pid,ppid,pgid,lstart,command`) and kill one confirmed PID at a
+    time.
+  - **Signal the scraper's PID first, not its group.** A group SIGTERM
+    reaches the driver at the same moment, Chromium closes under in-flight
+    fetches, and each of those pages uses up a retry (measured: 2 rows at
+    `retry_count` 1). Launchers should send SIGTERM to the PID, wait for the
+    grace period, and only then signal or kill the group.
+- **Slow tests: `RUN_SLOW_TESTS=1`.** The real-signal tests in
+  `tests/test_graceful_stop.py` (subprocess runs with real SIGTERM/SIGINT,
+  and the SIGKILL kill-mid-append loop, about 70s) are skipped by default.
+  Run `RUN_SLOW_TESTS=1 uv run python -m unittest discover -s tests` before
+  merging anything that touches headless, signals or the writer.
+- **Tests that apply settings must restore `config`.**
+  `tests/test_headless_contract.py`'s `ConfigGuard` fails a test that
+  leaves it changed.
+
 ## Control server (`server/`)
 
 Local HTTP control layer — `uv run python server.py`, Flask,

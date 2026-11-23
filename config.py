@@ -4,7 +4,13 @@ from enum import Enum
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-load_dotenv()
+# SCRAPER_LOAD_DOTENV=0 (Brief 3A, approved in Step 0): don't read
+# web-scraper/.env at all -- a launcher (foundry) passes everything the run
+# needs itself, settings in the v1 config and the key via api_key_env. Any
+# other value, or unset: load .env as always (it never overrides a variable
+# that is already set).
+if os.getenv("SCRAPER_LOAD_DOTENV", "").strip() != "0":
+    load_dotenv()
 
 # Frontier / crawl-pipeline knobs (frontier.py).
 MAX_RETRIES = 3
@@ -96,6 +102,25 @@ EXTRACT_UNIT_CONCURRENCY = int(os.getenv("EXTRACT_UNIT_CONCURRENCY", "1"))
 # reaching quiescence. Longer outages are the circuit breaker's job, not a
 # single row's backoff.
 RATE_LIMIT_MAX_BACKOFF_SECONDS = 300.0
+
+# Headless contract v1 graceful stop (Brief 3A Step 3): after SIGTERM/SIGINT,
+# how long in-flight pages get to finish and be written before the workers
+# are cancelled and still-claimed rows are put back to 'queued'. In-flight
+# LLM calls can't be cancelled (ROADMAP #58), so this is their window to
+# finish. v1 setting "stop_grace_seconds"; legacy runs install no handlers.
+STOP_GRACE_SECONDS = int(os.getenv("SCRAPER_STOP_GRACE_SECONDS", "30"))
+# Brief 3A Step 4 (ROADMAP #51/#52). Off here = today's behaviour; headless
+# contract v1 turns both on by default (headless.SETTINGS).
+# SITE_RETRY_BACKOFF: a site's 429/503 re-queues the page with a backoff (the
+# site's Retry-After, else 5s doubling per retry, capped at
+# RATE_LIMIT_MAX_BACKOFF_SECONDS) instead of an immediate re-fetch.
+SITE_RETRY_BACKOFF = os.getenv("SCRAPER_SITE_RETRY_BACKOFF", "false").strip().lower() == "true"
+# LLM_UNAVAILABLE_MAX_RELEASES: > 0 = a transient provider error (HTTP
+# 500/502/503/504) on extraction releases the page with a backoff WITHOUT
+# using a retry, at most this many times per page per run; the next one
+# fails the page with a clear reason. 0 = today's path (a generic error,
+# counted retry, no backoff).
+LLM_UNAVAILABLE_MAX_RELEASES = int(os.getenv("SCRAPER_LLM_UNAVAILABLE_MAX_RELEASES", "0"))
 
 # Count terminally failed pages toward max_pages (crawl/frontier.py
 # count_failed_toward_budget). Off by default = the original budget

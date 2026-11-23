@@ -16,12 +16,28 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Awaitable, Callable
 
-import aiofiles
-
 ChromaUpsertFn = Callable[[str, list[dict]], Awaitable[None]]  # (url, chunks) -- each chunk needs its source url
+
+
+def append_page_atomically(path: str, data: bytes) -> None:
+    """All of one page's rows in a single O_APPEND write, then fsync (Brief
+    3A Step 3, item 9). The previous text-mode writelines() went out as one
+    write() per row or per buffer, so a kill between them left a page half
+    written: measured, 39 of 80 SIGKILLs. Writer then counts that URL as done
+    on resume, so the missing rows are never written. Blocking: callers run
+    it in asyncio.to_thread (event-loop invariant, CLAUDE.md)."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        view = memoryview(data)
+        while view:  # a regular-file write normally takes it all in one call
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 class Writer:
@@ -68,11 +84,10 @@ class Writer:
             )
         async with self._guard:
             if not self.already_written(url) and qa_pairs:
-                lines = [
+                data = "".join(
                     json.dumps({**pair, "source_url": url}) + "\n" for pair in qa_pairs
-                ]
-                async with aiofiles.open(self._jsonl_path, mode="a", encoding="utf-8") as f:
-                    await f.writelines(lines)
+                ).encode("utf-8")
+                await asyncio.to_thread(append_page_atomically, self._jsonl_path, data)
                 self._written_urls.add(url)
             if chunks and self._chroma_upsert_fn is not None:
                 await self._chroma_upsert_fn(url, chunks)

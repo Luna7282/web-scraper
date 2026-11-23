@@ -40,8 +40,12 @@ def build_canonical_record(
     license_signal: str | None,
     quality_score: float | None = None,
     quality_decision_method: str | None = None,
+    scraper_version: str | None = None,
 ) -> dict:
-    return {
+    """scraper_version: headless contract v1 only (the producing scraper's git
+    commit, e.g. "3437952+dirty"). None -- legacy -- leaves the record
+    exactly as before (no key)."""
+    record = {
         "question": question,
         "answer": answer,
         "source_chunk": source_chunk,
@@ -62,6 +66,9 @@ def build_canonical_record(
         "quality_score": quality_score,
         "quality_decision_method": quality_decision_method,
     }
+    if scraper_version is not None:
+        record["scraper_version"] = scraper_version
+    return record
 
 
 _H1_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)

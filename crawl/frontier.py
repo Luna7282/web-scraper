@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import aiosqlite
 
@@ -172,6 +172,13 @@ class Frontier:
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
         self._in_flight = 0
+        # Graceful stop (headless v1, Brief 3A Step 3): once set, claim() hands
+        # out nothing new. In memory only -- unlike `paused`, it belongs to
+        # this process's shutdown and must not survive into a resume.
+        self._draining = False
+        # url -> transient-LLM-error releases this run (release_llm_unavailable).
+        # In memory on purpose: the cap bounds one run; a resume starts again.
+        self._llm_releases: dict[str, int] = {}
         self._shutdown_triggered = False
         self.quiescent = asyncio.Event()
 
@@ -251,6 +258,8 @@ class Frontier:
             self.quiescent.set()
 
     async def _locked_claim(self) -> FrontierRow | None:
+        if self._draining:
+            return None  # stopping: rows stay 'queued'
         if await self._locked_is_paused():
             return None  # rows stay 'queued' in the DB -- nothing here changes their status
         now = _now()
@@ -672,6 +681,51 @@ class Frontier:
         async with self._lock:
             self._in_flight -= 1
             await self._locked_check_quiescence()
+
+    @property
+    def in_flight(self) -> int:
+        """Claimed rows not yet finished (fetching, queued for extraction,
+        extracting, or waiting to be written)."""
+        return self._in_flight
+
+    def begin_drain(self) -> None:
+        """Stop handing out new rows; work already claimed carries on."""
+        self._draining = True
+
+    async def release_llm_unavailable(self, url: str, reason: str, backoff_for, max_releases: int) -> bool:
+        """A transient provider error (5xx) on this page: put it back in
+        'queued' with not_before = backoff_for(n) seconds, where n is this
+        page's release count this run, WITHOUT counting a retry -- the page
+        did nothing wrong. After max_releases releases the next call marks it
+        'failed' with a reason saying so. Returns True if it is now failed."""
+        async with self._lock:
+            n = self._llm_releases.get(url, 0) + 1
+            self._llm_releases[url] = n
+            if n > max_releases:
+                await self._locked_mark_terminal(
+                    url, "failed", f"{reason}; gave up after {max_releases} releases (llm_unavailable_max_releases)")
+                return True
+            not_before = (datetime.now(UTC) + timedelta(seconds=backoff_for(n))).isoformat()
+            await self._conn.execute(
+                "UPDATE frontier SET status = 'queued', last_error = ?, not_before = ?, updated_at = ? WHERE url = ?",
+                (f"{reason} (release {n}/{max_releases})", not_before, _now(), url),
+            )
+            await self._conn.commit()
+            await self._locked_leave_in_progress(url)
+            return False
+
+    async def release_in_progress(self, reason: str) -> int:
+        """Put every still-claimed row back to 'queued' for a later resume,
+        WITHOUT counting a retry: a requested stop isn't a failure of the page
+        (unlike recover_crashed(), which treats an unexplained in_progress row
+        as one). Returns how many rows were released."""
+        async with self._lock:
+            cur = await self._conn.execute(
+                "UPDATE frontier SET status = 'queued', last_error = ?, updated_at = ? "
+                "WHERE status = 'in_progress'", (reason, _now()))
+            await self._conn.commit()
+            self._in_flight = 0
+            return cur.rowcount
 
     async def recover_crashed(self) -> dict[str, int]:
         """Startup only, before any worker runs -- no in_flight bookkeeping

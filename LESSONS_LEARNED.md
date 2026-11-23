@@ -5464,3 +5464,179 @@ so Step 4's 111 was the high draw, not a regression now. Run: 5/5 `done`,
 limits, 0 errors, stop rules never fired. The A-C changes didn't change
 extraction output on the default path, as intended. Their 429 behaviour
 still hasn't met a real rate limit.
+
+### 87. Brief 3A Step 1: headless contract v1. The control server is a second headless client, so "required" had to mean "required to opt in"
+
+**Built** (`9f9f98c` code, `0ec9cd8` tests; branch `brief-3a-contract`,
+not merged): `headless.py`. `contract_version`, strict keys, settings in
+the config with config > env > default precedence (sources recorded), an
+API key named by `api_key_env`, exit codes 0 / 1 / 2 / 130 (143 with
+Step 3). 17 tests; full suite 559, only the 10 known #50 failures.
+
+**What reading the code found before writing any (Step 0):**
+- **`server/app.py` launches `main.py --headless-config` too,** with no
+  version and an extra `root_url` key `headless_crawl` never reads. A brief
+  that says "`contract_version` required in headless mode" *and* "the
+  control server behaves exactly as today" can't have both literally. The
+  resolution, approved: no `contract_version` = legacy, untouched; `1` = v1.
+  A subprocess test pins it: a legacy config with `root_url` and a bad mode
+  still gives today's ValueError traceback and exit 1.
+- **Every reader of the behaviour settings uses `config.X` at call time**
+  (`main.py`, `decisions/dispatch.py`, the `effective_llm_sdk_max_retries()`
+  function), and none imports them by name. That's what makes "apply the
+  effective settings to the config module for one run" safe, rather than
+  threading a settings object through every caller.
+- **foundry's adapter writes files into the scraper run_dir before
+  launching,** so Step 2's "refuse a non-empty run_dir" must mean "contains
+  scraper state".
+
+**Decisions worth keeping:** `bool` is refused where an int is expected
+(`True` is an `int` in Python, so `extract_unit_concurrency: true` would
+otherwise mean 1). Env values are parsed exactly as `config.py` parses them
+at import, so precedence never changes how a value is read. A
+`ConfigGuard` on every settings test fails if the config module is left
+changed (owner's addition).
+
+### 88. Brief 3A Step 2: result.json, resume rule, run ids and scraper version, finished after a mid-step usage cut-off
+
+**Built** (`900ba06` hooks, `fd63b65` code, `fb11f1c` tests; branch
+`brief-3a-contract`, not merged): `result.json` for every v1 outcome,
+crashes included; the scraper version in results and v1 rows; the
+run_dir resume rule with archiving; run ids on timing events. 23 tests;
+full suite 582 on two runs, only the 10 known #50 failures.
+
+**Resuming after the cut-off:** the previous session stopped with Step 2's
+code written but untested and uncommitted. Before touching it:
+`git status` / `git diff --stat` confirmed exactly the six expected files.
+Several other files had been reported "changed on disk", but they had no
+uncommitted diff (they matched their commits). The hook diffs were read
+line by line, and the 53 affected tests re-run. **Lesson:** after an
+interruption, prove the tree's state from git, not from memory or tool
+notices.
+
+**Decisions worth keeping:**
+- **A config error never overwrites an earlier run's result.** If the
+  run_dir already holds scraper state (the exact case "refuse a non-empty
+  run_dir" catches), writing a `config_error` result.json would destroy the
+  previous run's record. So a config result is written only into a run_dir
+  that exists and holds no run, and a missing run_dir is never created.
+- **Crash messages are cleaned, not dropped:** exception type plus message
+  with absolute paths → `<path>` and key-shaped strings → `[redacted]`,
+  capped. stderr gets the same single line, never a traceback (a traceback
+  can echo a provider error containing a key).
+- **"Legacy byte-identical" was proven against the previous commit, not
+  assumed:** `storage/canonical.py` and `crawl/timing.py` from git HEAD were
+  loaded beside the working tree and fed the same inputs. Identical bytes
+  for rows, identical values and key order for events. The permanent tests
+  pin the exact legacy key lists.
+- **Resume archives never overwrite:** an unreadable previous result becomes
+  `result.unknown-<time>.json`, and an existing `result.<id>.json` gets a
+  time suffix.
+
+**Fixed on resume:** two ruff findings the cut-off left in
+`headless_v1_entry` (`datetime.now(timezone.utc)` → `datetime.UTC`, and a
+nested `if` folded into one). `main.py` is back to HEAD's count. Seen in
+passing: this session's shell had `VIRTUAL_ENV` pointing at foundry's venv.
+uv ignored it with a warning and used `web-scraper/.venv`; commands now run
+with it unset (see the uv section of this file's companion `CLAUDE.md`).
+
+### 89. Brief 3A Step 3: graceful stop and atomic page writes. The real write bug was partial pages, not cut lines; and a group SIGTERM costs in-flight pages a retry
+
+**Built** (`cf1fd88` writer, `addca80` graceful stop + resume repair,
+`e5d4123` tests): `append_page_atomically` (one `O_APPEND` write + fsync per
+page, all modes); `crawl/graceful.py` with drain / release / close in v1
+crawl runs; a second-signal immediate exit; cut-tail repair on resume. 14
+tests (3 stable reruns), including real signals against a fake-I/O run and a
+12-kill SIGKILL test.
+
+**Measured before changing the writer** (SIGKILL harness, page = 40 rows):
+- **Cut lines: 0 in 120 kills, old and new writer alike.** Python's text
+  writer sends a large row as its own `write()`, so kills land between rows.
+- **Partial pages: the old writer left one in 39 of 80 kills** (28/40 with
+  large rows, 11/40 with realistic 600-byte rows). The new writer: 0 of 80.
+  That's the real defect: `Writer` preloads every `source_url` already in
+  the file, so a half-written page counts as done on resume and its missing
+  rows are never written. The brief anticipated "a truncated line". The
+  evidence pointed at a different, worse failure, found only because the
+  sensitivity check was run *before* the fix rather than assumed.
+
+**Real Chromium on macOS** (local 127.0.0.1 static site, 40 pages; real v1
+entry, crawl4ai, fetch, frontier and writer; a **fake extractor** via the
+`_extract_fn` seam, so zero LLM calls; trees recorded by PID + creation time
+before each signal, checked only by those):
+
+| run | signal at | exit | outcome | drain | survivors | canonical ends on a line |
+|---|---|---|---|---|---|---|
+| SIGTERM early | browser up, 0 rows | 143 | stopped_by_signal | 0.0s | none | yes |
+| SIGTERM mid | 5 rows | 143 | stopped_by_signal | 0.97s | none | yes (7 rows) |
+| SIGTERM late | 30 rows | 143 | stopped_by_signal | 1.01s | none | yes (32) |
+| SIGINT mid | 5 rows | 130 | interrupted | 1.03s | none | yes (7) |
+| double SIGTERM | 5 rows | 143 | stopped_immediately | — | none* | yes (5) |
+| group SIGTERM (foundry's style) | 5 rows | 143 | stopped_by_signal | 0.52s | none | yes (5) |
+
+*After a second signal, 2-5 driver/browser processes are still alive at the
+moment the scraper exits, and all are gone within 0.25s (3/3 repetitions):
+Playwright's driver closes the browser when its parent's pipe closes.
+
+**What it showed:**
+- **Real Chromium does run in its own process group** (2 groups in every
+  recorded tree). This confirms foundry's fake-tree assumption: only the
+  driver's own cleanup reaches the browser.
+- **A group SIGTERM reaches the driver at the same instant as the scraper.**
+  Chromium closes under in-flight fetches, crawl4ai logs "Target page,
+  context or browser has been closed", and those pages are recorded as fetch
+  failures that **use up a retry** (2 rows at `retry_count` 1; with a PID
+  SIGTERM the leftovers stayed at 0). Recommendation for launchers
+  (foundry): SIGTERM the scraper's PID first, the group only after the grace
+  period.
+- **Nothing was ever left behind** in the graceful and double-signal cases.
+  Real leftovers need the driver itself killed hard. Recovery is by the
+  launcher's recorded PIDs + creation times, never by name (CLAUDE.md).
+
+`aiofiles` is no longer used by the writer. It's still listed in
+`pyproject.toml`: removing a dependency is a separate decision.
+
+### 90. Brief 3A Step 4: safe defaults in v1 headless. Turning the breaker on also turned off SDK retries for 503s
+
+**Built** (`1cf4ee7` mechanisms, off by default; `61cba5b` v1 defaults;
+`e43c3da` 15 tests): v1 defaults `max_pages_counts_failed` on,
+`llm_breaker_threshold` 5, `site_retry_backoff` on,
+`llm_unavailable_max_releases` 5. `config.py` and legacy are unchanged
+(checked in a fresh interpreter).
+
+**Decisions:**
+- **Site 429/503 still count as a retry.** A site refusing a page
+  repeatedly is a real failure of that page. The fix is to stop hammering
+  it: `Retry-After` (crawl4ai exposes `response_headers`, which Step 0 left
+  to check), else 5s doubling.
+- **An LLM 5xx does not count as a retry, but it is capped.** The page did
+  nothing wrong, so spending its retry budget on a provider's bad minute is
+  the ROADMAP #51 failure. Without a cap, though, a persistent 503 would
+  loop for the whole run. Five releases per page per run, counted in
+  memory, then a failed row that says why. A resume starts the count again:
+  that's deliberate, since a later run is a new chance.
+- **The breaker only sees 429s.** A 5xx neither trips it nor resets its
+  count, and a 5xx on a half-open probe stays inconclusive (unchanged).
+  Folding 5xx into the breaker would stop whole runs on a demand spike
+  that the release path rides out.
+
+**Surprising:** `effective_llm_sdk_max_retries()` returns 0 whenever the
+breaker is on, so a v1 run by default no longer gets the openai SDK's two
+silent retries on a 503 either. Without the release path, the v1 default
+would have made 503s *worse* than legacy: each one becomes an immediate,
+counted page failure. The two defaults only make sense together.
+
+**Tests that exercise the real loop:** in-process v1 runs with a fake site
+and provider, timings shrunk by patch, config verified restored after each.
+- **Persistent 503:** every page failed after exactly 6 calls (5 releases +
+  1), with `retry_count` 0 and a clear reason. The run's outcome is still
+  `ok`, because failed pages aren't fatal.
+- **A 503 spike that clears:** nothing lost.
+- **The spiral regression (ROADMAP #54, LESSONS #81):** persistent 429s
+  with the v1 defaults end `stopped_early` through the breaker, with no page
+  failed and retries left. The same provider with the breaker off ends with
+  every page `failed` at `MAX_RETRIES`.
+
+**Not done:** host-level slowdown on site 429s (still ROADMAP #52), the
+interactive path (opt-in via env only), and quality-scoring calls (their
+5xx still take the generic path).

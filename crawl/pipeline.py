@@ -42,9 +42,45 @@ class FetchTimeout(Exception):
 
 
 class FetchHTTPError(Exception):
-    def __init__(self, status_code: int):
+    def __init__(self, status_code: int, retry_after: float | None = None):
         self.status_code = status_code
+        # The site's Retry-After, if it sent one (used only with site backoff on).
+        self.retry_after = retry_after
         super().__init__(f"HTTP {status_code}")
+
+    @classmethod
+    def from_response(cls, status_code: int, headers) -> FetchHTTPError:
+        lowered = {str(k).lower(): v for k, v in (headers or {}).items()} if hasattr(headers, "items") else {}
+        return cls(status_code, retry_after=_retry_after_from_headers(lowered))
+
+
+# Site answers that mean "slow down / try later" (ROADMAP #52): backed off when
+# config.SITE_RETRY_BACKOFF is on, instead of re-fetched at once.
+SITE_BACKOFF_STATUSES = (429, 503)
+# Provider answers that mean "temporarily unavailable" (ROADMAP #51): released
+# with a backoff when config.LLM_UNAVAILABLE_MAX_RELEASES > 0.
+TRANSIENT_PROVIDER_STATUSES = (500, 502, 503, 504)
+
+
+class ProviderUnavailableError(Exception):
+    """An LLM provider answered 500/502/503/504 (e.g. Gemini's 503 "high
+    demand"). Raised by main.py's extract_fn only when
+    config.LLM_UNAVAILABLE_MAX_RELEASES > 0; extract_worker then releases the
+    page with a backoff without using a retry, up to that cap per page."""
+
+    def __init__(self, status_code: int | None = None, retry_after: float | None = None,
+                 detail: str | None = None, **_ignored):
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.detail = detail
+        super().__init__(f"provider unavailable, status={status_code}")
+
+    @classmethod
+    def from_provider_error(cls, source) -> ProviderUnavailableError:
+        return cls(**rate_limit_details(source))
+
+    def details(self) -> dict:
+        return {"status_code": self.status_code, "retry_after": self.retry_after, "detail": self.detail}
 
 
 class BrowserDriverError(Exception):
@@ -213,6 +249,15 @@ def _rate_limit_backoff(e: RateLimitError) -> float:
     return min(e.retry_after or DEFAULT_RATE_LIMIT_BACKOFF_SECONDS, RATE_LIMIT_MAX_BACKOFF_SECONDS)
 
 
+def doubling_backoff(attempt: int, hint: float | None) -> float:
+    """The other side's own hint when given, else 5s doubling per attempt
+    (attempt 0 -> 5s, 1 -> 10s, ...), always capped at
+    RATE_LIMIT_MAX_BACKOFF_SECONDS (a far not_before keeps a run from
+    quiescing)."""
+    base = hint if hint else DEFAULT_RATE_LIMIT_BACKOFF_SECONDS * 2 ** max(0, attempt)
+    return min(base, RATE_LIMIT_MAX_BACKOFF_SECONDS)
+
+
 def _rate_limit_reason(stage: str, e: RateLimitError) -> str:
     summary = e.summary()
     return f"rate_limited ({stage}): {summary}" if summary else f"rate_limited ({stage})"
@@ -279,6 +324,8 @@ def _call_outcome(e: Exception) -> tuple[str, dict]:
     """(outcome, extra timing fields) for a failed LLM call."""
     if isinstance(e, RateLimitError):
         return "rate_limited", {"rate_limit": e.details()}
+    if isinstance(e, ProviderUnavailableError):
+        return "unavailable", {"unavailable": e.details()}
     return "error", {"error": type(e).__name__}
 
 
@@ -316,7 +363,11 @@ async def crawl_worker(
     poll_interval: float = POLL_INTERVAL,
     fatal_error_sink: list[str] | None = None,
     timing: TimingLog | None = None,
+    site_backoff: bool = False,
 ) -> None:
+    """site_backoff (config.SITE_RETRY_BACKOFF; off = today's immediate
+    re-fetch): a site's 429/503 re-queues the page after doubling_backoff
+    (the site's Retry-After, else 5s doubling per retry). Still a retry."""
     while True:
         # Checked before claim() too, not just in the row-is-None branch
         # below -- lets a fatal BrowserDriverError (set by any worker,
@@ -368,7 +419,12 @@ async def crawl_worker(
             await frontier.mark_fetch_failed(row.url, f"timeout: {e}")
             continue
         except FetchHTTPError as e:
-            await frontier.mark_fetch_failed(row.url, f"http_{e.status_code}")
+            if site_backoff and e.status_code in SITE_BACKOFF_STATUSES:
+                backoff = doubling_backoff(row.retry_count, e.retry_after)
+                await frontier.mark_fetch_failed(row.url, f"http_{e.status_code} (backoff {backoff:g}s)",
+                                                 backoff_seconds=backoff)
+            else:
+                await frontier.mark_fetch_failed(row.url, f"http_{e.status_code}")
             continue
         except BrowserDriverError as e:
             # Fail fast, don't retry -- see the class docstring. Every
@@ -428,6 +484,8 @@ async def extract_worker(
     timing: TimingLog | None = None,
     unit_concurrency: int = 1,
     breaker: LlmCircuitBreaker | None = None,
+    scraper_version: str | None = None,
+    llm_unavailable_max_releases: int = 0,
 ) -> None:
     """unit_concurrency (config.EXTRACT_UNIT_CONCURRENCY, default 1): how
     many of one page's extraction units -- and, with a quality_backend, its
@@ -441,7 +499,13 @@ async def extract_worker(
     same call back to the gate (finished units are kept, the page's retry
     budget isn't spent); a sporadic 429 with the breaker closed takes the
     original release-the-row path. BreakerStopped ends this worker without
-    marking the page failed (it stays in_progress, resumable)."""
+    marking the page failed (it stays in_progress, resumable).
+
+    llm_unavailable_max_releases (config.LLM_UNAVAILABLE_MAX_RELEASES, 0 =
+    off): a ProviderUnavailableError releases the page with doubling_backoff
+    and no retry used, at most this many times per page per run
+    (Frontier.release_llm_unavailable); the next one fails the page. The
+    breaker neither counts nor resets on these: it only sees 429s."""
     if unit_concurrency < 1:
         raise ValueError(f"unit_concurrency must be >= 1, got {unit_concurrency}")
 
@@ -547,6 +611,7 @@ async def extract_worker(
                     timestamp=timestamp, crawl_date=crawl_date,
                     license_signal=license_signal,
                     quality_score=quality_score, quality_decision_method=quality_method,
+                    scraper_version=scraper_version,
                 ))
             return records
 
@@ -636,6 +701,20 @@ async def extract_worker(
             await frontier.mark_extract_outcome(
                 url, "failed", _rate_limit_reason("extraction", e), backoff_seconds=_rate_limit_backoff(e),
             )
+            await frontier.content_done(content_queue)
+            continue
+        except ProviderUnavailableError as e:
+            pairs_so_far = sum(len(r) for r in unit_results if r)
+            if llm_unavailable_max_releases > 0:
+                _record_page(timing, url, "unavailable", units=len(units), pairs=pairs_so_far,
+                             started=extraction_started)
+                await frontier.release_llm_unavailable(
+                    url, f"llm_unavailable (extraction): HTTP {e.status_code}",
+                    lambda n, hint=e.retry_after: doubling_backoff(n - 1, hint), llm_unavailable_max_releases,
+                )
+            else:
+                _record_page(timing, url, "error", units=len(units), pairs=pairs_so_far, started=extraction_started)
+                await frontier.mark_extract_outcome(url, "failed", f"extraction: {type(e).__name__}: {e}")
             await frontier.content_done(content_queue)
             continue
         except Exception as e:

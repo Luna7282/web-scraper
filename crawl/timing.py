@@ -19,7 +19,7 @@ kinds written by crawl/pipeline.py and main.py:
   fetch                 -- url, seconds, outcome (ok / exception class name)
   score                 -- url, seconds, queue_wait_seconds
   extract_call          -- url, chunk_index, chars_in, seconds, provider,
-                           model, outcome (ok / malformed / rate_limited / error),
+                           model, outcome (ok / malformed / rate_limited / unavailable / error),
                            usage (token counts from the response, or null)
   quality_call          -- url, chunk_index, seconds, outcome
   page                  -- url, outcome, units, pairs, extraction_seconds
@@ -71,10 +71,15 @@ def _append_lines(path: str, events: list[dict]) -> None:
 
 
 class TimingLog:
-    def __init__(self, path: str, provider: str | None = None, model: str | None = None):
+    def __init__(self, path: str, provider: str | None = None, model: str | None = None,
+                 run_id: str | None = None):
         self.path = path
         self.provider = provider
         self.model = model
+        # Headless contract v1 only: stamped on every event so a resumed run's
+        # timings.jsonl says which run each line belongs to. None = legacy,
+        # events exactly as before.
+        self.run_id = run_id
         # Unbounded on purpose: record() must never await or block a worker.
         # Timing events are small and few (a handful per page), so growth is
         # bounded by the run itself.
@@ -85,7 +90,8 @@ class TimingLog:
         self._warned = False
 
     def record(self, event: str, **fields) -> None:
-        self._queue.put_nowait({"event": event, "ts": round(time.time(), 3), **fields})
+        stamp = {"run_id": self.run_id} if self.run_id is not None else {}
+        self._queue.put_nowait({"event": event, "ts": round(time.time(), 3), **stamp, **fields})
 
     def llm_fields(self) -> dict:
         return {"provider": self.provider, "model": self.model}
