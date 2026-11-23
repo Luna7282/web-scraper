@@ -103,6 +103,18 @@ RATE_LIMIT_MAX_BACKOFF_SECONDS = 300.0
 # LLM calls can't be cancelled (ROADMAP #58), so this is their window to
 # finish. v1 setting "stop_grace_seconds"; legacy runs install no handlers.
 STOP_GRACE_SECONDS = int(os.getenv("SCRAPER_STOP_GRACE_SECONDS", "30"))
+# Brief 3A Step 4 (ROADMAP #51/#52). Off here = today's behaviour; headless
+# contract v1 turns both on by default (headless.SETTINGS).
+# SITE_RETRY_BACKOFF: a site's 429/503 re-queues the page with a backoff (the
+# site's Retry-After, else 5s doubling per retry, capped at
+# RATE_LIMIT_MAX_BACKOFF_SECONDS) instead of an immediate re-fetch.
+SITE_RETRY_BACKOFF = os.getenv("SCRAPER_SITE_RETRY_BACKOFF", "false").strip().lower() == "true"
+# LLM_UNAVAILABLE_MAX_RELEASES: > 0 = a transient provider error (HTTP
+# 500/502/503/504) on extraction releases the page with a backoff WITHOUT
+# using a retry, at most this many times per page per run; the next one
+# fails the page with a clear reason. 0 = today's path (a generic error,
+# counted retry, no backoff).
+LLM_UNAVAILABLE_MAX_RELEASES = int(os.getenv("SCRAPER_LLM_UNAVAILABLE_MAX_RELEASES", "0"))
 
 # Count terminally failed pages toward max_pages (crawl/frontier.py
 # count_failed_toward_budget). Off by default = the original budget

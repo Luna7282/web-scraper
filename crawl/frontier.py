@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import aiosqlite
 
@@ -176,6 +176,9 @@ class Frontier:
         # out nothing new. In memory only -- unlike `paused`, it belongs to
         # this process's shutdown and must not survive into a resume.
         self._draining = False
+        # url -> transient-LLM-error releases this run (release_llm_unavailable).
+        # In memory on purpose: the cap bounds one run; a resume starts again.
+        self._llm_releases: dict[str, int] = {}
         self._shutdown_triggered = False
         self.quiescent = asyncio.Event()
 
@@ -688,6 +691,28 @@ class Frontier:
     def begin_drain(self) -> None:
         """Stop handing out new rows; work already claimed carries on."""
         self._draining = True
+
+    async def release_llm_unavailable(self, url: str, reason: str, backoff_for, max_releases: int) -> bool:
+        """A transient provider error (5xx) on this page: put it back in
+        'queued' with not_before = backoff_for(n) seconds, where n is this
+        page's release count this run, WITHOUT counting a retry -- the page
+        did nothing wrong. After max_releases releases the next call marks it
+        'failed' with a reason saying so. Returns True if it is now failed."""
+        async with self._lock:
+            n = self._llm_releases.get(url, 0) + 1
+            self._llm_releases[url] = n
+            if n > max_releases:
+                await self._locked_mark_terminal(
+                    url, "failed", f"{reason}; gave up after {max_releases} releases (llm_unavailable_max_releases)")
+                return True
+            not_before = (datetime.now(UTC) + timedelta(seconds=backoff_for(n))).isoformat()
+            await self._conn.execute(
+                "UPDATE frontier SET status = 'queued', last_error = ?, not_before = ?, updated_at = ? WHERE url = ?",
+                (f"{reason} (release {n}/{max_releases})", not_before, _now(), url),
+            )
+            await self._conn.commit()
+            await self._locked_leave_in_progress(url)
+            return False
 
     async def release_in_progress(self, reason: str) -> int:
         """Put every still-claimed row back to 'queued' for a later resume,

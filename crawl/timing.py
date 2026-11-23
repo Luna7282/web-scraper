@@ -19,7 +19,7 @@ kinds written by crawl/pipeline.py and main.py:
   fetch                 -- url, seconds, outcome (ok / exception class name)
   score                 -- url, seconds, queue_wait_seconds
   extract_call          -- url, chunk_index, chars_in, seconds, provider,
-                           model, outcome (ok / malformed / rate_limited / error),
+                           model, outcome (ok / malformed / rate_limited / unavailable / error),
                            usage (token counts from the response, or null)
   quality_call          -- url, chunk_index, seconds, outcome
   page                  -- url, outcome, units, pairs, extraction_seconds

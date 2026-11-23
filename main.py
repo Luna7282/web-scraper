@@ -21,7 +21,7 @@ from llm_factory import get_llm
 from crawl.discovery import discover_branches, fetch_page_links
 from crawl.scope import normalize_url, derive_prefix, is_in_scope
 from crawl.frontier import Frontier
-from crawl.pipeline import crawl_worker, extract_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError
+from crawl.pipeline import crawl_worker, extract_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError, ProviderUnavailableError, TRANSIENT_PROVIDER_STATUSES
 from crawl.politeness import HostPoliteness
 from crawl.timing import TimingLog, call_usage, usage_from_message
 from crawl.circuit_breaker import LlmCircuitBreaker
@@ -394,7 +394,7 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
         tasks = [
             asyncio.create_task(
                 crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness,
-                             fatal_error_sink=fatal_errors, timing=timing)
+                             fatal_error_sink=fatal_errors, timing=timing, site_backoff=config.SITE_RETRY_BACKOFF)
             )
             for _ in range(crawl_workers_n)
         ] + [
@@ -406,7 +406,8 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
                                 section_depth=config.SECTION_DEPTH, seed_prefixes=host_prefix_pairs,
                                 quality_backend=quality_backend, quality_threshold=quality_threshold,
                                 timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY,
-                                breaker=breaker, scraper_version=context.scraper_version if context else None)
+                                breaker=breaker, scraper_version=context.scraper_version if context else None,
+                                llm_unavailable_max_releases=config.LLM_UNAVAILABLE_MAX_RELEASES)
             )
             for _ in range(extract_workers_n)
         ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
@@ -938,7 +939,7 @@ def _make_fetch_fn(crawler: AsyncWebCrawler):
         if not result.success:
             status = result.redirected_status_code or result.status_code
             if status and status != 200:
-                raise FetchHTTPError(status)
+                raise FetchHTTPError.from_response(status, result.response_headers)
             error_message = result.error_message or "fetch failed"
             # crawl4ai catches Playwright's own exceptions internally and
             # returns them as result.error_message rather than raising --
@@ -965,9 +966,12 @@ def _make_embed_fn(embeddings):
     return embed_fn
 
 
+def _provider_status(e: Exception):
+    return getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+
+
 def _is_rate_limit_exception(e: Exception) -> bool:
-    status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
-    return status == 429
+    return _provider_status(e) == 429
 
 
 _EXTRACTION_SYSTEM_PROMPTS = {
@@ -992,6 +996,8 @@ def _make_extract_fn(llm, prompt_variant: "config.ExtractionPromptVariant" = Non
         except Exception as e:
             if _is_rate_limit_exception(e):
                 raise RateLimitError.from_provider_error(e) from e
+            if config.LLM_UNAVAILABLE_MAX_RELEASES > 0 and _provider_status(e) in TRANSIENT_PROVIDER_STATUSES:
+                raise ProviderUnavailableError.from_provider_error(e) from e
             raise
         if record_usage:
             call_usage.set(usage_from_message(response))
