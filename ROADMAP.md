@@ -1300,6 +1300,16 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     - **The second-site token-basis check is deferred.** The dry-pass token
       estimate is still fitted on one run (Brief 2c).
 
+68. **[Found 2026-11-23, Brief 2d e2e] `verification.written_rows_by_status`
+    counts the rows that left verification, not the rows written.** Balancing
+    runs after verification, so on the fastapi run it summed to 309 while 247
+    were written (62 cut by the page cap). Either count after balancing (a
+    `commit()`-time tally), or rename the field `verified_rows_by_status`.
+    Meanwhile foundry's dataset artifact `verification_status` (from the rows
+    actually written) is the true count. Measured as well: code_example@1's
+    output ratio is about 1.22x input, not the assumed qa 2.45x (11,235 vs
+    9,173 tokens).
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
