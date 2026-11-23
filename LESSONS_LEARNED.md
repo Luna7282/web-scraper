@@ -5757,3 +5757,43 @@ fetches, Chromium, zero LLM calls: no key in the environment,
 - **Measurement caveat:** the recompute sees each page only through its
   rows' `source_chunk`. Units that produced no rows are invisible, and
   that only matters for the link-density signal.
+
+### 94. Brief 3B licence fix and Step 4: site-level licence evidence; generators are single-call so the worker keeps control of every call
+
+**Licence evidence** (`e7d05a1`, ROADMAP #63 resolved): only site-level
+evidence counts now.
+- **What counts:** `rel="license"`, a link to a licence page or file, or a
+  licence name in footer text.
+- **What never counts:** HTML comments, `<svg>`, `<script>`, `<style>` and
+  body text.
+- **Result on saved pages:** all 15 saved fixture pages from 5 sites give
+  no evidence, and the record for both fastapi fixtures is `none_found`.
+  These are true negatives: each footer was found and read, and none
+  mentions a licence. Fastapi's "License" heading is body text about the
+  software's MIT licence, not the site's.
+- **Event loop:** the full HTML parse (7 ms on the 170 KB fastapi page)
+  moved into `asyncio.to_thread`. A multi-MB page would otherwise stall
+  every worker.
+
+**Step 4: generators** (`926dd78`). Two deviations from the Step 0 plan:
+- **No separate `generate_worker`.** `extract_worker`'s call loop became one
+  `guarded_call` helper, shared by v1's `extract_fn` path and the v2
+  generator path. One copy of the breaker, semaphore, 429/5xx, cost and
+  timing logic beats two that can drift. The v1 path's steps are
+  unchanged, the golden byte test passes, and v2 `qa@1` rows equal the
+  golden v1 rows field for field.
+- **`request`/`parse` instead of `generate(unit, page, llm)`.** With the
+  worker making the call, a malformed answer is booked exactly as today,
+  and no generator can make an ungated or uncounted call. Multi-call
+  generators would need a new interface version.
+
+**Measured on the real fastapi units** (saved dry-pass units, offline):
+- `qa@1` would make 52 calls with 109,992 input characters, exactly Brief
+  2c's figure. That confirms the request is byte-identical.
+- `code_example@1` wants 20 of the 52 units, adding about 8.7k input tokens
+  by the qa basis. Its output ratio is unmeasured.
+- **Why it sends context:** the chunker often splits a code block from its
+  explanation. Several units are 27 characters holding only
+  ```` ```uvx library-skills``` ````, with the explanation in the unit before.
+  So `code_example@1` sends up to 1,500 characters of the preceding unit
+  as context.

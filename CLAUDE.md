@@ -53,6 +53,9 @@ not by accident.
 | | `sectioning.py` | `derive_section` (canonical record field) + filename slugify/cap/disambiguate (export time) |
 | | `relevance.py` | Embedding-based relevance scoring (`score_headings`, chosen by measurement) |
 | | `balance.py` | Contract v2 source balancing: row caps, low-value page heuristic, `rebalance_rows` |
+| `generators/` | `__init__.py` | Contract v2 `Generator` interface (`wants`/`request`/`parse`), registry, `parse_json_array` |
+| | `qa.py` | `qa@1`: today's Q&A extraction as a generator (same prompt, request and parser) |
+| | `code_example.py` | `code_example@1`: instruction/code pairs from units with fenced code |
 | `storage/` | `writer.py` | Sole owner of the canonical JSONL file + Chroma upsert calls |
 | | `chunk_store.py` | Content-hash chunk IDs, `ChunkStore.add_or_merge_chunk`, embedding-identity check |
 | | `canonical.py` | The canonical record schema + `build_canonical_record` |
@@ -720,6 +723,40 @@ legacy runs take today's code paths (the v2 branches are all behind
     skipped pages.
   - **Offline recompute:** `rebalance_rows()` runs the same logic over an
     existing `canonical.jsonl`.
+- **Licence evidence is site-level only** (ROADMAP #63): `rel="license"`, a
+  link to a licence page or file, or a licence name in footer text. HTML
+  comments, `<svg>`, `<script>`, `<style>` and body text never count. The
+  HTML parse (`crawl/sources.py::page_evidence`) runs in `asyncio.to_thread`;
+  only its result is recorded on the event loop.
+- **Step 4 (done): pluggable generators** (`generators/`), v2 only.
+  - **Config key:** `generators`, a list of `{name, version, options?}`.
+    The default is `[{"name": "qa", "version": 1}]`. An unknown or
+    duplicate generator, or any option, is a config error.
+  - **Single-call interface:** `wants(unit, page, i)` (cheap filter),
+    `request(unit, page, i)` returning `(system prompt, text)`, and `parse(raw,
+    unit, page, i)` returning a list of field dicts. `parse` raises
+    `MalformedExtractionError` when it can't read the response.
+  - **The worker makes every call:** `extract_worker`'s `guarded_call`
+    applies the breaker gate, the unit semaphore, 429/5xx handling, cost and
+    timing for v1's call and for every generator's. A generator can't make
+    an ungated or uncounted call.
+  - **Labelling:** cost rows, timing events and 5xx releases carry the
+    generator id.
+  - **`PageContext`** holds url, title, section and every unit of the page.
+  - **`qa@1`** sends the provider exactly v1's messages (tested). Its v2
+    rows equal the golden v1 rows field for field, once the header and
+    provenance are removed.
+  - **`code_example@1`** calls only on units with a fenced block. It sends
+    up to `config.CODE_EXAMPLE_CONTEXT_CHARS` of the preceding unit as
+    context, because the chunker often leaves a code block alone in its
+    unit. Its rows have `instruction`, `code`, `language` and `explanation`.
+  - **Malformed answers:** a unit counts as malformed only when every
+    attempted generator's answer was unreadable.
+  - **Quality scoring** applies only to `qa` rows.
+  - **Dry pass:** `estimate.json` gives calls, input characters and tokens
+    per generator. A non-`qa` output ratio is labelled "unmeasured".
+  - **Exporters** skip non-`qa` rows and count them in the dataset card
+    (`skipped_non_qa_rows`, present only when something was skipped).
 - **Tests that spawn the real `main.py`** must use a config that can't run
   (an unsupported version, a never-existing run_dir). When version 2
   became valid, one such test silently ran a real v2 crawl
