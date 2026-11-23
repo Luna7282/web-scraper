@@ -29,6 +29,11 @@ from storage import writer as writer_module
 from storage.writer import Writer
 
 REPO = Path(__file__).resolve().parents[1]
+
+try:
+    from netguard import allow_network
+except ImportError:  # pragma: no cover -- run as tests.test_graceful_stop
+    from tests.netguard import allow_network
 # Real-signal tests (subprocess runs + SIGKILL loop, ~70s) only run with
 # RUN_SLOW_TESTS=1. They must pass before brief-3a-contract is merged.
 SLOW = unittest.skipUnless(os.environ.get("RUN_SLOW_TESTS") == "1", "slow real-signal test: set RUN_SLOW_TESTS=1")
@@ -130,6 +135,7 @@ class TestAtomicPageWrites(unittest.IsolatedAsyncioTestCase):
 
 
 @SLOW
+@allow_network  # slow real-signal test: subprocesses, explicitly allowed past the network guard
 class TestKillMidAppend(unittest.TestCase):
     """SIGKILL a process appending whole pages in a loop; every kill must leave
     only complete pages (40 rows each) and no cut line."""
@@ -180,6 +186,7 @@ class TestRepairOnResume(unittest.TestCase):
 # real signals against the fake run
 # ---------------------------------------------------------------------------
 @SLOW
+@allow_network  # slow real-signal test: subprocesses, explicitly allowed past the network guard
 @unittest.skipUnless(os.name == "posix", "POSIX signals")
 class TestSignalsOnARun(unittest.TestCase):
     def setUp(self):
