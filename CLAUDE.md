@@ -570,6 +570,43 @@ stayed `running` the whole time, and unpausing resumed immediately.
   - **Stamps:** timing events carry `run_id`, and canonical rows carry
     `scraper_version`, in v1 only. Legacy output is byte-identical, so pass
     `None` for both outside v1.
+- **Graceful stop, v1 crawl runs (Step 3, `crawl/graceful.py`):** handlers are
+  installed only when a v1 `RunContext` is present. Legacy and map runs keep
+  the default signal behaviour.
+  - **First SIGTERM/SIGINT:** the frontier stops handing out rows
+    (`begin_drain`, in memory only). Claimed pages get
+    `settings.stop_grace_seconds` (default 30) to finish and be written.
+    Then the workers are cancelled, rows still claimed go back to `queued`
+    without a retry (`release_in_progress`), and leaving the
+    `AsyncWebCrawler` context closes Chromium. Exit 143 / 130.
+  - **Second signal:** a minimal `result.json` (`stopped_immediately`),
+    then `os._exit`, with no cleanup.
+- **Canonical rows are appended one page per `O_APPEND` write plus fsync**
+  (`storage/writer.py::append_page_atomically`), in every mode. The old
+  text-mode `writelines` left a partial page in 39 of 80 measured SIGKILLs,
+  and `Writer` then treats that URL as written on resume, so the missing
+  rows are lost for good. On a v1 resume, a cut tail (still possible in
+  principle) is moved to `canonical.tail.<run_id>.bin`, never deleted.
+- **Leftover browser processes and recovery** (measured on macOS with real
+  Chromium, `LESSONS_LEARNED.md` #89):
+  - **Graceful stop:** nothing is left behind.
+  - **After a second signal:** Playwright's Node driver closes the browser
+    itself within about 0.25s once it sees its parent gone.
+  - **Real leftovers only happen if the driver is killed hard** (SIGKILL to
+    the group). Chromium runs in its **own process group**, so a group
+    signal never reaches it, and it can outlive the scraper.
+  - **Recovery:** the launcher must record the scraper's descendants (PID +
+    creation time) *before* signalling, then kill survivors by those
+    recorded PIDs, matching the creation time. foundry's `procs.stop` does
+    exactly this. **Never kill by name or command line**: `pkill chrome`
+    would also kill the user's own browser. Without a recorded tree, inspect
+    (`ps -o pid,ppid,pgid,lstart,command`) and kill one confirmed PID at a
+    time.
+  - **Signal the scraper's PID first, not its group.** A group SIGTERM
+    reaches the driver at the same moment, Chromium closes under in-flight
+    fetches, and each of those pages uses up a retry (measured: 2 rows at
+    `retry_count` 1). Launchers should send SIGTERM to the PID, wait for the
+    grace period, and only then signal or kill the group.
 - **Tests that apply settings must restore `config`.**
   `tests/test_headless_contract.py`'s `ConfigGuard` fails a test that
   leaves it changed.

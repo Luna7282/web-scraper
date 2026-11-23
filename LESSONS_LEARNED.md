@@ -5539,3 +5539,59 @@ nested `if` folded into one). `main.py` is back to HEAD's count. Seen in
 passing: this session's shell had `VIRTUAL_ENV` pointing at foundry's venv.
 uv ignored it with a warning and used `web-scraper/.venv`; commands now run
 with it unset (see the uv section of this file's companion `CLAUDE.md`).
+
+### 89. Brief 3A Step 3: graceful stop and atomic page writes. The real write bug was partial pages, not cut lines; and a group SIGTERM costs in-flight pages a retry
+
+**Built** (`cf1fd88` writer, `addca80` graceful stop + resume repair,
+`e5d4123` tests): `append_page_atomically` (one `O_APPEND` write + fsync per
+page, all modes); `crawl/graceful.py` with drain / release / close in v1
+crawl runs; a second-signal immediate exit; cut-tail repair on resume. 14
+tests (3 stable reruns), including real signals against a fake-I/O run and a
+12-kill SIGKILL test.
+
+**Measured before changing the writer** (SIGKILL harness, page = 40 rows):
+- **Cut lines: 0 in 120 kills, old and new writer alike.** Python's text
+  writer sends a large row as its own `write()`, so kills land between rows.
+- **Partial pages: the old writer left one in 39 of 80 kills** (28/40 with
+  large rows, 11/40 with realistic 600-byte rows). The new writer: 0 of 80.
+  That's the real defect: `Writer` preloads every `source_url` already in
+  the file, so a half-written page counts as done on resume and its missing
+  rows are never written. The brief anticipated "a truncated line". The
+  evidence pointed at a different, worse failure, found only because the
+  sensitivity check was run *before* the fix rather than assumed.
+
+**Real Chromium on macOS** (local 127.0.0.1 static site, 40 pages; real v1
+entry, crawl4ai, fetch, frontier and writer; a **fake extractor** via the
+`_extract_fn` seam, so zero LLM calls; trees recorded by PID + creation time
+before each signal, checked only by those):
+
+| run | signal at | exit | outcome | drain | survivors | canonical ends on a line |
+|---|---|---|---|---|---|---|
+| SIGTERM early | browser up, 0 rows | 143 | stopped_by_signal | 0.0s | none | yes |
+| SIGTERM mid | 5 rows | 143 | stopped_by_signal | 0.97s | none | yes (7 rows) |
+| SIGTERM late | 30 rows | 143 | stopped_by_signal | 1.01s | none | yes (32) |
+| SIGINT mid | 5 rows | 130 | interrupted | 1.03s | none | yes (7) |
+| double SIGTERM | 5 rows | 143 | stopped_immediately | — | none* | yes (5) |
+| group SIGTERM (foundry's style) | 5 rows | 143 | stopped_by_signal | 0.52s | none | yes (5) |
+
+*After a second signal, 2-5 driver/browser processes are still alive at the
+moment the scraper exits, and all are gone within 0.25s (3/3 repetitions):
+Playwright's driver closes the browser when its parent's pipe closes.
+
+**What it showed:**
+- **Real Chromium does run in its own process group** (2 groups in every
+  recorded tree). This confirms foundry's fake-tree assumption: only the
+  driver's own cleanup reaches the browser.
+- **A group SIGTERM reaches the driver at the same instant as the scraper.**
+  Chromium closes under in-flight fetches, crawl4ai logs "Target page,
+  context or browser has been closed", and those pages are recorded as fetch
+  failures that **use up a retry** (2 rows at `retry_count` 1; with a PID
+  SIGTERM the leftovers stayed at 0). Recommendation for launchers
+  (foundry): SIGTERM the scraper's PID first, the group only after the grace
+  period.
+- **Nothing was ever left behind** in the graceful and double-signal cases.
+  Real leftovers need the driver itself killed hard. Recovery is by the
+  launcher's recorded PIDs + creation times, never by name (CLAUDE.md).
+
+`aiofiles` is no longer used by the writer. It's still listed in
+`pyproject.toml`: removing a dependency is a separate decision.

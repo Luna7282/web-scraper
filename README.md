@@ -295,7 +295,11 @@ section for the design reasoning.
   for every outcome (crashes included), refuse a run_dir that already holds
   a run unless `"resume": true` (the old result is kept as
   `result.<previous run id>.json`), and stamp timing events with the run id
-  and canonical rows with the scraper version.
+  and canonical rows with the scraper version. SIGTERM / SIGINT stop a v1
+  crawl gracefully: in-flight pages finish within `stop_grace_seconds`, the
+  rest stay queued for a resume, the browser is closed, exit 143 / 130. A
+  second signal exits at once. Canonical rows are appended a whole page at
+  a time, so a killed run never leaves a page half written.
 
 ## Architecture
 
