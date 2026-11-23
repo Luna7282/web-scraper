@@ -1,5 +1,8 @@
 """Brief 3A Step 3: graceful stop (item 8) and atomic page writes (item 9).
 
+The real-signal classes (TestKillMidAppend, TestSignalsOnARun) are SLOW and
+run only with RUN_SLOW_TESTS=1 -- required before merging brief-3a-contract.
+
 Unit tests for the pieces; then real signals sent to tests/fakes/graceful_run.py
 (the real v1 entry, headless_crawl, frontier and Writer with a fake crawler,
 fetch and extractor -- no LLM, no network), and a kill-mid-append test.
@@ -26,6 +29,9 @@ from storage import writer as writer_module
 from storage.writer import Writer
 
 REPO = Path(__file__).resolve().parents[1]
+# Real-signal tests (subprocess runs + SIGKILL loop, ~70s) only run with
+# RUN_SLOW_TESTS=1. They must pass before brief-3a-contract is merged.
+SLOW = unittest.skipUnless(os.environ.get("RUN_SLOW_TESTS") == "1", "slow real-signal test: set RUN_SLOW_TESTS=1")
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +129,7 @@ class TestAtomicPageWrites(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(calls, {"write": 1, "fsync": 1})
 
 
+@SLOW
 class TestKillMidAppend(unittest.TestCase):
     """SIGKILL a process appending whole pages in a loop; every kill must leave
     only complete pages (40 rows each) and no cut line."""
@@ -172,6 +179,7 @@ class TestRepairOnResume(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # real signals against the fake run
 # ---------------------------------------------------------------------------
+@SLOW
 @unittest.skipUnless(os.name == "posix", "POSIX signals")
 class TestSignalsOnARun(unittest.TestCase):
     def setUp(self):

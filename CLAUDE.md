@@ -607,6 +607,11 @@ stayed `running` the whole time, and unpausing resumed immediately.
     fetches, and each of those pages uses up a retry (measured: 2 rows at
     `retry_count` 1). Launchers should send SIGTERM to the PID, wait for the
     grace period, and only then signal or kill the group.
+- **Slow tests: `RUN_SLOW_TESTS=1`.** The real-signal tests in
+  `tests/test_graceful_stop.py` (subprocess runs with real SIGTERM/SIGINT,
+  and the SIGKILL kill-mid-append loop, about 70s) are skipped by default.
+  Run `RUN_SLOW_TESTS=1 uv run python -m unittest discover -s tests` before
+  merging anything that touches headless, signals or the writer.
 - **Tests that apply settings must restore `config`.**
   `tests/test_headless_contract.py`'s `ConfigGuard` fails a test that
   leaves it changed.
