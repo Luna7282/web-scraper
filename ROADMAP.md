@@ -1244,6 +1244,23 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     `CLAUDE.md` extended, not bypassed, and an embedding-identity check per
     Chroma collection, which already exists.
 
+63. **[Found 2026-11-23, Brief 3B dry pass] Licence evidence picks up
+    third-party licences embedded in the page.** On fastapi.tiangolo.com the
+    only "licence" found on all 3 pages was Font Awesome's comment inside an
+    inline SVG icon ("Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT
+    License"). That's the icon set's licence, not the site's content. It's
+    reported as evidence with its snippet, so it can be checked, but the
+    summary line ("Creative Commons named, MIT License") reads as if the site
+    were licensed that way. Candidate fix: ignore matches inside HTML comments
+    and `<svg>` elements, or report them as a separate "embedded asset" kind.
+
+64. **[Found 2026-11-23, Brief 3B Step 3] A per-page row cap can't bound the
+    largest page's share in a small run.** With 3 pages the largest is always
+    at least a third; Brief 2c's root page goes from 58.7% to 46.7% under the
+    default cap of 100. Bounding a share needs the whole run's rows, i.e. a
+    selection after the run (Step 0 decision 2, option (b)), not a cap before
+    the writer.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

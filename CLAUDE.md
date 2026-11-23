@@ -52,6 +52,7 @@ not by accident.
 | | `extraction_units.py` | Extraction-strategy chunk selection (`first_n_chars`/`per_chunk`/`top_k_chunks_by_relevance`) |
 | | `sectioning.py` | `derive_section` (canonical record field) + filename slugify/cap/disambiguate (export time) |
 | | `relevance.py` | Embedding-based relevance scoring (`score_headings`, chosen by measurement) |
+| | `balance.py` | Contract v2 source balancing: row caps, low-value page heuristic, `rebalance_rows` |
 | `storage/` | `writer.py` | Sole owner of the canonical JSONL file + Chroma upsert calls |
 | | `chunk_store.py` | Content-hash chunk IDs, `ChunkStore.add_or_merge_chunk`, embedding-identity check |
 | | `canonical.py` | The canonical record schema + `build_canonical_record` |
@@ -694,6 +695,31 @@ legacy runs take today's code paths (the v2 branches are all behind
   - **Cost** (`crawl/cost.py`): `result.json` has a `cost` section counting
     every call attempt by outcome, per provider, model and role, plus 5xx
     releases. A token total is null when no call reported it, never 0.
+  - **Fingerprints:** `estimate.json`'s `page_fingerprints` holds each page's
+    content SHA-256 and each unit's SHA-256 and length. They tell "the page
+    changed" apart from "the estimate is wrong".
+- **Step 3 (done): source balancing** (`content/balance.py`), v2 only.
+  - **Settings** (`headless.SETTINGS_V2_ONLY`): `max_rows_per_page` (100),
+    `max_rows_per_source` (null = off), `low_value_policy` (`cap`; or
+    `skip` / `keep`), `low_value_max_rows` (25). Null turns a cap off, from
+    the config or as `none` in the environment.
+  - **Overrides key:** `low_value_overrides` `{"keep": [...], "skip":
+    [...]}` takes URL or path prefixes. The longest matching prefix wins,
+    and a tie keeps.
+  - **Caps are per record type.** The keep rule is round-robin across a
+    page's units, and kept rows stay in their original order.
+  - **The per-source cap** is applied in the order pages finish, which
+    varies between runs, so every cut is recorded.
+  - **Low-value heuristic:** URL segment, title, version-number headings,
+    or link-line share, with config values in `config.LOW_VALUE_*`. The
+    reasons are recorded.
+  - **`skip`** marks the page `skipped_extract` before any call, and the dry
+    pass skips it too.
+  - **`result.json`'s `balance` section:** rows per page, the largest page
+    and its share, rows per source, every cut, the low-value pages and the
+    skipped pages.
+  - **Offline recompute:** `rebalance_rows()` runs the same logic over an
+    existing `canonical.jsonl`.
 - **Tests that spawn the real `main.py`** must use a config that can't run
   (an unsupported version, a never-existing run_dir). When version 2
   became valid, one such test silently ran a real v2 crawl

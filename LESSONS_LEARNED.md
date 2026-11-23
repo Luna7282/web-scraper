@@ -5710,3 +5710,50 @@ byte-for-byte with output from `git archive 1112ad7`, for v1 and legacy.
 - **Deviation:** dry-pass pages are `mapped`, not a new status. The
   frontier's `status` CHECK constraint lives in `CREATE TABLE`, so a new
   status would change every new `frontier.db`, legacy included.
+
+### 93. Brief 3B dry pass and Step 3: the dry pass matched a real run unit for unit; caps measured on two real datasets
+
+**First real dry pass** (approved; 3 Brief 2c fastapi pages, robots + 3
+fetches, Chromium, zero LLM calls: no key in the environment,
+`SCRAPER_LOAD_DOTENV=0`, provider preflight off):
+- **Units per page:** root 32, `/features/` 10, `/tutorial/` 10, 52 in all.
+  Identical to Brief 2c's 52 real extraction calls.
+- **Brief 2c stored no content hash,** so the comparison used what it did
+  store. Every one of the 52 units has the same length as that call's
+  `chars_in` in Brief 2c's `timings.jsonl`. The 42 units that produced rows
+  have byte-identical text to their rows' `source_chunk`. The other 10 have
+  no rows, so only their length could be compared.
+- **Fingerprints for next time** (`6ce315b`): `estimate.json` now records
+  each page's content SHA-256 and every unit's SHA-256 and length.
+- **The token estimate** (26,095 input) is within 2 tokens of Brief 2c's
+  real 26,097, but that's circular: the basis was derived from that same
+  run. It says nothing yet about other sites, models or prompts.
+- **Source record:** robots `allowed`, `ai_training_signal` `none_found`
+  (no `Content-Signal` line, no AI-agent groups). Licence evidence came
+  only from Font Awesome's comment inside an inline SVG: a third-party
+  licence, not the site's (ROADMAP #63).
+
+**Step 3: source balancing** (`76e9253`, `content/balance.py`):
+- **What was built:**
+  - row caps per page and per source, per record type;
+  - a low-value heuristic (changelog / index, with reasons) with skip,
+    cap or keep, plus `low_value_overrides`;
+  - a `balance` section in `result.json`.
+- **Keep rule:** round-robin across a page's units. For a 315-unit
+  changelog capped at 25, that keeps the first row of the first 25 units,
+  which on fastapi is the 25 newest releases.
+- **Recompute, offline, on the two real datasets:**
+  - **Brief 1** (5,986 rows): release notes were 72%. The heuristic flags
+    only that page, on all three signals (path, title, 382 version
+    headings), and none of the other 26.
+    - The low-value cap alone leaves 1,703 rows, largest page 14.2%.
+    - With the defaults (100 per page, low-value cap 25): 1,417 rows, 7
+      pages at 100, largest share 7.1%.
+  - **Brief 2c** (276 rows): nothing is flagged. The root page goes from
+    162 rows to 100, and its share from 58.7% to 46.7%. With 3 pages a cap
+    can't push the share much lower (ROADMAP #64).
+- **Defaults kept as proposed:** 100 per page, no per-source cap, policy
+  `cap`, low-value cap 25.
+- **Measurement caveat:** the recompute sees each page only through its
+  rows' `source_chunk`. Units that produced no rows are invisible, and
+  that only matters for the link-density signal.
