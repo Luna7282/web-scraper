@@ -1200,6 +1200,22 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     finish instead of cancelling them) is the proposed fix. Not
     implemented: deferred by decision, no code change in Brief 1.
 
+
+59. **[Found 2026-11-23, Brief 3A Step 3] Map mode (`headless_map`) has no
+    graceful-stop handlers.** v1 crawl runs drain and close Chromium on
+    SIGTERM/SIGINT (`crawl/graceful.py`); a v1 *map* run still dies on the
+    default signal. It makes no LLM calls, but it does run Chromium, so a stop
+    relies on Playwright's driver to close the browser (measured: about 0.25s
+    when the scraper's process dies), and a page in flight is lost. Add the
+    same handlers to `headless_map` (drain, release, close, result.json).
+
+60. **[Found 2026-11-23, Brief 3A Step 3] `aiofiles` is no longer used by the
+    writer.** `storage/writer.py` now appends with `os.write` + `fsync` in
+    `asyncio.to_thread` (`append_page_atomically`). `aiofiles==25.1.0` is
+    still in `pyproject.toml`. Before removing it: check every import in the
+    repo (and in tests), then change `pyproject.toml` and `uv lock` with the
+    usual dry-run approval.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
