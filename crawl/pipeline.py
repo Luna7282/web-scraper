@@ -428,6 +428,7 @@ async def extract_worker(
     timing: TimingLog | None = None,
     unit_concurrency: int = 1,
     breaker: LlmCircuitBreaker | None = None,
+    scraper_version: str | None = None,
 ) -> None:
     """unit_concurrency (config.EXTRACT_UNIT_CONCURRENCY, default 1): how
     many of one page's extraction units -- and, with a quality_backend, its
@@ -547,6 +548,7 @@ async def extract_worker(
                     timestamp=timestamp, crawl_date=crawl_date,
                     license_signal=license_signal,
                     quality_score=quality_score, quality_decision_method=quality_method,
+                    scraper_version=scraper_version,
                 ))
             return records
 
