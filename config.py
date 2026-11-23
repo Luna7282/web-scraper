@@ -122,6 +122,13 @@ SITE_RETRY_BACKOFF = os.getenv("SCRAPER_SITE_RETRY_BACKOFF", "false").strip().lo
 # counted retry, no backoff).
 LLM_UNAVAILABLE_MAX_RELEASES = int(os.getenv("SCRAPER_LLM_UNAVAILABLE_MAX_RELEASES", "0"))
 
+# Brief 3B Step 1 (contract v2 source records, crawl/sources.py): AI crawlers
+# whose explicit robots.txt groups are reported as an AI-training signal.
+# Reported only -- the scraper's own requests don't use these names.
+AI_TRAINING_USER_AGENTS = ("GPTBot", "ChatGPT-User", "OAI-SearchBot", "CCBot", "Google-Extended", "ClaudeBot",
+                           "anthropic-ai", "Claude-Web", "Applebot-Extended", "PerplexityBot", "Bytespider",
+                           "meta-externalagent", "cohere-ai", "Amazonbot")
+
 # Count terminally failed pages toward max_pages (crawl/frontier.py
 # count_failed_toward_budget). Off by default = the original budget
 # (done/skipped_extract/mapped only). On: genuine fetch/extraction failures
