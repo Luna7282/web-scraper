@@ -5595,3 +5595,48 @@ Playwright's driver closes the browser when its parent's pipe closes.
 
 `aiofiles` is no longer used by the writer. It's still listed in
 `pyproject.toml`: removing a dependency is a separate decision.
+
+### 90. Brief 3A Step 4: safe defaults in v1 headless. Turning the breaker on also turned off SDK retries for 503s
+
+**Built** (`1cf4ee7` mechanisms, off by default; `61cba5b` v1 defaults;
+`e43c3da` 15 tests): v1 defaults `max_pages_counts_failed` on,
+`llm_breaker_threshold` 5, `site_retry_backoff` on,
+`llm_unavailable_max_releases` 5. `config.py` and legacy are unchanged
+(checked in a fresh interpreter).
+
+**Decisions:**
+- **Site 429/503 still count as a retry.** A site refusing a page
+  repeatedly is a real failure of that page. The fix is to stop hammering
+  it: `Retry-After` (crawl4ai exposes `response_headers`, which Step 0 left
+  to check), else 5s doubling.
+- **An LLM 5xx does not count as a retry, but it is capped.** The page did
+  nothing wrong, so spending its retry budget on a provider's bad minute is
+  the ROADMAP #51 failure. Without a cap, though, a persistent 503 would
+  loop for the whole run. Five releases per page per run, counted in
+  memory, then a failed row that says why. A resume starts the count again:
+  that's deliberate, since a later run is a new chance.
+- **The breaker only sees 429s.** A 5xx neither trips it nor resets its
+  count, and a 5xx on a half-open probe stays inconclusive (unchanged).
+  Folding 5xx into the breaker would stop whole runs on a demand spike
+  that the release path rides out.
+
+**Surprising:** `effective_llm_sdk_max_retries()` returns 0 whenever the
+breaker is on, so a v1 run by default no longer gets the openai SDK's two
+silent retries on a 503 either. Without the release path, the v1 default
+would have made 503s *worse* than legacy: each one becomes an immediate,
+counted page failure. The two defaults only make sense together.
+
+**Tests that exercise the real loop:** in-process v1 runs with a fake site
+and provider, timings shrunk by patch, config verified restored after each.
+- **Persistent 503:** every page failed after exactly 6 calls (5 releases +
+  1), with `retry_count` 0 and a clear reason. The run's outcome is still
+  `ok`, because failed pages aren't fatal.
+- **A 503 spike that clears:** nothing lost.
+- **The spiral regression (ROADMAP #54, LESSONS #81):** persistent 429s
+  with the v1 defaults end `stopped_early` through the breaker, with no page
+  failed and retries left. The same provider with the breaker off ends with
+  every page `failed` at `MAX_RETRIES`.
+
+**Not done:** host-level slowdown on site 429s (still ROADMAP #52), the
+interactive path (opt-in via env only), and quality-scoring calls (their
+5xx still take the generic path).

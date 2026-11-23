@@ -1032,8 +1032,10 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     alongside it, not instead of it).
 
 51. **[429 part RESOLVED -- Brief 1 3c item A: the provider's Retry-After /
-    retryDelay is now used, capped at `RATE_LIMIT_MAX_BACKOFF_SECONDS`; the
-    503/UNAVAILABLE extension below is still open] [Found 2026-11-20, Brief 1 Step 1] Every extraction 429 backs off a
+    retryDelay is now used, capped at `RATE_LIMIT_MAX_BACKOFF_SECONDS`. 503 part
+    RESOLVED for v1 headless, opt-in elsewhere -- Brief 3A Step 4:
+    `LLM_UNAVAILABLE_MAX_RELEASES` (v1 default 5) releases a 500/502/503/504
+    page with a backoff and no retry used; interactive `main()` not wired] [Found 2026-11-20, Brief 1 Step 1] Every extraction 429 backs off a
     flat 5 seconds, whatever the provider asked for.**
     `main.py::_make_extract_fn` turns a 429 into `RateLimitError()` with no
     `retry_after`, so `extract_worker` always falls back to
@@ -1067,7 +1069,10 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     errors (400/401/404). Not changed in Brief 1, and not part of Step 3's
     scope.
 
-52. **[Found 2026-11-20, Brief 1 Step 2] Site-side HTTP 429 is retried
+52. **[Per-row backoff RESOLVED for v1 headless, opt-in elsewhere -- Brief 3A
+    Step 4: `SITE_RETRY_BACKOFF` re-queues a 429/503 after Retry-After, else 5s
+    doubling. Still open: slowing or stopping the whole host, and the
+    interactive path] [Found 2026-11-20, Brief 1 Step 2] Site-side HTTP 429 is retried
     with zero backoff (the fetch-side twin of #51), and the default crawl
     settings were too fast for docs.manim.community.** `crawl_worker`
     handles `FetchHTTPError` with `frontier.mark_fetch_failed(url,

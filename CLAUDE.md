@@ -545,6 +545,21 @@ stayed `running` the whole time, and unpausing resumed immediately.
     The value goes only into `get_llm(..., api_key=)`, never into the
     config dict, `result.json`, errors or logs.
   - Any other version is a config error.
+- **v1 safe defaults (Step 4, item 18)**, v1 only. `config.py` and legacy
+  keep today's values; a config value or env variable can still turn each
+  one off.
+  - `max_pages_counts_failed`: on.
+  - `llm_breaker_threshold`: 5. This also forces SDK retries to 0.
+  - `site_retry_backoff`: on. A site's 429/503 re-queues the page after the
+    site's `Retry-After`, else 5s doubling per retry, capped at 300s. It
+    still counts as a retry.
+  - `llm_unavailable_max_releases`: 5. An LLM 500/502/503/504 releases the
+    page with the provider's hint or 5s doubling, **without** using a
+    retry, at most 5 times per page per run (counted in memory). The next
+    one fails the page: "gave up after 5 releases".
+  - **The breaker only sees 429s.** A 5xx neither trips it nor resets its
+    count. With the breaker on, the SDK no longer retries 5xx either, so the
+    release path is what absorbs a provider's 503 spike.
 - **v1 exit codes** (`headless.EXIT_*`): 0 ok, 1 stopped early
   (`fatal_errors`), 2 config error (one line on stderr, no traceback),
   130 SIGINT, 143 SIGTERM. Legacy keeps 0 / 1, and Ctrl-C there still
