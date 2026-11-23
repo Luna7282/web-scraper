@@ -1221,6 +1221,25 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     repo (and in tests), then change `pyproject.toml` and `uv lock` with the
     usual dry-run approval.
 
+
+61. **[Brief 3B Step 0 decision] Let a real run reuse a dry pass's fetched
+    pages.** The v2 dry pass (`dry_run: true`) fetches and chunks pages for
+    `estimate.json` but persists no content, and a real run is refused in a
+    dry-pass run_dir, so the real run fetches every page again. Persisting the
+    dry pass's markdown (or units) and letting a real run start from it would
+    halve the site traffic and make the estimate describe exactly the pages the
+    real run extracts. Needs a content store and a staleness rule.
+
+62. **[Brief 3B Step 0 decision] A hosted embeddings backend.** Any run with an
+    intent, RAG or `top_k_chunks_by_relevance` needs local Ollama
+    `nomic-embed-text`. Brief 3B only makes the v2 preflight fail clearly with
+    remediation (pull the model, or run with a blank intent and RAG off). A
+    public tool needs a real alternative: Gemini's `gemini-embedding-2` exists
+    but is deliberately not wired (`config.EMBEDDING_CAPABLE_PROVIDERS`,
+    `SYSTEM_ONE_MODELS.md`); it would need the provider-routing invariant in
+    `CLAUDE.md` extended, not bypassed, and an embedding-identity check per
+    Chroma collection, which already exists.
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when
