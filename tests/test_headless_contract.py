@@ -116,7 +116,7 @@ class TestPrecedence(ConfigGuard):
             self.assertEqual(spec.default, {"EXTRACT_UNIT_CONCURRENCY": 1, "MAX_PAGES_COUNTS_FAILED": False,
                                             "LLM_BREAKER_THRESHOLD": 0, "LLM_SDK_MAX_RETRIES": 2,
                                             "USE_SYSTEM_ONE": False, "SYSTEM_ONE_PROVIDER": None,
-                                            "EXTRACT_TIMING_LOG": False}[spec.config_attr], name)
+                                            "EXTRACT_TIMING_LOG": False, "STOP_GRACE_SECONDS": 30}[spec.config_attr], name)
 
     def test_bad_settings_are_refused(self):
         cases = [({"nope": 1}, "unknown settings: nope"),
