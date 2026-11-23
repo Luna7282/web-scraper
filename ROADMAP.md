@@ -753,7 +753,9 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
       chunks is an open design question this measurement surfaces, not
       answers. **Size: unclear until a direction is picked for either.**
 
-38. **`crawl/robots_cache.py` reads robots.txt but not the `Content-Signal`
+38. **[Read and reported in contract v2, Brief 3B Step 1: `crawl/sources.py`
+    puts Content-Signal lines in the source record. Still not enforced.]
+    **`crawl/robots_cache.py` reads robots.txt but not the `Content-Signal`
     directive some sites now publish alongside it.** Noticed inspecting
     `blog.cloudflare.com/robots.txt` before a real crawl there (see
     `LESSONS_LEARNED.md`): it declares
@@ -1096,7 +1098,9 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     specifies none, so only the 0.5s default applied. Not fixed in
     Brief 1.
 
-53. **[Found 2026-11-20, Brief 1 Step 2] A docs-root index page can't be
+53. **[RESOLVED for contract v2, Brief 3B Step 1: robots checked and page
+    fetched in the discovered request form (`scope.fetch_form`, v2-only
+    `fetch_urls` table); legacy/v1 unchanged] [Found 2026-11-20, Brief 1 Step 2] A docs-root index page can't be
     crawled as a discovered link: `normalize_url` strips the trailing
     slash, and the site's robots.txt only allows the slash form.**
     docs.manim.community's robots.txt is `Disallow: /` + `Allow:

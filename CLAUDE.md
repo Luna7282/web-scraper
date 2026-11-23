@@ -634,6 +634,35 @@ stayed `running` the whole time, and unpausing resumed immediately.
   `tests/test_headless_contract.py`'s `ConfigGuard` fails a test that
   leaves it changed.
 
+## Headless contract v2 (Brief 3B, in progress on `brief-3b-data-engine`)
+
+`"contract_version": 2` = every v1 key plus `headless.V2_KEYS`. A v1
+config using a v2 key is refused as unknown, exactly as before; v1 and
+legacy runs take today's code paths (the v2 branches are all behind
+`context.contract_version >= 2`).
+- **Step 1 (done):**
+  - **Rows:** v2 rows are canonical schema v2
+    (`storage/canonical.py::build_canonical_record_v2`): `schema_version`
+    2, `record_type`, the same top-level fields (so exporters still find
+    `question`/`answer`), and a `provenance` block: generator, provider,
+    model, pinned version (`model_pinned_version`, default the model),
+    `served_model`, endpoint, scraper version, run id, prompt sha256.
+  - **`served_model`:** the provider response's own `model` field, captured
+    by `llm_factory.ServedModelChatOpenAI`. langchain's `model_name` falls
+    back to the *requested* model, so never read it as provenance.
+  - **Source records** (`crawl/sources.py`) go to `sources.json` and into
+    `result.json`, in foundry's `data_sources` shape. A missing value is the
+    explicit `none_found`. Licence is evidence (snippet + page URL), never
+    a legal verdict. AI-training signals are reported, not enforced.
+  - **Request form vs identity (ROADMAP #53):** v2 checks robots and
+    fetches the URL in the form it was first discovered (trailing slash
+    kept, `scope.fetch_form`). Identity stays `normalize_url`. The mapping
+    lives in a v2-only side table, `fetch_urls`.
+- **Tests that spawn the real `main.py`** must use a config that can't run
+  (an unsupported version, a never-existing run_dir). When version 2
+  became valid, one such test silently ran a real v2 crawl
+  (`LESSONS_LEARNED.md` #91).
+
 ## Control server (`server/`)
 
 Local HTTP control layer — `uv run python server.py`, Flask,

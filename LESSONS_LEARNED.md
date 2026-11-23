@@ -5640,3 +5640,45 @@ and provider, timings shrunk by patch, config verified restored after each.
 **Not done:** host-level slowdown on site 429s (still ROADMAP #52), the
 interactive path (opt-in via env only), and quality-scoring calls (their
 5xx still take the generic path).
+
+### 91. Brief 3B Step 1: provenance and source records. langchain names the model you asked for, and making version 2 valid made a test crawl for real
+
+**Built** (`69fd8fc` sources, `652d501` request form, `476a82e` contract
+v2 wiring, `d7d3ed7` 21 tests): contract v2 (v1 + `model_pinned_version`);
+canonical row schema v2 with a provenance block; per-site source records;
+the ROADMAP #53 fix for v2.
+
+**Found by reading, then tested:**
+- **The served model isn't what langchain reports.** `ChatOpenAI` sets
+  `model_name` to `response.get("model", self.model_name)`. When a provider
+  omits the field, that's the model *requested*, so "the provider said X"
+  and "we asked for X" look identical. `ServedModelChatOpenAI` stores the
+  raw field (None if absent).
+- **The check runs through a real `invoke()`** over an
+  `httpx.MockTransport`, not just a unit call. That proves langchain's own
+  metadata merging keeps the key.
+
+**Incident:** `TestRealProcess` spawned the real `main.py` with
+`contract_version: 2` to prove it exits 2. Once version 2 was valid, that
+test **ran a real v2 crawl** into `/tmp/x`:
+- **What it did:** launched Chromium and tried DNS for `example.test`, a
+  reserved TLD that never resolves. The robots fetch failed, the one page
+  failed, and no LLM call was made.
+- **Knock-on effect:** the leftover `/tmp/x` then broke four unrelated
+  tests, which assumed that path didn't exist.
+- **Fix:** the test now uses an unsupported version (3); the shared helper's
+  run_dir is a path that can't exist; `/tmp/x` was removed after checking
+  every file in it came from today's run.
+- **Lesson:** a test that proves "X is refused" by actually running the
+  program turns into a real run the day X becomes valid. Such tests need a
+  config that can't run for a second reason too.
+
+**Fixture facts:**
+- **fastapi:** its robots.txt *discusses* content signals in comments but
+  has no `Content-Signal:` directive, so its record correctly says
+  `none_found`.
+- **blog.cloudflare.com:** `ai-train=yes, search=yes, ai-input=yes`.
+
+**Side effect:** foundry's drift guard fails while this branch is checked
+out (`SUPPORTED_CONTRACT_VERSIONS (1, 2)` vs its `(1,)`). The guard should
+accept a scraper that still supports v1 (foundry ROADMAP #13).
