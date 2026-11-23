@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import config
+import generators
 
 SUPPORTED_CONTRACT_VERSIONS = (1, 2)
 
@@ -52,7 +53,7 @@ V1_KEYS = ("contract_version", "run_id", "resume", "settings", "api_key_env")
 ALLOWED_KEYS = frozenset(RUN_KEYS + V1_KEYS)
 # Contract v2 (Brief 3B) = every v1 key plus these. A v1 config using one is
 # refused as an unknown key, exactly as before.
-V2_KEYS = ("model_pinned_version", "dry_run", "low_value_overrides")
+V2_KEYS = ("model_pinned_version", "dry_run", "low_value_overrides", "generators")
 ALLOWED_KEYS_BY_VERSION = {1: ALLOWED_KEYS, 2: frozenset(ALLOWED_KEYS | set(V2_KEYS))}
 MODES = ("crawl", "map")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -160,6 +161,11 @@ def validate(cfg: dict, environ: Mapping[str, str] | None = None) -> HeadlessRun
         raise HeadlessConfigError("dry_run must be true or false")
     if "low_value_overrides" in cfg:
         _check_overrides(cfg["low_value_overrides"])
+    if "generators" in cfg:
+        try:
+            generators.validate_specs(cfg["generators"])
+        except ValueError as e:
+            raise HeadlessConfigError(str(e)) from None
     if cfg.get("dry_run") and cfg.get("resume"):
         raise HeadlessConfigError("a dry pass needs its own run_dir: dry_run and resume can't be combined")
     api_key_env = cfg.get("api_key_env")

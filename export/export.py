@@ -234,6 +234,18 @@ def run_export(
         raise ValueError(f"unknown framework {framework!r}, expected one of {FRAMEWORKS}")
 
     records = load_canonical_records(canonical_path)
+    # Contract v2 rows carry a record_type; these exporters project Q&A only.
+    # Other record types (e.g. code_example) are skipped and counted, never
+    # rejected as invalid Q&A. v1 / legacy rows have no record_type: all qa.
+    skipped_by_type: dict[str, int] = {}
+    qa_records = []
+    for r in records:
+        rtype = r.get("record_type", "qa")
+        if rtype == "qa":
+            qa_records.append(r)
+        else:
+            skipped_by_type[rtype] = skipped_by_type.get(rtype, 0) + 1
+    records = qa_records
     valid, rejected = validate_records(records, min_answer_length=min_answer_length)
     deduped, dedup_removed = dedup_by_question(valid)
 
@@ -271,6 +283,8 @@ def run_export(
         valid_count=len(valid), rejected_count=len(rejected), dedup_removed=dedup_removed,
         semantic_dedup_removed=semantic_removed,
     )
+    if skipped_by_type:  # only when there were any: a v1 export's card is unchanged
+        card["skipped_non_qa_rows"] = dict(sorted(skipped_by_type.items()))
 
     if schema in BATCH_PROJECTIONS:
         splits = split_records(deduped, by=split_by, seed=seed)

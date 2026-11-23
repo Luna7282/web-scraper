@@ -163,6 +163,11 @@ LOW_VALUE_MIN_VERSION_HEADINGS = 3
 LOW_VALUE_MIN_LINK_LINES = 20
 LOW_VALUE_LINK_LINE_SHARE = 0.5
 
+# Brief 3B Step 4: code_example@1 (generators/code_example.py) sends up to
+# this many characters of the PRECEDING unit as context: the chunker often
+# puts a code block alone in a unit and its explanation in the one before.
+CODE_EXAMPLE_CONTEXT_CHARS = 1500
+
 # Brief 3B Step 1 (contract v2 source records, crawl/sources.py): AI crawlers
 # whose explicit robots.txt groups are reported as an AI-training signal.
 # Reported only -- the scraper's own requests don't use these names.

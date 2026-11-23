@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import hashlib
 from datetime import UTC, datetime
 import json
 import os
@@ -27,6 +26,8 @@ from crawl.sources import SourceRecorder, page_evidence
 from crawl.cost import CostLedger
 from estimate import build_estimate
 from content.balance import Balancer, BalanceSettings
+from generators import USER_PREFIX as GENERATOR_USER_PREFIX
+from generators import build as build_generators
 from preflight import PreflightFailed, embeddings_preflight, needs_embeddings, provider_preflight
 from storage.canonical import build_canonical_record_v2
 from crawl.pipeline import crawl_worker, extract_worker, estimate_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError, ProviderUnavailableError, TRANSIENT_PROVIDER_STATUSES
@@ -277,7 +278,7 @@ async def headless_map(cfg: dict) -> dict:
 
 async def headless_crawl(cfg: dict, api_key: str | None = None, context: "headless.RunContext | None" = None,
                          *, _crawler_factory=None, _fetch_fn_factory=None, _extract_fn=None,
-                         _http_fetch=None, _llm=None, _embeddings=None) -> dict:
+                         _http_fetch=None, _llm=None, _embeddings=None, _llm_call=None) -> dict:
     """Non-interactive equivalent of main() -- same worker wiring, same
     RAG/threshold/provider logic, just no Prompt.ask calls. See
     headless_map's docstring for the seeds/host_prefix_pairs contract and
@@ -296,7 +297,7 @@ async def headless_crawl(cfg: dict, api_key: str | None = None, context: "headle
         stop.install(loop)
     try:
         return await _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _fetch_fn_factory,
-                                          _extract_fn, _http_fetch, _llm, _embeddings)
+                                          _extract_fn, _http_fetch, _llm, _embeddings, _llm_call)
     finally:
         if stop is not None:
             stop.uninstall(loop)
@@ -318,7 +319,7 @@ def _second_signal_exit(run_dir: str, context: "headless.RunContext"):
 
 
 async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _fetch_fn_factory, _extract_fn,
-                               _http_fetch=None, _llm=None, _embeddings=None):
+                               _http_fetch=None, _llm=None, _embeddings=None, _llm_call=None):
     config.validate_system_one_config()
     v2 = context is not None and context.contract_version >= 2
     dry = v2 and bool(cfg.get("dry_run"))  # contract v2 dry pass: fetch + chunk, zero LLM calls
@@ -365,7 +366,16 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
     embed_fn = _make_embed_fn(embeddings)
     intent_embedding = await embed_fn(intent) if intent else None
     score_fn = make_score_fn(intent, intent_embedding, embed_fn)
-    extract_fn = None if dry else (_extract_fn or _make_extract_fn(llm, record_usage=config.EXTRACT_TIMING_LOG or v2))
+    gens = build_generators(cfg.get("generators")) if v2 else None
+    if v2:
+        # Every v2 call goes through a generator. Test seams: _llm_call(system, text), or a
+        # per-unit _extract_fn that only ever sees the request text.
+        extract_fn = None
+        llm_call = None if dry else (_llm_call or (_adapt_extract_fn(_extract_fn) if _extract_fn else None)
+                                     or _make_llm_call(llm, record_usage=True))
+    else:
+        llm_call = None
+        extract_fn = None if dry else (_extract_fn or _make_extract_fn(llm, record_usage=config.EXTRACT_TIMING_LOG))
     extraction_units_fn = make_extraction_units_fn(
         config.EXTRACTION_STRATEGY, embed_fn=embed_fn, intent_embedding=intent_embedding,
     )
@@ -449,7 +459,7 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
             tasks += [asyncio.create_task(
                 estimate_worker(frontier, content_queue, score_fn, cfg.get("extract_threshold", 0.0),
                                 cfg.get("follow_threshold", 0.0), extraction_units_fn, dry_pages,
-                                balancer=balancer))
+                                balancer=balancer, generators=gens))
                 for _ in range(extract_workers_n)]
         else:
             tasks += [
@@ -463,7 +473,8 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
                                 timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY,
                                 breaker=breaker, scraper_version=context.scraper_version if context else None,
                                 llm_unavailable_max_releases=config.LLM_UNAVAILABLE_MAX_RELEASES,
-                                record_builder=record_builder, cost=cost, balancer=balancer)
+                                record_builder=record_builder, cost=cost, balancer=balancer,
+                                generators=gens if v2 else None, llm_call=llm_call)
             )
             for _ in range(extract_workers_n)
             ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
@@ -504,10 +515,8 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
         result["balance"] = balancer.report()
     if dry:
         estimate = build_estimate(
-            dry_pages, provider=provider_name, model=model_name,
-            system_prompt=_EXTRACTION_SYSTEM_PROMPTS[config.EXTRACTION_PROMPT_VARIANT],
-            generator={"name": "qa", "version": 1}, provider_preflight=config.PROVIDER_PREFLIGHT,
-            quality_scoring=bool(cfg.get("enable_quality_scoring")))
+            dry_pages, provider=provider_name, model=model_name, generators=gens,
+            provider_preflight=config.PROVIDER_PREFLIGHT, quality_scoring=bool(cfg.get("enable_quality_scoring")))
         await asyncio.to_thread(_write_json_atomic, os.path.join(run_dir, ESTIMATE_FILE), estimate)
         result.update({"dry_run": True, "estimate": estimate})
     if stop_info is not None:
@@ -985,18 +994,23 @@ def _write_json_atomic(path: str, data) -> None:
 
 def _make_v2_record_builder(context: "headless.RunContext", provider_name: str, model_name: str, llm):
     """Canonical row schema v2 (storage/canonical.py) with this run's
-    provenance. The generator is fixed to qa@1 until generators are pluggable
-    (Brief 3B Step 4)."""
-    prompt = _EXTRACTION_SYSTEM_PROMPTS[config.EXTRACTION_PROMPT_VARIANT]
-    provenance = {
-        "generator": {"name": "qa", "version": 1}, "provider": provider_name, "model": model_name,
+    provenance; the generator (and with it record_type and prompt_sha256)
+    comes per row."""
+    base = {
+        "provider": provider_name, "model": model_name,
         "pinned_version": context.model_pinned_version or model_name,
         "endpoint": getattr(llm, "openai_api_base", None), "scraper_version": context.scraper_version,
-        "run_id": context.run_id, "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "run_id": context.run_id,
     }
+    per_generator: dict[str, dict] = {}
 
-    def build(fields: dict, served_model: str | None) -> dict:
-        return build_canonical_record_v2(fields, record_type="qa", provenance=provenance, served_model=served_model)
+    def build(fields: dict, served_model: str | None, generator) -> dict:
+        provenance = per_generator.get(generator.id)
+        if provenance is None:
+            provenance = per_generator[generator.id] = {
+                "generator": generator.spec(), **base, "prompt_sha256": generator.prompt_sha256}
+        return build_canonical_record_v2(fields, record_type=generator.record_type, provenance=provenance,
+                                         served_model=served_model)
     return build
 
 
@@ -1153,6 +1167,39 @@ def _make_extract_fn(llm, prompt_variant: "config.ExtractionPromptVariant" = Non
             call_usage.set(usage_from_message(response))
         return response.content
     return extract_fn
+
+
+def _make_llm_call(llm, record_usage: bool = False):
+    """Contract v2 generators' call: (system_prompt, text) -> response text.
+    Sends exactly what _make_extract_fn sends -- system prompt, then "Text to
+    process:" + the text capped at MAX_EXTRACT_CHARS -- with the same error
+    mapping, served-model and usage capture. qa@1's request is the unit, so
+    its messages are identical to v1's (tested)."""
+    async def llm_call(system_prompt: str, text: str) -> str:
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"{GENERATOR_USER_PREFIX}{text[:config.MAX_EXTRACT_CHARS]}"),
+        ]
+        try:
+            response = await asyncio.to_thread(llm.invoke, messages)
+        except Exception as e:
+            if _is_rate_limit_exception(e):
+                raise RateLimitError.from_provider_error(e) from e
+            if config.LLM_UNAVAILABLE_MAX_RELEASES > 0 and _provider_status(e) in TRANSIENT_PROVIDER_STATUSES:
+                raise ProviderUnavailableError.from_provider_error(e) from e
+            raise
+        call_served_model.set(served_model_from_message(response))
+        if record_usage:
+            call_usage.set(usage_from_message(response))
+        return response.content
+    return llm_call
+
+
+def _adapt_extract_fn(extract_fn):
+    """Test seam: a per-unit fake extract_fn(text) as a v2 llm_call."""
+    async def llm_call(system_prompt: str, text: str) -> str:
+        return await extract_fn(text)
+    return llm_call
 
 
 def _make_decision_chat_fn(llm):

@@ -31,6 +31,7 @@ from crawl.politeness import HostPoliteness
 from crawl.robots_cache import RobotsCache
 from crawl.scope import fetch_form, normalize_url
 from crawl.provenance import call_served_model
+from generators import PageContext
 from crawl.timing import call_usage
 from content.sectioning import DEFAULT_SECTION_DEPTH, derive_section
 from storage.writer import Writer
@@ -504,6 +505,8 @@ async def extract_worker(
     record_builder: Callable[..., dict] | None = None,
     cost=None,
     balancer=None,
+    generators: list | None = None,
+    llm_call: Callable[[str, str], Awaitable[str]] | None = None,
 ) -> None:
     """unit_concurrency (config.EXTRACT_UNIT_CONCURRENCY, default 1): how
     many of one page's extraction units -- and, with a quality_backend, its
@@ -540,7 +543,17 @@ async def extract_worker(
     the relevance gate, a page detected as low-value with action "skip" is
     marked skipped_extract with no extraction calls; after extraction, the
     page's rows are capped (per page, per source, low-value cap) before they
-    go to the writer. None: no balancing, exactly as before."""
+    go to the writer. None: no balancing, exactly as before.
+
+    generators + llm_call (headless contract v2 only, generators/): instead
+    of one extract_fn call per unit, every generator that wants the unit
+    gets one llm_call(system_prompt, text) through the same breaker,
+    semaphore, cost and timing path (timing events and cost rows carry the
+    generator id), and record_builder is called with generator=. A unit
+    fails as malformed only if every attempted generator's answer was
+    unreadable. None: extract_fn, exactly as before."""
+    if generators is not None and (llm_call is None or record_builder is None):
+        raise ValueError("generators need llm_call and record_builder")
     if unit_concurrency < 1:
         raise ValueError(f"unit_concurrency must be >= 1, got {unit_concurrency}")
 
@@ -582,6 +595,61 @@ async def extract_worker(
                     breaker.success(permit)
                 return answer.value, answer.method
 
+        async def guarded_call(chunk_index: int, unit: str, sem: asyncio.Semaphore | None, invoke,
+                               role_extra: dict):
+            """One LLM call behind the breaker gate and the unit semaphore,
+            recorded in cost and timing on failure. Returns (raw response,
+            served model, usage, started, seconds); the caller records the
+            ok / malformed outcome once it has parsed the response."""
+            while True:
+                permit = await breaker.acquire() if breaker is not None else None
+                if timing is not None or cost is not None:
+                    call_usage.set(None)  # never attribute a previous call's usage to this one
+                call_served_model.set(None)
+                async with sem if sem is not None else nullcontext():
+                    call_started = time.perf_counter()
+                    try:
+                        raw_response = await invoke()
+                    except Exception as e:
+                        outcome, extra = _call_outcome(e)
+                        if cost is not None:
+                            cost.record("extraction", outcome, **role_extra)
+                        _record_extract_call(timing, url, chunk_index, unit, call_started, outcome,
+                                             **extra, **role_extra)
+                        if breaker is not None and breaker.failure(permit, e):
+                            continue  # back to the gate; retry this same unit
+                        raise
+                    call_seconds = _since(call_started)
+                    served_model = call_served_model.get()  # this call's, read in the same task
+                    call_usage_now = call_usage.get() if cost is not None else None
+                if breaker is not None:
+                    breaker.success(permit)
+                return raw_response, served_model, call_usage_now, call_started, call_seconds
+
+        async def scored(chunk_index: int, pairs: list[dict], sem: asyncio.Semaphore | None) -> list:
+            if quality_backend is None:
+                return [(None, None)] * len(pairs)
+            if sem is None:
+                return [await score_pair(chunk_index, pair, None) for pair in pairs]
+            return await _run_in_order([functools.partial(score_pair, chunk_index, pair, sem) for pair in pairs])
+
+        def passes_quality(quality_score, quality_method) -> bool:
+            if quality_backend is None:
+                return True
+            # None (the default): per-method threshold, looked up by
+            # the answering backend's own method -- Jev/Laya/
+            # traditional score quality on different distributions
+            # (see config.DECISION_THRESHOLDS), so reusing one fixed
+            # number regardless of which backend answered would be
+            # the same category error dedup's shared 0.4 threshold
+            # turned out to be. An explicit quality_threshold still
+            # overrides this for every method, same as before.
+            active_threshold = (
+                quality_threshold if quality_threshold is not None
+                else get_threshold("sample_quality", quality_method)
+            )
+            return quality_score >= active_threshold
+
         async def process_unit(chunk_index: int, unit: str, sem: asyncio.Semaphore | None) -> list[dict] | None:
             """One extraction unit: one extract_fn call, parse, optional
             quality scoring. Returns the unit's canonical records, or None if
@@ -591,29 +659,8 @@ async def extract_worker(
             propagates. With a semaphore, a permit is held only around each
             LLM call -- never while waiting on this unit's own quality calls,
             which need permits too (holding one there could deadlock)."""
-            while True:
-                permit = await breaker.acquire() if breaker is not None else None
-                if timing is not None or cost is not None:
-                    call_usage.set(None)  # never attribute a previous call's usage to this one
-                call_served_model.set(None)
-                async with sem if sem is not None else nullcontext():
-                    call_started = time.perf_counter()
-                    try:
-                        raw_response = await extract_fn(unit)
-                    except Exception as e:
-                        outcome, extra = _call_outcome(e)
-                        if cost is not None:
-                            cost.record("extraction", outcome)
-                        _record_extract_call(timing, url, chunk_index, unit, call_started, outcome, **extra)
-                        if breaker is not None and breaker.failure(permit, e):
-                            continue  # back to the gate; retry this same unit
-                        raise
-                    call_seconds = _since(call_started)
-                    served_model = call_served_model.get()  # this call's, read in the same task
-                    call_usage_now = call_usage.get() if cost is not None else None
-                if breaker is not None:
-                    breaker.success(permit)
-                break
+            raw_response, served_model, call_usage_now, call_started, call_seconds = await guarded_call(
+                chunk_index, unit, sem, lambda: extract_fn(unit), {})
             try:
                 pairs = parse_qa_json(raw_response)
             except MalformedExtractionError:
@@ -626,31 +673,11 @@ async def extract_worker(
                 cost.record("extraction", "ok", call_usage_now)
             _record_extract_call(timing, url, chunk_index, unit, call_started, "ok", seconds=call_seconds)
 
-            scores = [(None, None)] * len(pairs)
-            if quality_backend is not None:
-                if sem is None:
-                    scores = [await score_pair(chunk_index, pair, None) for pair in pairs]
-                else:
-                    scores = await _run_in_order(
-                        [functools.partial(score_pair, chunk_index, pair, sem) for pair in pairs]
-                    )
+            scores = await scored(chunk_index, pairs, sem)
             records = []
             for pair, (quality_score, quality_method) in zip(pairs, scores):
-                if quality_backend is not None:
-                    # None (the default): per-method threshold, looked up by
-                    # the answering backend's own method -- Jev/Laya/
-                    # traditional score quality on different distributions
-                    # (see config.DECISION_THRESHOLDS), so reusing one fixed
-                    # number regardless of which backend answered would be
-                    # the same category error dedup's shared 0.4 threshold
-                    # turned out to be. An explicit quality_threshold still
-                    # overrides this for every method, same as before.
-                    active_threshold = (
-                        quality_threshold if quality_threshold is not None
-                        else get_threshold("sample_quality", quality_method)
-                    )
-                    if quality_score < active_threshold:
-                        continue
+                if not passes_quality(quality_score, quality_method):
+                    continue
                 fields = {
                     "question": pair["instruction"], "answer": pair["response"],
                     "source_chunk": unit, "chunk_index": chunk_index, "source_url": url, "section": section,
@@ -667,6 +694,55 @@ async def extract_worker(
                     records.append(record_builder(fields, served_model=served_model))
             return records
 
+        async def process_unit_generators(chunk_index: int, unit: str, sem: asyncio.Semaphore | None,
+                                          page: PageContext) -> list[dict] | None:
+            """Contract v2: every configured generator that wants this unit
+            gets one call (in config order). None only if every attempted
+            generator's response was malformed; [] if none wanted the unit."""
+            records, attempted, parsed = [], 0, 0
+            for gen in generators:
+                if not gen.wants(unit, page, chunk_index):
+                    continue
+                attempted += 1
+                system_prompt, text = gen.request(unit, page, chunk_index)
+                tag = {"generator": gen.id}
+                try:
+                    raw_response, served_model, call_usage_now, call_started, call_seconds = await guarded_call(
+                        chunk_index, unit, sem, functools.partial(llm_call, system_prompt, text), tag)
+                except ProviderUnavailableError as e:
+                    e.generator = gen.id  # the page release below is booked against this generator
+                    raise
+                try:
+                    items = gen.parse(raw_response, unit, page, chunk_index)
+                except MalformedExtractionError:
+                    if cost is not None:
+                        cost.record("extraction", "malformed", call_usage_now, **tag)
+                    _record_extract_call(timing, url, chunk_index, unit, call_started, "malformed",
+                                         seconds=call_seconds, **tag)
+                    continue
+                parsed += 1
+                if cost is not None:
+                    cost.record("extraction", "ok", call_usage_now, **tag)
+                _record_extract_call(timing, url, chunk_index, unit, call_started, "ok", seconds=call_seconds, **tag)
+                scores = (await scored(chunk_index, [i["_pair"] for i in items], sem) if gen.quality_scored
+                          else [(None, None)] * len(items))
+                for item, (quality_score, quality_method) in zip(items, scores):
+                    if gen.quality_scored and not passes_quality(quality_score, quality_method):
+                        continue
+                    fields = {k: v for k, v in item.items() if not k.startswith("_")}
+                    fields.update({"source_chunk": unit, "chunk_index": chunk_index, "source_url": url,
+                                   "section": section, "page_title": page_title})
+                    if gen.generation_meta:
+                        fields.update({"generation_model": generation_model,
+                                       "extraction_strategy": extraction_strategy})
+                    fields.update({"timestamp": timestamp, "crawl_date": crawl_date, "license_signal": license_signal,
+                                   "quality_score": quality_score, "quality_decision_method": quality_method,
+                                   "scraper_version": scraper_version})
+                    records.append(record_builder(fields, served_model=served_model, generator=gen))
+            return None if attempted and not parsed else records
+
+        if generators is not None:
+            return process_unit_generators
         return process_unit
 
     while True:
@@ -729,6 +805,8 @@ async def extract_worker(
         extraction_started = time.perf_counter()
 
         process_unit = make_unit_processor(url, section, page_title, timestamp, crawl_date, license_signal)
+        if generators is not None:
+            process_unit = functools.partial(process_unit, page=PageContext(url, page_title, section, tuple(units)))
 
 
         # unit_concurrency == 1 (config.EXTRACT_UNIT_CONCURRENCY's default):
@@ -766,7 +844,7 @@ async def extract_worker(
             pairs_so_far = sum(len(r) for r in unit_results if r)
             if llm_unavailable_max_releases > 0:
                 if cost is not None:
-                    cost.unavailable_release()
+                    cost.unavailable_release(generator=getattr(e, "generator", None))
                 _record_page(timing, url, "unavailable", units=len(units), pairs=pairs_so_far,
                              started=extraction_started)
                 await frontier.release_llm_unavailable(
@@ -818,6 +896,7 @@ async def estimate_worker(
     pages: dict,
     poll_interval: float = POLL_INTERVAL,
     balancer=None,
+    generators: list | None = None,
 ) -> None:
     """Dry pass (headless contract v2 `dry_run: true`): extract_worker's
     decisions without its LLM calls. Same score, same follow/promote, same
@@ -855,6 +934,12 @@ async def estimate_worker(
         units = await extraction_units_fn(content) if extraction_units_fn else [content]
         pages[url] = {"units": [len(u) for u in units], "content_sha256": _sha256(content),
                       "unit_sha256": [_sha256(u) for u in units]}
+        if generators is not None:  # v2: the calls each generator would make, as (system, text) lengths
+            page = PageContext(url, extract_page_title(content), None, tuple(units))
+            pages[url]["calls"] = {
+                gen.id: [tuple(map(len, gen.request(u, page, i))) for i, u in enumerate(units)
+                         if gen.wants(u, page, i)]
+                for gen in generators}
         await frontier.mark_mapped(url)
         await frontier.content_done(content_queue)
 

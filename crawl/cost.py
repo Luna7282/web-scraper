@@ -1,7 +1,8 @@
 """Per-run cost and token accounting (contract v2, Brief 3B Step 2, item 20).
 
-One bucket per (provider, model, role) -- role: extraction / quality /
-preflight. Counts every call attempt (a breaker retry is another call) by
+One bucket per (provider, model, role, generator) -- role: extraction /
+quality / preflight; generator: the v2 generator id ("qa@1") for extraction
+calls made through a generator, else None (and left out of the row). Counts every call attempt (a breaker retry is another call) by
 outcome, and token totals from the calls that reported usage. A token total is
 null when no call reported it -- never assumed 0 -- and usage_missing_calls
 says how many calls didn't report.
@@ -34,15 +35,15 @@ class _Bucket:
 class CostLedger:
     def __init__(self, provider: str, model: str):
         self.provider, self.model = provider, model
-        self._buckets: dict[tuple[str, str, str], _Bucket] = {}
+        self._buckets: dict[tuple[str, str, str, str], _Bucket] = {}
 
-    def _bucket(self, role: str) -> _Bucket:
-        return self._buckets.setdefault((self.provider, self.model, role), _Bucket())
+    def _bucket(self, role: str, generator: str | None = None) -> _Bucket:
+        return self._buckets.setdefault((self.provider, self.model, role, generator or ""), _Bucket())
 
-    def record(self, role: str, outcome: str, usage: dict | None = None) -> None:
+    def record(self, role: str, outcome: str, usage: dict | None = None, generator: str | None = None) -> None:
         if outcome not in OUTCOMES:
             outcome = "error"
-        b = self._bucket(role)
+        b = self._bucket(role, generator)
         b.calls += 1
         b.outcomes[outcome] += 1
         if usage:
@@ -54,12 +55,13 @@ class CostLedger:
                     reported = reported or field in ("input_tokens", "output_tokens")
             b.usage_reported_calls += reported
 
-    def unavailable_release(self, role: str = "extraction") -> None:
-        self._bucket(role).unavailable_releases += 1
+    def unavailable_release(self, role: str = "extraction", generator: str | None = None) -> None:
+        """A 5xx page release, booked against the generator whose call got the 5xx."""
+        self._bucket(role, generator).unavailable_releases += 1
 
     def to_dict(self) -> dict:
-        rows = [{"provider": p, "model": m, "role": r, **b.to_dict()}
-                for (p, m, r), b in sorted(self._buckets.items())]
+        rows = [{"provider": p, "model": m, "role": r, **({"generator": g} if g else {}), **b.to_dict()}
+                for (p, m, r, g), b in sorted(self._buckets.items())]
         totals = {"calls": sum(r["calls"] for r in rows)}
         for key in (*OUTCOMES, "unavailable_releases", "usage_reported_calls", "usage_missing_calls"):
             totals[key] = sum(r[key] for r in rows)
