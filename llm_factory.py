@@ -34,6 +34,25 @@ class LocalOllamaEmbeddings:
         response.raise_for_status()
         return response.json()["embedding"]
 
+class ServedModelChatOpenAI(ChatOpenAI):
+    """ChatOpenAI that also records the model the provider SAID it served.
+
+    langchain_openai fills response_metadata["model_name"] with
+    `response.get("model", self.model_name)` -- the model we ASKED for when
+    the provider omits the field -- so "absent" can't be told apart from
+    "same as requested". This puts the raw response `model` (None if absent
+    or empty) in response_metadata["served_model"] (Brief 3B Step 1,
+    provenance). Nothing else changes: same requests, same text."""
+
+    def _create_chat_result(self, response, generation_info=None):
+        result = super()._create_chat_result(response, generation_info)
+        raw = response.get("model") if isinstance(response, dict) else getattr(response, "model", None)
+        served = raw if isinstance(raw, str) and raw.strip() else None
+        for generation in result.generations:
+            generation.message.response_metadata["served_model"] = served
+        return result
+
+
 def get_llm(
     provider_name: str,
     model_name: str = "deepseek-v4-flash",
@@ -59,7 +78,7 @@ def get_llm(
     #    see LESSONS_LEARNED.md #56), meaning a hung connection blocks its
     #    asyncio.to_thread slot forever instead of eventually raising into
     #    the existing retry path.
-    llm = ChatOpenAI(
+    llm = ServedModelChatOpenAI(
         model=model_name,
         api_key=api_key or (config.api_key if config.api_key else "dummy"),
         base_url=config.base_url,

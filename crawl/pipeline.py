@@ -28,7 +28,8 @@ from crawl.circuit_breaker import BreakerStopped, LlmCircuitBreaker
 from crawl.frontier import ROBOTS_DISALLOWED_ERROR, Frontier, FrontierRow
 from crawl.politeness import HostPoliteness
 from crawl.robots_cache import RobotsCache
-from crawl.scope import normalize_url
+from crawl.scope import fetch_form, normalize_url
+from crawl.provenance import call_served_model
 from crawl.timing import call_usage
 from content.sectioning import DEFAULT_SECTION_DEPTH, derive_section
 from storage.writer import Writer
@@ -364,10 +365,17 @@ async def crawl_worker(
     fatal_error_sink: list[str] | None = None,
     timing: TimingLog | None = None,
     site_backoff: bool = False,
+    use_fetch_urls: bool = False,
 ) -> None:
     """site_backoff (config.SITE_RETRY_BACKOFF; off = today's immediate
     re-fetch): a site's 429/503 re-queues the page after doubling_backoff
-    (the site's Retry-After, else 5s doubling per retry). Still a retry."""
+    (the site's Retry-After, else 5s doubling per retry). Still a retry.
+
+    use_fetch_urls (headless contract v2 only; ROADMAP #53): robots.txt is
+    checked against, and the page fetched at, the form the URL was first
+    discovered in (Frontier.fetch_url_for: e.g. with its trailing slash),
+    and each child's request form is recorded. Row identity is unchanged.
+    Off: exactly today's behaviour."""
     while True:
         # Checked before claim() too, not just in the row-is-None branch
         # below -- lets a fatal BrowserDriverError (set by any worker,
@@ -383,11 +391,12 @@ async def crawl_worker(
             await asyncio.sleep(poll_interval)
             continue
 
+        target = await frontier.fetch_url_for(row.url) if use_fetch_urls else row.url
         policy = None
         if robots_cache is not None:
             policy = await robots_cache.get_policy(row.host)
-            if not policy.is_allowed(row.url):
-                print(f"[robots] disallowed by robots.txt, skipping: {row.url}")
+            if not policy.is_allowed(target):
+                print(f"[robots] disallowed by robots.txt, skipping: {target}")
                 await frontier.mark_permanently_failed(row.url, ROBOTS_DISALLOWED_ERROR)
                 continue
 
@@ -403,13 +412,13 @@ async def crawl_worker(
         try:
             async with gate:
                 if timing is None:
-                    html, raw_hrefs = await fetch_fn(row.url)
+                    html, raw_hrefs = await fetch_fn(target)
                 else:
                     # Timed inside the politeness gate: fetch time only,
                     # not time spent waiting for the per-host slot.
                     fetch_started = time.perf_counter()
                     try:
-                        html, raw_hrefs = await fetch_fn(row.url)
+                        html, raw_hrefs = await fetch_fn(target)
                     except Exception as e:
                         timing.record("fetch", url=row.url, seconds=_since(fetch_started),
                                       outcome=type(e).__name__)
@@ -450,14 +459,19 @@ async def crawl_worker(
             continue
 
         children = []
+        request_forms = []
         for href in raw_hrefs:
-            normalized = normalize_url(href, row.url)
+            normalized = normalize_url(href, target if use_fetch_urls else row.url)
             if normalized is None:
                 continue
             if not scope_check(normalized):
                 continue
             children.append((normalized, row.section_label))
+            if use_fetch_urls:
+                request_forms.append((normalized, fetch_form(href, target)))
 
+        if request_forms:
+            await frontier.record_fetch_urls(request_forms)
         await frontier.insert_children(row.url, row.depth, children)
         if timing is not None:
             timing.mark_enqueued(row.url)
@@ -486,6 +500,7 @@ async def extract_worker(
     breaker: LlmCircuitBreaker | None = None,
     scraper_version: str | None = None,
     llm_unavailable_max_releases: int = 0,
+    record_builder: Callable[..., dict] | None = None,
 ) -> None:
     """unit_concurrency (config.EXTRACT_UNIT_CONCURRENCY, default 1): how
     many of one page's extraction units -- and, with a quality_backend, its
@@ -505,7 +520,13 @@ async def extract_worker(
     off): a ProviderUnavailableError releases the page with doubling_backoff
     and no retry used, at most this many times per page per run
     (Frontier.release_llm_unavailable); the next one fails the page. The
-    breaker neither counts nor resets on these: it only sees 429s."""
+    breaker neither counts nor resets on these: it only sees 429s.
+
+    record_builder (headless contract v2 only): called as
+    record_builder(fields, served_model=...) for each pair instead of
+    build_canonical_record(**fields); served_model is what the provider's
+    response said it ran for that unit's call (crawl.provenance). None:
+    build_canonical_record, exactly as before."""
     if unit_concurrency < 1:
         raise ValueError(f"unit_concurrency must be >= 1, got {unit_concurrency}")
 
@@ -556,6 +577,7 @@ async def extract_worker(
                 permit = await breaker.acquire() if breaker is not None else None
                 if timing is not None:
                     call_usage.set(None)  # never attribute a previous call's usage to this one
+                call_served_model.set(None)
                 async with sem if sem is not None else nullcontext():
                     call_started = time.perf_counter()
                     try:
@@ -567,6 +589,7 @@ async def extract_worker(
                             continue  # back to the gate; retry this same unit
                         raise
                     call_seconds = _since(call_started)
+                    served_model = call_served_model.get()  # this call's, read in the same task
                 if breaker is not None:
                     breaker.success(permit)
                 break
@@ -603,16 +626,20 @@ async def extract_worker(
                     )
                     if quality_score < active_threshold:
                         continue
-                records.append(build_canonical_record(
-                    question=pair["instruction"], answer=pair["response"],
-                    source_chunk=unit, chunk_index=chunk_index, source_url=url, section=section,
-                    page_title=page_title, generation_model=generation_model,
-                    extraction_strategy=extraction_strategy,
-                    timestamp=timestamp, crawl_date=crawl_date,
-                    license_signal=license_signal,
-                    quality_score=quality_score, quality_decision_method=quality_method,
-                    scraper_version=scraper_version,
-                ))
+                fields = {
+                    "question": pair["instruction"], "answer": pair["response"],
+                    "source_chunk": unit, "chunk_index": chunk_index, "source_url": url, "section": section,
+                    "page_title": page_title, "generation_model": generation_model,
+                    "extraction_strategy": extraction_strategy,
+                    "timestamp": timestamp, "crawl_date": crawl_date,
+                    "license_signal": license_signal,
+                    "quality_score": quality_score, "quality_decision_method": quality_method,
+                    "scraper_version": scraper_version,
+                }
+                if record_builder is None:
+                    records.append(build_canonical_record(**fields))
+                else:
+                    records.append(record_builder(fields, served_model=served_model))
             return records
 
         return process_unit

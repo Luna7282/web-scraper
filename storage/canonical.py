@@ -71,6 +71,31 @@ def build_canonical_record(
     return record
 
 
+# --- canonical row schema v2 (headless contract v2, Brief 3B) ---------------
+# v1 rows (above) carry no schema_version and stay byte-identical. v2 rows add
+# a header (schema_version, record_type), keep the generator's own fields and
+# the common fields at the top level (so exporters still find question/answer
+# on qa rows), and move scraper_version into a provenance block that says
+# exactly what produced the row and from where.
+SCHEMA_VERSION_V2 = 2
+PROVENANCE_FIELDS = ("generator", "provider", "model", "pinned_version", "served_model", "endpoint",
+                     "scraper_version", "run_id", "prompt_sha256")
+
+
+def build_canonical_record_v2(fields: dict, *, record_type: str, provenance: dict,
+                              served_model: str | None) -> dict:
+    """fields: what build_canonical_record takes (scraper_version moves into
+    provenance). provenance: every PROVENANCE_FIELDS key except served_model,
+    which is per call (None when the provider's response named no model)."""
+    missing = [k for k in PROVENANCE_FIELDS if k != "served_model" and k not in provenance]
+    if missing:
+        raise ValueError(f"provenance missing {missing}")
+    record = {"schema_version": SCHEMA_VERSION_V2, "record_type": record_type}
+    record.update({k: v for k, v in fields.items() if k != "scraper_version"})
+    record["provenance"] = {k: (served_model if k == "served_model" else provenance[k]) for k in PROVENANCE_FIELDS}
+    return record
+
+
 _H1_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 _MD_LINK_RE = re.compile(r"\[.*?\]\(.*?\)")
 

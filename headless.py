@@ -34,7 +34,7 @@ from pathlib import Path
 
 import config
 
-SUPPORTED_CONTRACT_VERSIONS = (1,)
+SUPPORTED_CONTRACT_VERSIONS = (1, 2)
 
 # Exit codes for v1 runs (legacy keeps 0 / 1, and 0 on Ctrl-C).
 EXIT_OK = 0
@@ -50,6 +50,10 @@ RUN_KEYS = ("mode", "run_dir", "seeds", "host_prefix_pairs", "intent", "provider
 REQUIRED_KEYS = ("contract_version", "mode", "run_dir", "seeds", "host_prefix_pairs")
 V1_KEYS = ("contract_version", "run_id", "resume", "settings", "api_key_env")
 ALLOWED_KEYS = frozenset(RUN_KEYS + V1_KEYS)
+# Contract v2 (Brief 3B) = every v1 key plus these. A v1 config using one is
+# refused as an unknown key, exactly as before.
+V2_KEYS = ("model_pinned_version",)
+ALLOWED_KEYS_BY_VERSION = {1: ALLOWED_KEYS, 2: frozenset(ALLOWED_KEYS | set(V2_KEYS))}
 MODES = ("crawl", "map")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
@@ -111,7 +115,7 @@ def validate(cfg: dict, environ: Mapping[str, str] | None = None) -> HeadlessRun
     if type(version) is not int or version not in SUPPORTED_CONTRACT_VERSIONS:
         raise HeadlessConfigError(f"unsupported contract_version {version!r}; this scraper supports "
                                   f"{list(SUPPORTED_CONTRACT_VERSIONS)} (integer)")
-    unknown = sorted(set(cfg) - ALLOWED_KEYS)
+    unknown = sorted(set(cfg) - ALLOWED_KEYS_BY_VERSION[version])
     if unknown:
         raise HeadlessConfigError(f"unknown config keys: {', '.join(unknown)}")
     missing = [k for k in REQUIRED_KEYS if k not in cfg]
@@ -127,6 +131,9 @@ def validate(cfg: dict, environ: Mapping[str, str] | None = None) -> HeadlessRun
         raise HeadlessConfigError("resume must be true or false")
     if "run_id" in cfg and (not isinstance(cfg["run_id"], str) or not _RUN_ID.match(cfg["run_id"])):
         raise HeadlessConfigError("run_id must be 1-128 characters: letters, digits, '.', '_', '-'")
+    if "model_pinned_version" in cfg and (not isinstance(cfg["model_pinned_version"], str)
+                                          or not cfg["model_pinned_version"].strip()):
+        raise HeadlessConfigError("model_pinned_version must be a non-empty string")
     api_key_env = cfg.get("api_key_env")
     if api_key_env is not None:
         if not isinstance(api_key_env, str) or not _ENV_NAME.match(api_key_env):
@@ -224,9 +231,11 @@ _ABS_PATH = re.compile(r"(?:[A-Za-z]:\\|/)(?:[^\s'\"<>|]+)")
 
 @dataclass(frozen=True)
 class RunContext:
-    """What a v1 run knows about itself, passed to headless_run (legacy: None)."""
+    """What a versioned run knows about itself, passed to headless_run (legacy: None)."""
     run_id: str
     scraper_version: str
+    contract_version: int = 1
+    model_pinned_version: str | None = None   # v2: defaults to the model when None
 
 
 def new_run_id(clock=time.time) -> str:
@@ -340,6 +349,8 @@ def build_result(*, outcome: str, exit_code: int, contract_version: int | None, 
     if run_result.get("stop") is not None:
         result["signal"] = run_result.get("stopped_by_signal")
         result["stop"] = run_result["stop"]
+    if run_result.get("sources") is not None:   # contract v2 only
+        result["sources"] = run_result["sources"]
     if error is not None:
         result["error"] = error
     return result

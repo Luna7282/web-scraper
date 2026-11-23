@@ -1,10 +1,12 @@
 import argparse
 import asyncio
+import hashlib
 from datetime import UTC, datetime
 import json
 import os
 import sys
 import time
+from urllib.parse import urlparse
 
 import requests
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
@@ -20,10 +22,13 @@ from crawl import graceful
 from llm_factory import get_llm
 from crawl.discovery import discover_branches, fetch_page_links
 from crawl.scope import normalize_url, derive_prefix, is_in_scope
-from crawl.frontier import Frontier
+from crawl.frontier import ROBOTS_DISALLOWED_ERROR, Frontier
+from crawl.sources import SourceRecorder
+from storage.canonical import build_canonical_record_v2
 from crawl.pipeline import crawl_worker, extract_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError, ProviderUnavailableError, TRANSIENT_PROVIDER_STATUSES
 from crawl.politeness import HostPoliteness
 from crawl.timing import TimingLog, call_usage, usage_from_message
+from crawl.provenance import call_served_model, served_model_from_message
 from crawl.circuit_breaker import LlmCircuitBreaker
 from content.extraction import QA_EXTRACTION_SYSTEM_PROMPT, CODE_QA_EXTRACTION_SYSTEM_PROMPT
 from crawl.branch_select import suggest_branch_selection, BRANCH_CLASSIFICATION_SYSTEM_PROMPT
@@ -267,7 +272,8 @@ async def headless_map(cfg: dict) -> dict:
 
 
 async def headless_crawl(cfg: dict, api_key: str | None = None, context: "headless.RunContext | None" = None,
-                         *, _crawler_factory=None, _fetch_fn_factory=None, _extract_fn=None) -> dict:
+                         *, _crawler_factory=None, _fetch_fn_factory=None, _extract_fn=None,
+                         _http_fetch=None) -> dict:
     """Non-interactive equivalent of main() -- same worker wiring, same
     RAG/threshold/provider logic, just no Prompt.ask calls. See
     headless_map's docstring for the seeds/host_prefix_pairs contract and
@@ -286,7 +292,7 @@ async def headless_crawl(cfg: dict, api_key: str | None = None, context: "headle
         stop.install(loop)
     try:
         return await _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _fetch_fn_factory,
-                                          _extract_fn)
+                                          _extract_fn, _http_fetch)
     finally:
         if stop is not None:
             stop.uninstall(loop)
@@ -307,8 +313,10 @@ def _second_signal_exit(run_dir: str, context: "headless.RunContext"):
     return on_second
 
 
-async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _fetch_fn_factory, _extract_fn):
+async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _fetch_fn_factory, _extract_fn,
+                               _http_fetch=None):
     config.validate_system_one_config()
+    v2 = context is not None and context.contract_version >= 2
     run_dir = cfg["run_dir"]
     os.makedirs(run_dir, exist_ok=True)
     db_path = os.path.join(run_dir, "frontier.db")
@@ -326,6 +334,8 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
     await frontier.open()
     await frontier.recover_crashed()
     await frontier.seed(seeds)
+    if v2:
+        await frontier.enable_fetch_urls()
 
     embed_fn = _make_embed_fn(embeddings)
     intent_embedding = await embed_fn(intent) if intent else None
@@ -334,7 +344,10 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
     extraction_units_fn = make_extraction_units_fn(
         config.EXTRACTION_STRATEGY, embed_fn=embed_fn, intent_embedding=intent_embedding,
     )
-    robots_cache = RobotsCache(_http_get_text)
+    recorder = SourceRecorder() if v2 else None
+    robots_cache = RobotsCache(_recording_text_fetch(recorder, _http_fetch or _http_get_status_text)
+                               if v2 else _http_get_text)
+    record_builder = _make_v2_record_builder(context, provider_name, model_name, llm) if v2 else None
 
     quality_backend = make_quality_backend(_make_decision_chat_fn(llm)) if cfg.get("enable_quality_scoring") else None
     # None (unset): extract_worker looks up the per-method default itself
@@ -378,7 +391,10 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
                                                                 "waited_seconds": 0.0, "released_rows": 0}}
 
     async with (_crawler_factory or AsyncWebCrawler)() as crawler:
-        fetch_fn = (_fetch_fn_factory or _make_fetch_fn)(crawler)
+        if _fetch_fn_factory is not None:
+            fetch_fn = _fetch_fn_factory(crawler)
+        else:
+            fetch_fn = _make_fetch_fn(crawler, observer=recorder.observe_page if v2 else None)
         content_queue = asyncio.Queue(maxsize=max(4, crawl_workers_n * 2))
         results_queue = asyncio.Queue(maxsize=max(4, extract_workers_n * 2))
         politeness = HostPoliteness(
@@ -394,7 +410,8 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
         tasks = [
             asyncio.create_task(
                 crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness,
-                             fatal_error_sink=fatal_errors, timing=timing, site_backoff=config.SITE_RETRY_BACKOFF)
+                             fatal_error_sink=fatal_errors, timing=timing, site_backoff=config.SITE_RETRY_BACKOFF,
+                             use_fetch_urls=v2)
             )
             for _ in range(crawl_workers_n)
         ] + [
@@ -407,7 +424,8 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
                                 quality_backend=quality_backend, quality_threshold=quality_threshold,
                                 timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY,
                                 breaker=breaker, scraper_version=context.scraper_version if context else None,
-                                llm_unavailable_max_releases=config.LLM_UNAVAILABLE_MAX_RELEASES)
+                                llm_unavailable_max_releases=config.LLM_UNAVAILABLE_MAX_RELEASES,
+                                record_builder=record_builder)
             )
             for _ in range(extract_workers_n)
         ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
@@ -432,8 +450,14 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
     # Leaving `async with` closed the crawler -- and with it Chromium.
 
     counts = await frontier.counts_by_status()
+    sources = None
+    if v2:
+        sources = recorder.build(await frontier.robots_disallowed_by_host(ROBOTS_DISALLOWED_ERROR))
+        await asyncio.to_thread(_write_json_atomic, os.path.join(run_dir, SOURCES_FILE), sources)
     await frontier.close()
     result = {"mode": "crawl", "counts_by_status": counts, "fatal_errors": fatal_errors}
+    if sources is not None:
+        result["sources"] = sources
     if stop_info is not None:
         result.update({"stopped_by_signal": stop.signal_name, "stop": stop_info})
     return result
@@ -496,7 +520,9 @@ def headless_v1_entry(cfg: dict, run=None, out=None, err=None, environ=None, ver
                       error={"type": "HeadlessConfigError", "message": str(e)}, print_line=False)
     repaired = headless.repair_canonical_tail(hr.cfg["run_dir"], run_id) if resumed_from is not None else None
     api_key = environ[hr.api_key_env].strip() if hr.api_key_env else None
-    context = headless.RunContext(run_id=run_id, scraper_version=version["version"])
+    context = headless.RunContext(run_id=run_id, scraper_version=version["version"],
+                                  contract_version=hr.contract_version,
+                                  model_pinned_version=hr.cfg.get("model_pinned_version"))
     run = headless_run if run is None else run
     common = {"hr": hr, "run_id": run_id, "resumed_from": resumed_from, "repaired": repaired}
     try:
@@ -854,6 +880,57 @@ async def _http_get_text(url: str) -> str | None:
     return await asyncio.to_thread(_get)
 
 
+async def _http_get_status_text(url: str) -> tuple[int | None, str | None]:
+    """(status, text) -- None status when the request itself failed. Contract
+    v2's robots fetch, so a source record can tell 404 from a failure."""
+    def _get():
+        try:
+            resp = requests.get(url, timeout=15, headers={"User-Agent": HTTP_USER_AGENT})
+            return resp.status_code, resp.text
+        except Exception:  # noqa: BLE001 -- any request failure is the record's "fetch_failed"
+            return None, None
+    return await asyncio.to_thread(_get)
+
+
+def _recording_text_fetch(recorder: SourceRecorder, fetch_status_text):
+    """RobotsCache's fetch (text or None), recording robots.txt's status and
+    text for the source record on the way."""
+    async def fetch(url: str) -> str | None:
+        status, text = await fetch_status_text(url)
+        if urlparse(url).path == "/robots.txt":
+            recorder.record_robots(url, status, text)
+        return text if status == 200 else None
+    return fetch
+
+
+SOURCES_FILE = "sources.json"
+
+
+def _write_json_atomic(path: str, data) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def _make_v2_record_builder(context: "headless.RunContext", provider_name: str, model_name: str, llm):
+    """Canonical row schema v2 (storage/canonical.py) with this run's
+    provenance. The generator is fixed to qa@1 until generators are pluggable
+    (Brief 3B Step 4)."""
+    prompt = _EXTRACTION_SYSTEM_PROMPTS[config.EXTRACTION_PROMPT_VARIANT]
+    provenance = {
+        "generator": {"name": "qa", "version": 1}, "provider": provider_name, "model": model_name,
+        "pinned_version": context.model_pinned_version or model_name,
+        "endpoint": getattr(llm, "openai_api_base", None), "scraper_version": context.scraper_version,
+        "run_id": context.run_id, "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+    }
+
+    def build(fields: dict, served_model: str | None) -> dict:
+        return build_canonical_record_v2(fields, record_type="qa", provenance=provenance, served_model=served_model)
+    return build
+
+
 def _start_timing_log(
     run_dir: str, provider_name: str, model_name: str, crawl_workers_n: int,
     extract_workers_n: int, max_pages: int | None, quality_scoring: bool, run_id: str | None = None,
@@ -911,7 +988,7 @@ async def _stop_timing_log(timing: TimingLog | None) -> None:
         await timing.close()  # writes run_end (wall_seconds) and flushes
 
 
-def _make_fetch_fn(crawler: AsyncWebCrawler):
+def _make_fetch_fn(crawler: AsyncWebCrawler, observer=None):
     """Shares one AsyncWebCrawler instance across every crawl_worker call
     -- matching orchestrator.py's existing pattern, not spinning up a new
     browser context per fetch. Live crawl bypasses crawl4ai's cache
@@ -953,6 +1030,8 @@ def _make_fetch_fn(crawler: AsyncWebCrawler):
             if "Connection closed while reading from the driver" in error_message:
                 raise BrowserDriverError(error_message)
             raise FetchTimeout(error_message)
+        if observer is not None:  # contract v2: source-record evidence (headers, raw HTML)
+            observer(url, result.response_headers, result.html)
         links = result.links.get("internal", []) + result.links.get("external", [])
         raw_hrefs = [l.get("href", "") for l in links if l.get("href")]
         markdown = strip_text_patterns(normalize_link_text(result.markdown))
@@ -999,6 +1078,7 @@ def _make_extract_fn(llm, prompt_variant: "config.ExtractionPromptVariant" = Non
             if config.LLM_UNAVAILABLE_MAX_RELEASES > 0 and _provider_status(e) in TRANSIENT_PROVIDER_STATUSES:
                 raise ProviderUnavailableError.from_provider_error(e) from e
             raise
+        call_served_model.set(served_model_from_message(response))
         if record_usage:
             call_usage.set(usage_from_message(response))
         return response.content
