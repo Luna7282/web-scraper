@@ -549,6 +549,27 @@ stayed `running` the whole time, and unpausing resumed immediately.
   (`fatal_errors`), 2 config error (one line on stderr, no traceback),
   130 SIGINT, 143 SIGTERM. Legacy keeps 0 / 1, and Ctrl-C there still
   exits 0.
+- **v1 run identity and outputs (Step 2):**
+  - **`run_id`:** from the config, else generated.
+  - **`result.json`:** written atomically for every outcome: `ok`,
+    `stopped_early`, `interrupted`, `crashed`, and `config_error` when the
+    run_dir exists and holds no earlier run (**never clobber an earlier
+    result**, and never create a missing run_dir). It holds the contract
+    version, run id, scraper version (git commit + dirty flag, else
+    `0.1.0+unknown`), outcome and exit code, effective settings with
+    sources, counts, fatal errors, the key variable's name and set/not-set,
+    and for a crash the error type plus a message with paths and keys
+    removed. The same result is the stdout line, even if the file can't be
+    written.
+  - **Resume:** a run_dir holding scraper state (`frontier.db`,
+    `canonical.jsonl`, `timings.jsonl`, `result.json`; other files don't
+    count) is refused unless `"resume": true`, and `resume` with nothing to
+    resume is refused. On resume the old result is kept as
+    `result.<previous run id>.json` and the new one records
+    `resumed_from_run_id`.
+  - **Stamps:** timing events carry `run_id`, and canonical rows carry
+    `scraper_version`, in v1 only. Legacy output is byte-identical, so pass
+    `None` for both outside v1.
 - **Tests that apply settings must restore `config`.**
   `tests/test_headless_contract.py`'s `ConfigGuard` fails a test that
   leaves it changed.

@@ -291,7 +291,11 @@ section for the design reasoning.
   **2** config error (one line on stderr, no traceback), **130**
   interrupted (SIGINT), **143** stopped by SIGTERM. A config **without**
   `contract_version` is legacy headless, unchanged (exit 0 / 1). That's
-  what the control server sends.
+  what the control server sends. v1 runs also write `<run_dir>/result.json`
+  for every outcome (crashes included), refuse a run_dir that already holds
+  a run unless `"resume": true` (the old result is kept as
+  `result.<previous run id>.json`), and stamp timing events with the run id
+  and canonical rows with the scraper version.
 
 ## Architecture
 

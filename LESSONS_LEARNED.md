@@ -5496,3 +5496,46 @@ otherwise mean 1). Env values are parsed exactly as `config.py` parses them
 at import, so precedence never changes how a value is read. A
 `ConfigGuard` on every settings test fails if the config module is left
 changed (owner's addition).
+
+### 88. Brief 3A Step 2: result.json, resume rule, run ids and scraper version, finished after a mid-step usage cut-off
+
+**Built** (`900ba06` hooks, `fd63b65` code, `fb11f1c` tests; branch
+`brief-3a-contract`, not merged): `result.json` for every v1 outcome,
+crashes included; the scraper version in results and v1 rows; the
+run_dir resume rule with archiving; run ids on timing events. 23 tests;
+full suite 582 on two runs, only the 10 known #50 failures.
+
+**Resuming after the cut-off:** the previous session stopped with Step 2's
+code written but untested and uncommitted. Before touching it:
+`git status` / `git diff --stat` confirmed exactly the six expected files.
+Several other files had been reported "changed on disk", but they had no
+uncommitted diff (they matched their commits). The hook diffs were read
+line by line, and the 53 affected tests re-run. **Lesson:** after an
+interruption, prove the tree's state from git, not from memory or tool
+notices.
+
+**Decisions worth keeping:**
+- **A config error never overwrites an earlier run's result.** If the
+  run_dir already holds scraper state (the exact case "refuse a non-empty
+  run_dir" catches), writing a `config_error` result.json would destroy the
+  previous run's record. So a config result is written only into a run_dir
+  that exists and holds no run, and a missing run_dir is never created.
+- **Crash messages are cleaned, not dropped:** exception type plus message
+  with absolute paths → `<path>` and key-shaped strings → `[redacted]`,
+  capped. stderr gets the same single line, never a traceback (a traceback
+  can echo a provider error containing a key).
+- **"Legacy byte-identical" was proven against the previous commit, not
+  assumed:** `storage/canonical.py` and `crawl/timing.py` from git HEAD were
+  loaded beside the working tree and fed the same inputs. Identical bytes
+  for rows, identical values and key order for events. The permanent tests
+  pin the exact legacy key lists.
+- **Resume archives never overwrite:** an unreadable previous result becomes
+  `result.unknown-<time>.json`, and an existing `result.<id>.json` gets a
+  time suffix.
+
+**Fixed on resume:** two ruff findings the cut-off left in
+`headless_v1_entry` (`datetime.now(timezone.utc)` → `datetime.UTC`, and a
+nested `if` folded into one). `main.py` is back to HEAD's count. Seen in
+passing: this session's shell had `VIRTUAL_ENV` pointing at foundry's venv.
+uv ignored it with a warning and used `web-scraper/.venv`; commands now run
+with it unset (see the uv section of this file's companion `CLAUDE.md`).
