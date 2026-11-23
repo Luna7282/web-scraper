@@ -1317,3 +1317,13 @@ we resume building: #1 (branch scope) and #2 (lockfile) are both small and
 block trusting anything else the tool produces — the tool currently can't
 reliably scope a crawl, and the environment that made everything else work
 isn't reproducible.*
+
+69. **[Done 2026-11-24, branch `items-mode`, foundry P1 Step 2] Items mode.**
+    A contract v2 key, `items_mode: true`: fetch + clean, one page record per
+    page in `items.jsonl`, zero LLM calls, plus the usual source records.
+    Connector work under #67. Chunking, generation, verification and
+    balancing happen in foundry. Adding the key changes `headless.V2_KEYS`,
+    so foundry's drift guard is updated in the same P1 step. **Open:** page
+    records carry no HTTP status or response headers, because the
+    content queue passes only (url, markdown). Add them only if a consumer
+    needs them.
