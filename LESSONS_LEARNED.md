@@ -5884,3 +5884,9 @@ happened, and no key was loaded.
 - Suites: fast 748 and slow 748, only the 10 known #50 control-server
   failures. Golden v1 / legacy byte tests OK. No new lint findings in the
   touched files.
+- **Real run (foundry P1, 2026-11-23, 3 fastapi pages, `3dc45c5`):** 3 page
+  records, outcome `ok`. All 3 `content_sha256` equal the Brief 2d dry pass's
+  `page_fingerprints`. The timing log has only `run_start` / `fetch` /
+  `run_end`, and a provider-construction guard injected into the process
+  logged 0 hits. Fetch spacing was 1.00s start to start. Note: a `fetch`
+  event's `ts` is when the fetch *ended*, so `ts` gaps understate spacing.
