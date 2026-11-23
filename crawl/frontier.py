@@ -692,6 +692,42 @@ class Frontier:
         """Stop handing out new rows; work already claimed carries on."""
         self._draining = True
 
+    # -- headless contract v2: request forms and robots counts (Brief 3B Step 1) --
+    # A SIDE table, created only by v2 runs, so legacy/v1 frontier.db files are
+    # never altered. Maps a row's identity (normalize_url) to the form it was
+    # first discovered in, when that differs (a trailing slash: ROADMAP #53).
+    async def enable_fetch_urls(self) -> None:
+        async with self._lock:
+            await self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS fetch_urls (url TEXT PRIMARY KEY, fetch_url TEXT NOT NULL)")
+            await self._conn.commit()
+
+    async def record_fetch_urls(self, pairs: list[tuple[str, str]]) -> None:
+        """(identity url, request url) pairs; first discoverer wins, like parent_url."""
+        differing = [(u, f) for u, f in pairs if f != u]
+        if not differing:
+            return
+        async with self._lock:
+            await self._conn.executemany("INSERT OR IGNORE INTO fetch_urls (url, fetch_url) VALUES (?, ?)", differing)
+            await self._conn.commit()
+
+    async def fetch_url_for(self, url: str) -> str:
+        async with self._lock:
+            cur = await self._conn.execute("SELECT fetch_url FROM fetch_urls WHERE url = ?", (url,))
+            row = await cur.fetchone()
+        return row[0] if row else url
+
+    async def robots_disallowed_by_host(self, robots_error: str) -> dict[str, dict]:
+        """host -> {"urls": rows failed by robots.txt, "seeds": depth-0 rows,
+        "seeds_disallowed": depth-0 rows failed by robots.txt}."""
+        async with self._lock:
+            cur = await self._conn.execute(
+                "SELECT host, SUM(last_error = ?), SUM(depth = 0), SUM(depth = 0 AND last_error = ?) "
+                "FROM frontier GROUP BY host", (robots_error, robots_error))
+            rows = await cur.fetchall()
+        return {h.lower(): {"urls": int(u or 0), "seeds": int(s or 0), "seeds_disallowed": int(sd or 0)}
+                for h, u, s, sd in rows}
+
     async def release_llm_unavailable(self, url: str, reason: str, backoff_for, max_releases: int) -> bool:
         """A transient provider error (5xx) on this page: put it back in
         'queued' with not_before = backoff_for(n) seconds, where n is this

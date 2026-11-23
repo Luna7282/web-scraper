@@ -5640,3 +5640,220 @@ and provider, timings shrunk by patch, config verified restored after each.
 **Not done:** host-level slowdown on site 429s (still ROADMAP #52), the
 interactive path (opt-in via env only), and quality-scoring calls (their
 5xx still take the generic path).
+
+### 91. Brief 3B Step 1: provenance and source records. langchain names the model you asked for, and making version 2 valid made a test crawl for real
+
+**Built** (`69fd8fc` sources, `652d501` request form, `476a82e` contract
+v2 wiring, `d7d3ed7` 21 tests): contract v2 (v1 + `model_pinned_version`);
+canonical row schema v2 with a provenance block; per-site source records;
+the ROADMAP #53 fix for v2.
+
+**Found by reading, then tested:**
+- **The served model isn't what langchain reports.** `ChatOpenAI` sets
+  `model_name` to `response.get("model", self.model_name)`. When a provider
+  omits the field, that's the model *requested*, so "the provider said X"
+  and "we asked for X" look identical. `ServedModelChatOpenAI` stores the
+  raw field (None if absent).
+- **The check runs through a real `invoke()`** over an
+  `httpx.MockTransport`, not just a unit call. That proves langchain's own
+  metadata merging keeps the key.
+
+**Incident:** `TestRealProcess` spawned the real `main.py` with
+`contract_version: 2` to prove it exits 2. Once version 2 was valid, that
+test **ran a real v2 crawl** into `/tmp/x`:
+- **What it did:** launched Chromium and tried DNS for `example.test`, a
+  reserved TLD that never resolves. The robots fetch failed, the one page
+  failed, and no LLM call was made.
+- **Knock-on effect:** the leftover `/tmp/x` then broke four unrelated
+  tests, which assumed that path didn't exist.
+- **Fix:** the test now uses an unsupported version (3); the shared helper's
+  run_dir is a path that can't exist; `/tmp/x` was removed after checking
+  every file in it came from today's run.
+- **Lesson:** a test that proves "X is refused" by actually running the
+  program turns into a real run the day X becomes valid. Such tests need a
+  config that can't run for a second reason too.
+
+**Fixture facts:**
+- **fastapi:** its robots.txt *discusses* content signals in comments but
+  has no `Content-Signal:` directive, so its record correctly says
+  `none_found`.
+- **blog.cloudflare.com:** `ai-train=yes, search=yes, ai-input=yes`.
+
+**Side effect:** foundry's drift guard fails while this branch is checked
+out (`SUPPORTED_CONTRACT_VERSIONS (1, 2)` vs its `(1,)`). The guard should
+accept a scraper that still supports v1 (foundry ROADMAP #13).
+
+### 92. Brief 3B Step 2 and the network guard: the guard paid for itself on its first run
+
+**Network guard** (`b13a69d`): any non-localhost socket, DNS lookup or
+Chromium launch fails a fast-suite test. That holds in child Pythons too
+(via `sitecustomize` on `PYTHONPATH`), and when the code under test
+swallows the error. On its first run it found:
+- **Two tests launching real Chromium in the fast suite**
+  (`test_fetch_fn_integration`, offline `raw:` HTML). They're in the slow
+  suite now, marked allowed.
+- **A real call during Step 2:** the Step 1 v2 run test, once the provider
+  preflight existed, tried to reach ollama.com. It was blocked before any
+  connection. The preflight is now off in that test, and preflight has its
+  own fake-provider tests.
+
+**Byte-identity** (`50355c6`): before this, "v1 rows unchanged" was only
+checked by key order. Now a deterministic headless run is compared
+byte-for-byte with output from `git archive 1112ad7`, for v1 and legacy.
+
+**Step 2** (`da3b04b`):
+- **Preflights,** the **dry pass** and **cost accounting** (CLAUDE.md,
+  contract v2).
+- **Token basis, measured not assumed:** 4.215 input chars per token
+  including the system prompt, and output = 2.4504 × input. Both come from
+  the Brief 2c run's 52 calls, all of which reported usage.
+- **Deviation:** dry-pass pages are `mapped`, not a new status. The
+  frontier's `status` CHECK constraint lives in `CREATE TABLE`, so a new
+  status would change every new `frontier.db`, legacy included.
+
+### 93. Brief 3B dry pass and Step 3: the dry pass matched a real run unit for unit; caps measured on two real datasets
+
+**First real dry pass** (approved; 3 Brief 2c fastapi pages, robots + 3
+fetches, Chromium, zero LLM calls: no key in the environment,
+`SCRAPER_LOAD_DOTENV=0`, provider preflight off):
+- **Units per page:** root 32, `/features/` 10, `/tutorial/` 10, 52 in all.
+  Identical to Brief 2c's 52 real extraction calls.
+- **Brief 2c stored no content hash,** so the comparison used what it did
+  store. Every one of the 52 units has the same length as that call's
+  `chars_in` in Brief 2c's `timings.jsonl`. The 42 units that produced rows
+  have byte-identical text to their rows' `source_chunk`. The other 10 have
+  no rows, so only their length could be compared.
+- **Fingerprints for next time** (`6ce315b`): `estimate.json` now records
+  each page's content SHA-256 and every unit's SHA-256 and length.
+- **The token estimate** (26,095 input) is within 2 tokens of Brief 2c's
+  real 26,097, but that's circular: the basis was derived from that same
+  run. It says nothing yet about other sites, models or prompts.
+- **Source record:** robots `allowed`, `ai_training_signal` `none_found`
+  (no `Content-Signal` line, no AI-agent groups). Licence evidence came
+  only from Font Awesome's comment inside an inline SVG: a third-party
+  licence, not the site's (ROADMAP #63).
+
+**Step 3: source balancing** (`76e9253`, `content/balance.py`):
+- **What was built:**
+  - row caps per page and per source, per record type;
+  - a low-value heuristic (changelog / index, with reasons) with skip,
+    cap or keep, plus `low_value_overrides`;
+  - a `balance` section in `result.json`.
+- **Keep rule:** round-robin across a page's units. For a 315-unit
+  changelog capped at 25, that keeps the first row of the first 25 units,
+  which on fastapi is the 25 newest releases.
+- **Recompute, offline, on the two real datasets:**
+  - **Brief 1** (5,986 rows): release notes were 72%. The heuristic flags
+    only that page, on all three signals (path, title, 382 version
+    headings), and none of the other 26.
+    - The low-value cap alone leaves 1,703 rows, largest page 14.2%.
+    - With the defaults (100 per page, low-value cap 25): 1,417 rows, 7
+      pages at 100, largest share 7.1%.
+  - **Brief 2c** (276 rows): nothing is flagged. The root page goes from
+    162 rows to 100, and its share from 58.7% to 46.7%. With 3 pages a cap
+    can't push the share much lower (ROADMAP #64).
+- **Defaults kept as proposed:** 100 per page, no per-source cap, policy
+  `cap`, low-value cap 25.
+- **Measurement caveat:** the recompute sees each page only through its
+  rows' `source_chunk`. Units that produced no rows are invisible, and
+  that only matters for the link-density signal.
+
+### 94. Brief 3B licence fix and Step 4: site-level licence evidence; generators are single-call so the worker keeps control of every call
+
+**Licence evidence** (`e7d05a1`, ROADMAP #63 resolved): only site-level
+evidence counts now.
+- **What counts:** `rel="license"`, a link to a licence page or file, or a
+  licence name in footer text.
+- **What never counts:** HTML comments, `<svg>`, `<script>`, `<style>` and
+  body text.
+- **Result on saved pages:** all 15 saved fixture pages from 5 sites give
+  no evidence, and the record for both fastapi fixtures is `none_found`.
+  These are true negatives: each footer was found and read, and none
+  mentions a licence. Fastapi's "License" heading is body text about the
+  software's MIT licence, not the site's.
+- **Event loop:** the full HTML parse (7 ms on the 170 KB fastapi page)
+  moved into `asyncio.to_thread`. A multi-MB page would otherwise stall
+  every worker.
+
+**Step 4: generators** (`926dd78`). Two deviations from the Step 0 plan:
+- **No separate `generate_worker`.** `extract_worker`'s call loop became one
+  `guarded_call` helper, shared by v1's `extract_fn` path and the v2
+  generator path. One copy of the breaker, semaphore, 429/5xx, cost and
+  timing logic beats two that can drift. The v1 path's steps are
+  unchanged, the golden byte test passes, and v2 `qa@1` rows equal the
+  golden v1 rows field for field.
+- **`request`/`parse` instead of `generate(unit, page, llm)`.** With the
+  worker making the call, a malformed answer is booked exactly as today,
+  and no generator can make an ungated or uncounted call. Multi-call
+  generators would need a new interface version.
+
+**Measured on the real fastapi units** (saved dry-pass units, offline):
+- `qa@1` would make 52 calls with 109,992 input characters, exactly Brief
+  2c's figure. That confirms the request is byte-identical.
+- `code_example@1` wants 20 of the 52 units, adding about 8.7k input tokens
+  by the qa basis. Its output ratio is unmeasured.
+- **Why it sends context:** the chunker often splits a code block from its
+  explanation. Several units are 27 characters holding only
+  ```` ```uvx library-skills``` ````, with the explanation in the unit before.
+  So `code_example@1` sends up to 1,500 characters of the preceding unit
+  as context.
+
+### 95. Brief 3B Step 5: verifiers. Grounding needs the exact text sent, and a killed child's pipes must be drained
+
+**What was built** (`198a03c`): the `verifiers/` hook with `schema@1`,
+`near_duplicate@1`, `code_syntax@1` and `external@1`, plus drop/flag,
+per-row verdicts and `result.json` counts. Order in the extract path:
+generation, verification, balancing, writer.
+
+**Grounding check, "code appears in the source":**
+- **The source must be what the model saw,** not just the unit.
+  `code_example@1` sends the preceding unit as context, so code copied from
+  the context is grounded, and code beyond the 4,000-character cap was
+  never seen.
+- **Rows now store the exact `context` sent.** `sent_text(row)` rebuilds
+  the capped request from the row, so the check can be repeated later,
+  offline.
+- **Tests:**
+  - hallucinated code fails;
+  - code present only in the context passes;
+  - code present only past the cap fails.
+
+**Leak found under `-W error::ResourceWarning`:** after killing an
+external verifier for oversized output, the stdout transport stayed open.
+`proc.wait()` isn't enough; `communicate()` drains the pipes to EOF and
+closes them. The timeout test also checks that a grandchild dies with the
+group: it's killed via `killpg` on the child's own PID, never by name.
+
+**Measured on Brief 2c's 276 real rows** (offline, as v2 `qa`):
+- **`schema@1`:** 276 pass.
+- **`near_duplicate@1`:** flags 2, both exact repeats across pages: the
+  root page's `read_item` question, and the `uv add "fastapi[standard]"`
+  question asked on both `/tutorial/` and `/features/`.
+- **Caveat:** this is one small dataset. The 0.9 threshold isn't
+  calibrated beyond it.
+
+### 96. Brief 3B Step 6: the fastapi dry pass matched the estimate exactly; docs.manim.community is behind a Cloudflare bot challenge, and the 429 stop rule caught it on the first request
+
+**Run safety settings** (`416a882`): `crawl_delay_seconds`, a floor under
+per-host spacing, and `stop_on_site_429`, covering pages and `robots.txt`.
+In v2, a page crawl4ai reports as a success with status ≥ 400 is an HTTP
+error, never content.
+
+**Dry pass 1: fastapi, 3 pages, `qa@1` + `code_example@1`, caps and
+verifiers on, delay 1s, stop on 429:**
+- **Calls:** 72 extraction calls (52 + 20) plus 1 preflight, the same as
+  the offline estimate from the saved units.
+- **Unchanged pages:** the page fingerprints equal the first dry pass's.
+  Licence is `none_found` now (ROADMAP #63).
+
+**Dry pass 2: docs.manim.community, 3 pages under `/en/stable/`:**
+- **Result:** `stopped_early`, exit 1, on the first page request. crawl4ai
+  logged "Blocked by anti-bot protection: Cloudflare JS challenge", status
+  429. It was not a rate limit: it was our first request.
+- **Load on the site:** `robots.txt` plus that one request. The other two
+  pages were waiting on the 1s spacing and were never requested.
+- **Decision:** a bot challenge is the site saying no to automated
+  crawling. We don't try to get past it (ROADMAP #66).
+
+**As instructed, Step 6 stopped at the first stop rule.** Neither real run
+happened, and no key was loaded.

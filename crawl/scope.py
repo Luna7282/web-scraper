@@ -180,3 +180,21 @@ def is_in_scope(
         return ScopeDecision(False, f"outside_prefix (not under {prefix})")
 
     return ScopeDecision(True, "accepted")
+
+
+def fetch_form(href: str, base_url: str) -> str | None:
+    """The URL as it should actually be REQUESTED (headless contract v2,
+    ROADMAP #53): normalize_url's canonical form, but with the trailing slash
+    the href itself had. normalize_url strips it so /x and /x/ dedupe as one
+    page; robots.txt rules, though, apply to the request path, and a site can
+    allow only the slash form (docs.manim.community: Allow /en/stable/ under
+    Disallow /). Identity stays normalize_url(); only the request differs.
+    None when normalize_url would return None."""
+    normalized = normalize_url(href, base_url)
+    if normalized is None:
+        return None
+    raw_path = urlparse(urljoin(base_url, href.strip())).path
+    parsed = urlparse(normalized)
+    if raw_path.endswith("/") and not parsed.path.endswith("/"):
+        return urlunparse(parsed._replace(path=parsed.path + "/"))
+    return normalized

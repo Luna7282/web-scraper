@@ -8,6 +8,7 @@ tests/test_crawl_worker.py, tests/test_extract_worker.py.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import functools
 import math
 import re
@@ -28,7 +29,9 @@ from crawl.circuit_breaker import BreakerStopped, LlmCircuitBreaker
 from crawl.frontier import ROBOTS_DISALLOWED_ERROR, Frontier, FrontierRow
 from crawl.politeness import HostPoliteness
 from crawl.robots_cache import RobotsCache
-from crawl.scope import normalize_url
+from crawl.scope import fetch_form, normalize_url
+from crawl.provenance import call_served_model
+from generators import PageContext
 from crawl.timing import call_usage
 from content.sectioning import DEFAULT_SECTION_DEPTH, derive_section
 from storage.writer import Writer
@@ -364,10 +367,23 @@ async def crawl_worker(
     fatal_error_sink: list[str] | None = None,
     timing: TimingLog | None = None,
     site_backoff: bool = False,
+    use_fetch_urls: bool = False,
+    stop_on_site_429: bool = False,
 ) -> None:
     """site_backoff (config.SITE_RETRY_BACKOFF; off = today's immediate
     re-fetch): a site's 429/503 re-queues the page after doubling_backoff
-    (the site's Retry-After, else 5s doubling per retry). Still a retry."""
+    (the site's Retry-After, else 5s doubling per retry). Still a retry.
+
+    use_fetch_urls (headless contract v2 only; ROADMAP #53): robots.txt is
+    checked against, and the page fetched at, the form the URL was first
+    discovered in (Frontier.fetch_url_for: e.g. with its trailing slash),
+    and each child's request form is recorded. Row identity is unchanged.
+    Off: exactly today's behaviour.
+
+    stop_on_site_429 (headless contract v2 setting): the first 429 from the
+    site fails that page (a counted retry, so it stays resumable), records a
+    fatal error and stops the run via quiescence -- like a dead browser.
+    Off: exactly today's behaviour."""
     while True:
         # Checked before claim() too, not just in the row-is-None branch
         # below -- lets a fatal BrowserDriverError (set by any worker,
@@ -383,11 +399,12 @@ async def crawl_worker(
             await asyncio.sleep(poll_interval)
             continue
 
+        target = await frontier.fetch_url_for(row.url) if use_fetch_urls else row.url
         policy = None
         if robots_cache is not None:
             policy = await robots_cache.get_policy(row.host)
-            if not policy.is_allowed(row.url):
-                print(f"[robots] disallowed by robots.txt, skipping: {row.url}")
+            if not policy.is_allowed(target):
+                print(f"[robots] disallowed by robots.txt, skipping: {target}")
                 await frontier.mark_permanently_failed(row.url, ROBOTS_DISALLOWED_ERROR)
                 continue
 
@@ -403,13 +420,13 @@ async def crawl_worker(
         try:
             async with gate:
                 if timing is None:
-                    html, raw_hrefs = await fetch_fn(row.url)
+                    html, raw_hrefs = await fetch_fn(target)
                 else:
                     # Timed inside the politeness gate: fetch time only,
                     # not time spent waiting for the per-host slot.
                     fetch_started = time.perf_counter()
                     try:
-                        html, raw_hrefs = await fetch_fn(row.url)
+                        html, raw_hrefs = await fetch_fn(target)
                     except Exception as e:
                         timing.record("fetch", url=row.url, seconds=_since(fetch_started),
                                       outcome=type(e).__name__)
@@ -419,6 +436,14 @@ async def crawl_worker(
             await frontier.mark_fetch_failed(row.url, f"timeout: {e}")
             continue
         except FetchHTTPError as e:
+            if stop_on_site_429 and e.status_code == 429:
+                await frontier.mark_fetch_failed(row.url, "http_429 (run stopped: stop_on_site_429)")
+                msg = f"[FATAL] Site returned 429 for {target}; stopping the run (stop_on_site_429)."
+                print(msg)
+                if fatal_error_sink is not None:
+                    fatal_error_sink.append(msg)
+                frontier.quiescent.set()
+                return
             if site_backoff and e.status_code in SITE_BACKOFF_STATUSES:
                 backoff = doubling_backoff(row.retry_count, e.retry_after)
                 await frontier.mark_fetch_failed(row.url, f"http_{e.status_code} (backoff {backoff:g}s)",
@@ -450,14 +475,19 @@ async def crawl_worker(
             continue
 
         children = []
+        request_forms = []
         for href in raw_hrefs:
-            normalized = normalize_url(href, row.url)
+            normalized = normalize_url(href, target if use_fetch_urls else row.url)
             if normalized is None:
                 continue
             if not scope_check(normalized):
                 continue
             children.append((normalized, row.section_label))
+            if use_fetch_urls:
+                request_forms.append((normalized, fetch_form(href, target)))
 
+        if request_forms:
+            await frontier.record_fetch_urls(request_forms)
         await frontier.insert_children(row.url, row.depth, children)
         if timing is not None:
             timing.mark_enqueued(row.url)
@@ -486,6 +516,12 @@ async def extract_worker(
     breaker: LlmCircuitBreaker | None = None,
     scraper_version: str | None = None,
     llm_unavailable_max_releases: int = 0,
+    record_builder: Callable[..., dict] | None = None,
+    cost=None,
+    balancer=None,
+    generators: list | None = None,
+    llm_call: Callable[[str, str], Awaitable[str]] | None = None,
+    verifiers=None,
 ) -> None:
     """unit_concurrency (config.EXTRACT_UNIT_CONCURRENCY, default 1): how
     many of one page's extraction units -- and, with a quality_backend, its
@@ -505,7 +541,40 @@ async def extract_worker(
     off): a ProviderUnavailableError releases the page with doubling_backoff
     and no retry used, at most this many times per page per run
     (Frontier.release_llm_unavailable); the next one fails the page. The
-    breaker neither counts nor resets on these: it only sees 429s."""
+    breaker neither counts nor resets on these: it only sees 429s.
+
+    record_builder (headless contract v2 only): called as
+    record_builder(fields, served_model=...) for each pair instead of
+    build_canonical_record(**fields); served_model is what the provider's
+    response said it ran for that unit's call (crawl.provenance). None:
+    build_canonical_record, exactly as before.
+
+    cost (headless contract v2 only, crawl.cost.CostLedger): every
+    extraction and quality call attempt is recorded by outcome, with the
+    token usage the response reported; 5xx page releases too. None: nothing
+    recorded, exactly as before.
+
+    balancer (headless contract v2 only, content.balance.Balancer): after
+    the relevance gate, a page detected as low-value with action "skip" is
+    marked skipped_extract with no extraction calls; after extraction, the
+    page's rows are capped (per page, per source, low-value cap) before they
+    go to the writer. None: no balancing, exactly as before.
+
+    generators + llm_call (headless contract v2 only, generators/): instead
+    of one extract_fn call per unit, every generator that wants the unit
+    gets one llm_call(system_prompt, text) through the same breaker,
+    semaphore, cost and timing path (timing events and cost rows carry the
+    generator id), and record_builder is called with generator=. A unit
+    fails as malformed only if every attempted generator's answer was
+    unreadable. None: extract_fn, exactly as before.
+
+    verifiers (headless contract v2 only, verifiers.VerifierRunner): a
+    page's rows are verified after generation and before balancing; rows
+    failing an on_fail=drop verifier are removed, the rest carry their
+    verdicts. Rows finally sent to the writer are committed (near_duplicate's
+    "seen"). None: no verification, exactly as before."""
+    if generators is not None and (llm_call is None or record_builder is None):
+        raise ValueError("generators need llm_call and record_builder")
     if unit_concurrency < 1:
         raise ValueError(f"unit_concurrency must be >= 1, got {unit_concurrency}")
 
@@ -527,6 +596,8 @@ async def extract_worker(
                             "Is this a good instruction-response training pair?",
                         )
                     except Exception as e:
+                        if cost is not None:
+                            cost.record("quality", _call_outcome(e)[0])
                         if timing is not None:
                             outcome, extra = _call_outcome(e)
                             timing.record(
@@ -536,12 +607,69 @@ async def extract_worker(
                         if breaker is not None and breaker.failure(permit, e):
                             continue  # back to the gate; retry this same call
                         raise
+                    if cost is not None:
+                        cost.record("quality", "ok")
                     if timing is not None:
                         timing.record("quality_call", url=url, chunk_index=chunk_index,
                                       seconds=_since(quality_started), outcome="ok")
                 if breaker is not None:
                     breaker.success(permit)
                 return answer.value, answer.method
+
+        async def guarded_call(chunk_index: int, unit: str, sem: asyncio.Semaphore | None, invoke,
+                               role_extra: dict):
+            """One LLM call behind the breaker gate and the unit semaphore,
+            recorded in cost and timing on failure. Returns (raw response,
+            served model, usage, started, seconds); the caller records the
+            ok / malformed outcome once it has parsed the response."""
+            while True:
+                permit = await breaker.acquire() if breaker is not None else None
+                if timing is not None or cost is not None:
+                    call_usage.set(None)  # never attribute a previous call's usage to this one
+                call_served_model.set(None)
+                async with sem if sem is not None else nullcontext():
+                    call_started = time.perf_counter()
+                    try:
+                        raw_response = await invoke()
+                    except Exception as e:
+                        outcome, extra = _call_outcome(e)
+                        if cost is not None:
+                            cost.record("extraction", outcome, **role_extra)
+                        _record_extract_call(timing, url, chunk_index, unit, call_started, outcome,
+                                             **extra, **role_extra)
+                        if breaker is not None and breaker.failure(permit, e):
+                            continue  # back to the gate; retry this same unit
+                        raise
+                    call_seconds = _since(call_started)
+                    served_model = call_served_model.get()  # this call's, read in the same task
+                    call_usage_now = call_usage.get() if cost is not None else None
+                if breaker is not None:
+                    breaker.success(permit)
+                return raw_response, served_model, call_usage_now, call_started, call_seconds
+
+        async def scored(chunk_index: int, pairs: list[dict], sem: asyncio.Semaphore | None) -> list:
+            if quality_backend is None:
+                return [(None, None)] * len(pairs)
+            if sem is None:
+                return [await score_pair(chunk_index, pair, None) for pair in pairs]
+            return await _run_in_order([functools.partial(score_pair, chunk_index, pair, sem) for pair in pairs])
+
+        def passes_quality(quality_score, quality_method) -> bool:
+            if quality_backend is None:
+                return True
+            # None (the default): per-method threshold, looked up by
+            # the answering backend's own method -- Jev/Laya/
+            # traditional score quality on different distributions
+            # (see config.DECISION_THRESHOLDS), so reusing one fixed
+            # number regardless of which backend answered would be
+            # the same category error dedup's shared 0.4 threshold
+            # turned out to be. An explicit quality_threshold still
+            # overrides this for every method, same as before.
+            active_threshold = (
+                quality_threshold if quality_threshold is not None
+                else get_threshold("sample_quality", quality_method)
+            )
+            return quality_score >= active_threshold
 
         async def process_unit(chunk_index: int, unit: str, sem: asyncio.Semaphore | None) -> list[dict] | None:
             """One extraction unit: one extract_fn call, parse, optional
@@ -552,69 +680,90 @@ async def extract_worker(
             propagates. With a semaphore, a permit is held only around each
             LLM call -- never while waiting on this unit's own quality calls,
             which need permits too (holding one there could deadlock)."""
-            while True:
-                permit = await breaker.acquire() if breaker is not None else None
-                if timing is not None:
-                    call_usage.set(None)  # never attribute a previous call's usage to this one
-                async with sem if sem is not None else nullcontext():
-                    call_started = time.perf_counter()
-                    try:
-                        raw_response = await extract_fn(unit)
-                    except Exception as e:
-                        outcome, extra = _call_outcome(e)
-                        _record_extract_call(timing, url, chunk_index, unit, call_started, outcome, **extra)
-                        if breaker is not None and breaker.failure(permit, e):
-                            continue  # back to the gate; retry this same unit
-                        raise
-                    call_seconds = _since(call_started)
-                if breaker is not None:
-                    breaker.success(permit)
-                break
+            raw_response, served_model, call_usage_now, call_started, call_seconds = await guarded_call(
+                chunk_index, unit, sem, lambda: extract_fn(unit), {})
             try:
                 pairs = parse_qa_json(raw_response)
             except MalformedExtractionError:
+                if cost is not None:
+                    cost.record("extraction", "malformed", call_usage_now)
                 _record_extract_call(timing, url, chunk_index, unit, call_started, "malformed",
                                      seconds=call_seconds)
                 return None
+            if cost is not None:
+                cost.record("extraction", "ok", call_usage_now)
             _record_extract_call(timing, url, chunk_index, unit, call_started, "ok", seconds=call_seconds)
 
-            scores = [(None, None)] * len(pairs)
-            if quality_backend is not None:
-                if sem is None:
-                    scores = [await score_pair(chunk_index, pair, None) for pair in pairs]
-                else:
-                    scores = await _run_in_order(
-                        [functools.partial(score_pair, chunk_index, pair, sem) for pair in pairs]
-                    )
+            scores = await scored(chunk_index, pairs, sem)
             records = []
             for pair, (quality_score, quality_method) in zip(pairs, scores):
-                if quality_backend is not None:
-                    # None (the default): per-method threshold, looked up by
-                    # the answering backend's own method -- Jev/Laya/
-                    # traditional score quality on different distributions
-                    # (see config.DECISION_THRESHOLDS), so reusing one fixed
-                    # number regardless of which backend answered would be
-                    # the same category error dedup's shared 0.4 threshold
-                    # turned out to be. An explicit quality_threshold still
-                    # overrides this for every method, same as before.
-                    active_threshold = (
-                        quality_threshold if quality_threshold is not None
-                        else get_threshold("sample_quality", quality_method)
-                    )
-                    if quality_score < active_threshold:
-                        continue
-                records.append(build_canonical_record(
-                    question=pair["instruction"], answer=pair["response"],
-                    source_chunk=unit, chunk_index=chunk_index, source_url=url, section=section,
-                    page_title=page_title, generation_model=generation_model,
-                    extraction_strategy=extraction_strategy,
-                    timestamp=timestamp, crawl_date=crawl_date,
-                    license_signal=license_signal,
-                    quality_score=quality_score, quality_decision_method=quality_method,
-                    scraper_version=scraper_version,
-                ))
+                if not passes_quality(quality_score, quality_method):
+                    continue
+                fields = {
+                    "question": pair["instruction"], "answer": pair["response"],
+                    "source_chunk": unit, "chunk_index": chunk_index, "source_url": url, "section": section,
+                    "page_title": page_title, "generation_model": generation_model,
+                    "extraction_strategy": extraction_strategy,
+                    "timestamp": timestamp, "crawl_date": crawl_date,
+                    "license_signal": license_signal,
+                    "quality_score": quality_score, "quality_decision_method": quality_method,
+                    "scraper_version": scraper_version,
+                }
+                if record_builder is None:
+                    records.append(build_canonical_record(**fields))
+                else:
+                    records.append(record_builder(fields, served_model=served_model))
             return records
 
+        async def process_unit_generators(chunk_index: int, unit: str, sem: asyncio.Semaphore | None,
+                                          page: PageContext) -> list[dict] | None:
+            """Contract v2: every configured generator that wants this unit
+            gets one call (in config order). None only if every attempted
+            generator's response was malformed; [] if none wanted the unit."""
+            records, attempted, parsed = [], 0, 0
+            for gen in generators:
+                if not gen.wants(unit, page, chunk_index):
+                    continue
+                attempted += 1
+                system_prompt, text = gen.request(unit, page, chunk_index)
+                tag = {"generator": gen.id}
+                try:
+                    raw_response, served_model, call_usage_now, call_started, call_seconds = await guarded_call(
+                        chunk_index, unit, sem, functools.partial(llm_call, system_prompt, text), tag)
+                except ProviderUnavailableError as e:
+                    e.generator = gen.id  # the page release below is booked against this generator
+                    raise
+                try:
+                    items = gen.parse(raw_response, unit, page, chunk_index)
+                except MalformedExtractionError:
+                    if cost is not None:
+                        cost.record("extraction", "malformed", call_usage_now, **tag)
+                    _record_extract_call(timing, url, chunk_index, unit, call_started, "malformed",
+                                         seconds=call_seconds, **tag)
+                    continue
+                parsed += 1
+                if cost is not None:
+                    cost.record("extraction", "ok", call_usage_now, **tag)
+                _record_extract_call(timing, url, chunk_index, unit, call_started, "ok", seconds=call_seconds, **tag)
+                scores = (await scored(chunk_index, [i["_pair"] for i in items], sem) if gen.quality_scored
+                          else [(None, None)] * len(items))
+                for item, (quality_score, quality_method) in zip(items, scores):
+                    if gen.quality_scored and not passes_quality(quality_score, quality_method):
+                        continue
+                    fields = {k: v for k, v in item.items() if not k.startswith("_")}
+                    fields.update({"source_chunk": unit, "chunk_index": chunk_index, "source_url": url,
+                                   "section": section, "page_title": page_title})
+                    if gen.generation_meta:
+                        fields.update({"generation_model": generation_model,
+                                       "extraction_strategy": extraction_strategy})
+                    fields.update({"timestamp": timestamp, "crawl_date": crawl_date, "license_signal": license_signal,
+                                   "quality_score": quality_score, "quality_decision_method": quality_method,
+                                   "scraper_version": scraper_version})
+                    records.append(record_builder(fields, served_model=served_model, generator=gen))
+            return None if attempted and not parsed else records
+
+        if generators is not None:
+            return process_unit_generators
         return process_unit
 
     while True:
@@ -653,6 +802,13 @@ async def extract_worker(
             await frontier.content_done(content_queue)
             continue
 
+        low_value = balancer.classify(url, content, extract_page_title(content)) if balancer is not None else None
+        if low_value is not None and low_value.action == "skip":
+            _record_page(timing, url, "skipped_low_value", units=0, pairs=0, started=None)
+            await frontier.mark_extract_outcome(url, "skipped_extract")
+            await frontier.content_done(content_queue)
+            continue
+
         try:
             units = await extraction_units_fn(content) if extraction_units_fn else [content]
         except Exception as e:
@@ -670,6 +826,8 @@ async def extract_worker(
         extraction_started = time.perf_counter()
 
         process_unit = make_unit_processor(url, section, page_title, timestamp, crawl_date, license_signal)
+        if generators is not None:
+            process_unit = functools.partial(process_unit, page=PageContext(url, page_title, section, tuple(units)))
 
 
         # unit_concurrency == 1 (config.EXTRACT_UNIT_CONCURRENCY's default):
@@ -706,6 +864,8 @@ async def extract_worker(
         except ProviderUnavailableError as e:
             pairs_so_far = sum(len(r) for r in unit_results if r)
             if llm_unavailable_max_releases > 0:
+                if cost is not None:
+                    cost.unavailable_release(generator=getattr(e, "generator", None))
                 _record_page(timing, url, "unavailable", units=len(units), pairs=pairs_so_far,
                              started=extraction_started)
                 await frontier.release_llm_unavailable(
@@ -736,8 +896,76 @@ async def extract_worker(
             continue
 
         _record_page(timing, url, "ok", units=len(units), pairs=len(qa_pairs), started=extraction_started)
+        if verifiers is not None:
+            qa_pairs = await verifiers.run(url, qa_pairs)
+        if balancer is not None:
+            qa_pairs = balancer.apply(url, qa_pairs, low_value)
+        if verifiers is not None:
+            verifiers.commit(qa_pairs)
         chunks = chunk_fn(content) if chunk_fn is not None else None
         await frontier.put_results(results_queue, ExtractionResult(url=url, qa_pairs=qa_pairs, chunks=chunks))
+        await frontier.content_done(content_queue)
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+async def estimate_worker(
+    frontier: Frontier,
+    content_queue: asyncio.Queue,
+    score_fn: ScoreFn,
+    extract_threshold: float,
+    follow_threshold: float,
+    extraction_units_fn: Callable[[str], Awaitable[list[str]]] | None,
+    pages: dict,
+    poll_interval: float = POLL_INTERVAL,
+    balancer=None,
+    generators: list | None = None,
+) -> None:
+    """Dry pass (headless contract v2 `dry_run: true`): extract_worker's
+    decisions without its LLM calls. Same score, same follow/promote, same
+    extract_threshold skip, same extraction_units_fn -- so the pages and
+    units match what a real run would extract -- then records each page's
+    unit sizes in `pages` (url -> {"units": [chars, ...], "content_sha256",
+    "unit_sha256": [...]} or {"skipped": reason}) and marks it 'mapped' (fetched, nothing extracted; it counts
+    toward max_pages like 'done')."""
+    while True:
+        try:
+            url, content = await asyncio.wait_for(content_queue.get(), timeout=poll_interval)
+        except TimeoutError:
+            if frontier.quiescent.is_set():
+                return
+            continue
+        try:
+            score = await score_fn(url, content)
+        except Exception as e:  # noqa: BLE001 -- recorded; the dry pass goes on
+            pages[url] = {"skipped": f"scoring failed: {type(e).__name__}"}
+            await frontier.mark_extract_outcome(url, "failed", f"dry pass scoring: {type(e).__name__}: {e}")
+            await frontier.content_done(content_queue)
+            continue
+        await frontier.score_and_resolve_children(url, score, score >= follow_threshold)
+        if score < extract_threshold:
+            pages[url] = {"skipped": f"relevance {score:.3f} below extract_threshold {extract_threshold}"}
+            await frontier.mark_extract_outcome(url, "skipped_extract")
+            await frontier.content_done(content_queue)
+            continue
+        low_value = balancer.classify(url, content, extract_page_title(content)) if balancer is not None else None
+        if low_value is not None and low_value.action == "skip":
+            pages[url] = {"skipped": low_value.describe()}
+            await frontier.mark_extract_outcome(url, "skipped_extract")
+            await frontier.content_done(content_queue)
+            continue
+        units = await extraction_units_fn(content) if extraction_units_fn else [content]
+        pages[url] = {"units": [len(u) for u in units], "content_sha256": _sha256(content),
+                      "unit_sha256": [_sha256(u) for u in units]}
+        if generators is not None:  # v2: the calls each generator would make, as (system, text) lengths
+            page = PageContext(url, extract_page_title(content), None, tuple(units))
+            pages[url]["calls"] = {
+                gen.id: [tuple(map(len, gen.request(u, page, i))) for i, u in enumerate(units)
+                         if gen.wants(u, page, i)]
+                for gen in generators}
+        await frontier.mark_mapped(url)
         await frontier.content_done(content_queue)
 
 

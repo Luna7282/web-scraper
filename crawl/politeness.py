@@ -26,9 +26,14 @@ class HostPoliteness:
         self,
         max_concurrent_per_host: int = MAX_CONCURRENT_REQUESTS_PER_HOST,
         default_delay_seconds: float = DEFAULT_POLITENESS_DELAY_SECONDS,
+        min_delay_seconds: float | None = None,
     ):
+        """min_delay_seconds (contract v2 `crawl_delay_seconds`): a floor
+        under every host's spacing, including a smaller robots.txt
+        Crawl-delay. None: no floor, exactly as before."""
         self._max_concurrent = max_concurrent_per_host
         self._default_delay = default_delay_seconds
+        self._min_delay = min_delay_seconds
         self._semaphores: dict[str, asyncio.Semaphore] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._last_request_at: dict[str, float] = {}
@@ -70,6 +75,8 @@ class HostPoliteness:
         await sem.acquire()
         try:
             delay = self._default_delay if crawl_delay is None else crawl_delay
+            if self._min_delay is not None:
+                delay = max(delay, self._min_delay)
             async with self._lock(host):
                 last = self._last_request_at.get(host)
                 if last is not None:

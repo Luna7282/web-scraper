@@ -122,6 +122,76 @@ SITE_RETRY_BACKOFF = os.getenv("SCRAPER_SITE_RETRY_BACKOFF", "false").strip().lo
 # counted retry, no backoff).
 LLM_UNAVAILABLE_MAX_RELEASES = int(os.getenv("SCRAPER_LLM_UNAVAILABLE_MAX_RELEASES", "0"))
 
+# Brief 3B Step 2 (contract v2 only; headless.SETTINGS_V2_ONLY overrides per
+# run). Before any page work: one tiny provider call (a retired model or a
+# rejected key fails the run with exit 2), and one embedding when the run
+# needs embeddings (intent, RAG, top_k_chunks_by_relevance).
+PROVIDER_PREFLIGHT = os.getenv("SCRAPER_PROVIDER_PREFLIGHT", "true").strip().lower() == "true"
+EMBEDDINGS_PREFLIGHT = os.getenv("SCRAPER_EMBEDDINGS_PREFLIGHT", "true").strip().lower() == "true"
+PREFLIGHT_MAX_TOKENS = 16
+# Dry-pass token estimate (estimate.json). Basis, measured: the Brief 2c real
+# run (fastapi, 3 pages, 52 extraction calls, every call reporting usage,
+# ollama_cloud deepseek-v4.1-flash:cloud, qa prompt): 109,992 input chars
+# (system prompt + prefix + unit) = 26,097 input tokens -> 4.215 chars/token;
+# 63,949 output tokens = 2.4504 x input. One run, one model, one prompt.
+ESTIMATE_CHARS_PER_INPUT_TOKEN = 4.215
+ESTIMATE_OUTPUT_PER_INPUT_TOKEN = 2.4504
+ESTIMATE_BASIS = ("Brief 2c real run 2026-11-23: fastapi.tiangolo.com, 3 pages, 52 calls, "
+                  "ollama_cloud deepseek-v4.1-flash:cloud, qa prompt; 4.215 input chars/token, "
+                  "output = 2.4504 x input tokens. One run, one model, one prompt.")
+
+# Brief 3B Step 3: source balancing (contract v2 only, content/balance.py;
+# headless.SETTINGS_V2_ONLY overrides per run, and its defaults are what a v2
+# run gets -- these module values are read only by v2). Caps are per record
+# type. None = no cap. Keep rule: round-robin across a page's units.
+MAX_ROWS_PER_PAGE = None
+MAX_ROWS_PER_SOURCE = None
+LOW_VALUE_POLICY = "keep"         # "skip" | "cap" | "keep"
+LOW_VALUE_MAX_ROWS = None
+# Low-value page heuristic (content/balance.py::detect_low_value). Segments
+# match one whole URL path segment (extension dropped); titles are regexes
+# against the lowercased page title.
+LOW_VALUE_CHANGELOG_SEGMENTS = frozenset({
+    "changelog", "changelogs", "change-log", "changes", "release-notes", "releasenotes", "release_notes",
+    "releases", "release-history", "whatsnew", "whats-new", "what-s-new", "news", "history"})
+LOW_VALUE_INDEX_SEGMENTS = frozenset({
+    "genindex", "py-modindex", "modindex", "tags", "tag", "categories", "category", "archive", "archives",
+    "sitemap", "search", "authors"})
+LOW_VALUE_CHANGELOG_TITLES = (r"\brelease notes?\b", r"\bchange ?log\b", r"\bwhat'?s new\b", r"\brelease history\b")
+LOW_VALUE_INDEX_TITLES = (r"^index\b", r"\bmodule index\b", r"\bsite ?map\b", r"\barchives?\b", r"^tags?\b")
+LOW_VALUE_MIN_VERSION_HEADINGS = 3
+LOW_VALUE_MIN_LINK_LINES = 20
+LOW_VALUE_LINK_LINE_SHARE = 0.5
+
+# Brief 3B Step 4: code_example@1 (generators/code_example.py) sends up to
+# this many characters of the PRECEDING unit as context: the chunker often
+# puts a code block alone in a unit and its explanation in the one before.
+CODE_EXAMPLE_CONTEXT_CHARS = 1500
+
+# Brief 3B Step 6 run safety (contract v2 only; headless settings override
+# per run). MIN_CRAWL_DELAY_SECONDS: a floor under the per-host spacing --
+# max(site's robots.txt Crawl-delay or DEFAULT_POLITENESS_DELAY_SECONDS,
+# this). None = no floor. STOP_ON_SITE_429: the first 429 from the site
+# (a page or robots.txt) stops the run (stopped_early, resumable) instead of
+# re-queueing the page.
+MIN_CRAWL_DELAY_SECONDS = None
+STOP_ON_SITE_429 = False
+
+# Brief 3B Step 5: verifiers (contract v2, verifiers/).
+VERIFY_MIN_ANSWER_LENGTH = 20            # schema@1 on qa rows: export_formats' default minimum
+NEAR_DUPLICATE_THRESHOLD = 0.9           # near_duplicate@1: token-set (Jaccard) similarity
+EXTERNAL_VERIFIER_CONCURRENCY = 2        # headless setting external_verifier_concurrency overrides per run
+EXTERNAL_VERIFIER_DEFAULT_TIMEOUT = 30
+EXTERNAL_VERIFIER_MAX_TIMEOUT = 600
+EXTERNAL_VERIFIER_MAX_STDOUT_BYTES = 65_536
+
+# Brief 3B Step 1 (contract v2 source records, crawl/sources.py): AI crawlers
+# whose explicit robots.txt groups are reported as an AI-training signal.
+# Reported only -- the scraper's own requests don't use these names.
+AI_TRAINING_USER_AGENTS = ("GPTBot", "ChatGPT-User", "OAI-SearchBot", "CCBot", "Google-Extended", "ClaudeBot",
+                           "anthropic-ai", "Claude-Web", "Applebot-Extended", "PerplexityBot", "Bytespider",
+                           "meta-externalagent", "cohere-ai", "Amazonbot")
+
 # Count terminally failed pages toward max_pages (crawl/frontier.py
 # count_failed_toward_budget). Off by default = the original budget
 # (done/skipped_extract/mapped only). On: genuine fetch/extraction failures

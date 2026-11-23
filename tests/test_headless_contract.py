@@ -24,7 +24,9 @@ SECRET = "s" + "k-" + "abcdefghijklmnopqrstuvwxyz012345"  # assembled at runtime
 
 
 def v1(**overrides):
-    cfg = {"contract_version": 1, "mode": "crawl", "run_dir": "/tmp/x",
+    # A run_dir that never exists, so nothing (not even a test that wrongly
+    # gets to run) can leave state there for the next test to trip over.
+    cfg = {"contract_version": 1, "mode": "crawl", "run_dir": "/nonexistent-scraper-test-run-dir/x",
            "seeds": [["https://example.test/", None]], "host_prefix_pairs": [["example.test", "/"]]}
     cfg.update(overrides)
     return cfg
@@ -46,10 +48,11 @@ class TestVersioning(ConfigGuard):
 
     def test_supported_and_unsupported_versions(self):
         self.assertEqual(headless.validate(v1(), {}).contract_version, 1)
-        for bad in (2, 0, "1", True, 1.0, None):
+        self.assertEqual(headless.validate(v1(contract_version=2), {}).contract_version, 2)  # Brief 3B
+        for bad in (3, 0, "1", True, 1.0, None):
             with self.subTest(version=bad), self.assertRaises(headless.HeadlessConfigError) as ctx:
                 headless.validate(v1(contract_version=bad), {})
-            self.assertIn("supports [1]", str(ctx.exception))
+            self.assertIn("supports [1, 2]", str(ctx.exception))
 
 
 class TestStrictKeys(ConfigGuard):
@@ -217,7 +220,7 @@ class TestRealProcess(unittest.TestCase):
         self.assertEqual(done.returncode, 2)
         self.assertEqual(done.stderr.strip().splitlines()[-1], "config error: unknown config keys: max_pagez")
         self.assertNotIn("Traceback", done.stderr + done.stdout)
-        self.assertEqual(self.run_main(v1(contract_version=2)).returncode, 2)
+        self.assertEqual(self.run_main(v1(contract_version=3)).returncode, 2)  # unsupported: refused, never runs
 
     def test_legacy_config_is_unchanged(self):
         """No contract_version: today's behaviour -- an extra key is ignored

@@ -753,7 +753,9 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
       chunks is an open design question this measurement surfaces, not
       answers. **Size: unclear until a direction is picked for either.**
 
-38. **`crawl/robots_cache.py` reads robots.txt but not the `Content-Signal`
+38. **[Read and reported in contract v2, Brief 3B Step 1: `crawl/sources.py`
+    puts Content-Signal lines in the source record. Still not enforced.]
+    **`crawl/robots_cache.py` reads robots.txt but not the `Content-Signal`
     directive some sites now publish alongside it.** Noticed inspecting
     `blog.cloudflare.com/robots.txt` before a real crawl there (see
     `LESSONS_LEARNED.md`): it declares
@@ -1096,7 +1098,9 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     specifies none, so only the 0.5s default applied. Not fixed in
     Brief 1.
 
-53. **[Found 2026-11-20, Brief 1 Step 2] A docs-root index page can't be
+53. **[RESOLVED for contract v2, Brief 3B Step 1: robots checked and page
+    fetched in the discovered request form (`scope.fetch_form`, v2-only
+    `fetch_urls` table); legacy/v1 unchanged] [Found 2026-11-20, Brief 1 Step 2] A docs-root index page can't be
     crawled as a discovered link: `normalize_url` strips the trailing
     slash, and the site's robots.txt only allows the slash form.**
     docs.manim.community's robots.txt is `Disallow: /` + `Allow:
@@ -1220,6 +1224,91 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     still in `pyproject.toml`. Before removing it: check every import in the
     repo (and in tests), then change `pyproject.toml` and `uv lock` with the
     usual dry-run approval.
+
+
+61. **[Brief 3B Step 0 decision] Let a real run reuse a dry pass's fetched
+    pages.** The v2 dry pass (`dry_run: true`) fetches and chunks pages for
+    `estimate.json` but persists no content, and a real run is refused in a
+    dry-pass run_dir, so the real run fetches every page again. Persisting the
+    dry pass's markdown (or units) and letting a real run start from it would
+    halve the site traffic and make the estimate describe exactly the pages the
+    real run extracts. Needs a content store and a staleness rule.
+
+62. **[Brief 3B Step 0 decision] A hosted embeddings backend.** Any run with an
+    intent, RAG or `top_k_chunks_by_relevance` needs local Ollama
+    `nomic-embed-text`. Brief 3B only makes the v2 preflight fail clearly with
+    remediation (pull the model, or run with a blank intent and RAG off). A
+    public tool needs a real alternative: Gemini's `gemini-embedding-2` exists
+    but is deliberately not wired (`config.EMBEDDING_CAPABLE_PROVIDERS`,
+    `SYSTEM_ONE_MODELS.md`); it would need the provider-routing invariant in
+    `CLAUDE.md` extended, not bypassed, and an embedding-identity check per
+    Chroma collection, which already exists.
+
+63. **[Found 2026-11-23, Brief 3B dry pass] Licence evidence picks up
+    third-party licences embedded in the page.** On fastapi.tiangolo.com the
+    only "licence" found on all 3 pages was Font Awesome's comment inside an
+    inline SVG icon ("Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT
+    License"). That's the icon set's licence, not the site's content. It's
+    reported as evidence with its snippet, so it can be checked, but the
+    summary line ("Creative Commons named, MIT License") reads as if the site
+    were licensed that way. Candidate fix: ignore matches inside HTML comments
+    and `<svg>` elements, or report them as a separate "embedded asset" kind.
+    **Resolved (Brief 3B, after Step 3):** only site-level evidence counts now
+    (rel="license", a link to a licence page or file, licence names in footer
+    text). Comments, `<svg>`, `<script>`, `<style>` and body text are ignored.
+    The saved fastapi pages give `none_found`.
+
+64. **[Found 2026-11-23, Brief 3B Step 3] A per-page row cap can't bound the
+    largest page's share in a small run.** With 3 pages the largest is always
+    at least a third; Brief 2c's root page goes from 58.7% to 46.7% under the
+    default cap of 100. Bounding a share needs the whole run's rows, i.e. a
+    selection after the run (Step 0 decision 2, option (b)), not a cap before
+    the writer.
+
+65. **[Found 2026-11-23, Brief 3B Step 4] The chunker splits code from its
+    explanation; link this to unit packing (`scraper_changes_needed.md` item
+    15, Brief 3C).** On fastapi, 20 of 52 units hold fenced code, and several
+    are 27-character units holding only a code block, with the prose that
+    explains it in the unit before. `code_example@1` works around it by sending
+    up to 1,500 characters of the preceding unit as context (stored on the row
+    as `context`, so schema@1's grounding check stays exact). Unit packing
+    should keep a code block together with its lead-in text. Then the
+    workaround and the extra context tokens can go, and `qa@1` stops spending
+    calls on code-only fragments.
+
+66. **[Found 2026-11-23, Brief 3B Step 6] docs.manim.community now puts
+    automated browsers behind a Cloudflare JS challenge (served as HTTP 429).**
+    The first page request of a v2 dry pass got it, and `stop_on_site_429`
+    stopped the run. We must not try to get past bot protection. For the
+    scraper, this means:
+    - classify a challenge page as its own fetch outcome, `blocked_by_site`,
+      rather than a plain 429 retry;
+    - report it in the source record;
+    - never retry it.
+
+    Earlier manim numbers in this file came from before the challenge
+    existed.
+
+67. **[DECISION 2026-11-23, after Brief 3B] The scraper is one connector
+    (websites/text) in foundry's data layer.** No new generation features are
+    added to web-scraper from here on. Generators (`generators/`) and
+    verifiers (`verifiers/`) will move to foundry's dataset builder later.
+    Until then they stay as they are, behind contract v2, maintained but not
+    extended.
+    - **Still in scope:** fetching, scope, robots/politeness, source records,
+      chunking/units, provenance, cost, and the contract.
+    - **The second-site token-basis check is deferred.** The dry-pass token
+      estimate is still fitted on one run (Brief 2c).
+
+68. **[Found 2026-11-23, Brief 2d e2e] `verification.written_rows_by_status`
+    counts the rows that left verification, not the rows written.** Balancing
+    runs after verification, so on the fastapi run it summed to 309 while 247
+    were written (62 cut by the page cap). Either count after balancing (a
+    `commit()`-time tally), or rename the field `verified_rows_by_status`.
+    Meanwhile foundry's dataset artifact `verification_status` (from the rows
+    actually written) is the true count. Measured as well: code_example@1's
+    output ratio is about 1.22x input, not the assumed qa 2.45x (11,235 vs
+    9,173 tokens).
 
 ---
 

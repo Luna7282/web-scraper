@@ -6,6 +6,13 @@ someone remembers to.
 
 ## What this is
 
+> **Direction (2026-11-23, ROADMAP #67):** this scraper is ONE connector
+> (websites/text) in foundry's data layer. **Do not add new generation
+> features here.** `generators/` and `verifiers/` (contract v2) are
+> maintained but not extended, and will move to foundry's dataset builder.
+> Work here is fetching, scope, robots/politeness, source records, units,
+> provenance, cost and the contract.
+
 A general-purpose, prompt-steered crawler for any website — give it a root
 URL and a natural-language intent, and it crawls, judges pages against that
 intent, and turns the result into training datasets (multiple schemas and
@@ -52,6 +59,15 @@ not by accident.
 | | `extraction_units.py` | Extraction-strategy chunk selection (`first_n_chars`/`per_chunk`/`top_k_chunks_by_relevance`) |
 | | `sectioning.py` | `derive_section` (canonical record field) + filename slugify/cap/disambiguate (export time) |
 | | `relevance.py` | Embedding-based relevance scoring (`score_headings`, chosen by measurement) |
+| | `balance.py` | Contract v2 source balancing: row caps, low-value page heuristic, `rebalance_rows` |
+| `generators/` | `__init__.py` | Contract v2 `Generator` interface (`wants`/`request`/`parse`), registry, `parse_json_array` |
+| | `qa.py` | `qa@1`: today's Q&A extraction as a generator (same prompt, request and parser) |
+| | `code_example.py` | `code_example@1`: instruction/code pairs from units with fenced code |
+| `verifiers/` | `__init__.py` | Contract v2 `Verifier` interface, registry, `VerifierRunner` (drop/flag, statuses, report) |
+| | `schema.py` | `schema@1`: generator JSON Schema + export rules; code must appear in the exact text sent |
+| | `near_duplicate.py` | `near_duplicate@1`: same/near-same question or instruction+code within a run (order-dependent) |
+| | `code_syntax.py` | `code_syntax@1`: `ast.parse` / `json.loads` only, never executes |
+| | `external.py` | `external@1`: a supplied command, no shell, own process group, minimal env, timeout, stdout cap |
 | `storage/` | `writer.py` | Sole owner of the canonical JSONL file + Chroma upsert calls |
 | | `chunk_store.py` | Content-hash chunk IDs, `ChunkStore.add_or_merge_chunk`, embedding-identity check |
 | | `canonical.py` | The canonical record schema + `build_canonical_record` |
@@ -630,9 +646,179 @@ stayed `running` the whole time, and unpausing resumed immediately.
   and the SIGKILL kill-mid-append loop, about 70s) are skipped by default.
   Run `RUN_SLOW_TESTS=1 uv run python -m unittest discover -s tests` before
   merging anything that touches headless, signals or the writer.
+- **Network guard (fast suite):** `tests/test_000_network_guard.py`, which
+  discovery imports first, installs `tests/netguard.py`.
+  - **What fails a test:** any non-localhost connection or DNS lookup, and
+    any Playwright/Chromium launch.
+  - **Where it applies:** in the test process, and in every child Python
+    (via `tests/netguard_site/sitecustomize.py` on `PYTHONPATH`).
+  - **Swallowed violations count:** the test fails even if the code caught
+    the exception.
+  - **Opting out:** mark a test `@allow_network`, which is only for the slow
+    tests: `RUN_SLOW_TESTS=1` real-signal tests and the two real-Chromium
+    `raw:` HTML fetch tests.
+  - **Single-module runs** (`-m unittest tests.x`) aren't guarded unless that
+    module imports the guard.
+- **v1 and legacy rows are byte-checked:** `tests/test_v1_golden.py` runs a
+  deterministic headless run and compares `canonical.jsonl` byte-for-byte
+  with `tests/golden/*_main_1112ad7.jsonl`, produced by
+  `tests/golden/make_rows.py` from a `git archive` of pre-3B `main`.
+  Never regenerate them from the branch under test.
 - **Tests that apply settings must restore `config`.**
   `tests/test_headless_contract.py`'s `ConfigGuard` fails a test that
   leaves it changed.
+
+## Headless contract v2 (Brief 3B, in progress on `brief-3b-data-engine`)
+
+`"contract_version": 2` = every v1 key plus `headless.V2_KEYS`. A v1
+config using a v2 key is refused as unknown, exactly as before; v1 and
+legacy runs take today's code paths (the v2 branches are all behind
+`context.contract_version >= 2`).
+- **Step 1 (done):**
+  - **Rows:** v2 rows are canonical schema v2
+    (`storage/canonical.py::build_canonical_record_v2`): `schema_version`
+    2, `record_type`, the same top-level fields (so exporters still find
+    `question`/`answer`), and a `provenance` block: generator, provider,
+    model, pinned version (`model_pinned_version`, default the model),
+    `served_model`, endpoint, scraper version, run id, prompt sha256.
+  - **`served_model`:** the provider response's own `model` field, captured
+    by `llm_factory.ServedModelChatOpenAI`. langchain's `model_name` falls
+    back to the *requested* model, so never read it as provenance.
+  - **Source records** (`crawl/sources.py`) go to `sources.json` and into
+    `result.json`, in foundry's `data_sources` shape. A missing value is the
+    explicit `none_found`. Licence is evidence (snippet + page URL), never
+    a legal verdict. AI-training signals are reported, not enforced.
+  - **Request form vs identity (ROADMAP #53):** v2 checks robots and
+    fetches the URL in the form it was first discovered (trailing slash
+    kept, `scope.fetch_form`). Identity stays `normalize_url`. The mapping
+    lives in a v2-only side table, `fetch_urls`.
+- **Step 2 (done):**
+  - **Preflights** (`preflight.py`): they run before any page work, behind
+    the v2-only settings `provider_preflight` and `embeddings_preflight`.
+    - **Provider:** one tiny call, only when the run will make calls. A
+      retired model (410, or a 404 naming the model) or a rejected key
+      (401/403) raises `PreflightFailed`: `config_error`, exit 2. Anything
+      else is a recorded warning.
+    - **Embeddings:** only when the run needs them (intent, RAG,
+      top_k). Any failure fails the run, and the message lists remedies.
+  - **Dry pass (`dry_run: true`):** the chat provider is never constructed.
+    `estimate_worker` makes extract_worker's score and follow decisions,
+    runs the real chunker, and marks pages `mapped`. It writes
+    `estimate.json`, whose token basis is in `config.ESTIMATE_*`, measured
+    from the Brief 2c run. A dry pass can't be resumed into a real run, and
+    can't be combined with `resume`.
+  - **Cost** (`crawl/cost.py`): `result.json` has a `cost` section counting
+    every call attempt by outcome, per provider, model and role, plus 5xx
+    releases. A token total is null when no call reported it, never 0.
+  - **Fingerprints:** `estimate.json`'s `page_fingerprints` holds each page's
+    content SHA-256 and each unit's SHA-256 and length. They tell "the page
+    changed" apart from "the estimate is wrong".
+- **Step 3 (done): source balancing** (`content/balance.py`), v2 only.
+  - **Settings** (`headless.SETTINGS_V2_ONLY`): `max_rows_per_page` (100),
+    `max_rows_per_source` (null = off), `low_value_policy` (`cap`; or
+    `skip` / `keep`), `low_value_max_rows` (25). Null turns a cap off, from
+    the config or as `none` in the environment.
+  - **Overrides key:** `low_value_overrides` `{"keep": [...], "skip":
+    [...]}` takes URL or path prefixes. The longest matching prefix wins,
+    and a tie keeps.
+  - **Caps are per record type.** The keep rule is round-robin across a
+    page's units, and kept rows stay in their original order.
+  - **The per-source cap** is applied in the order pages finish, which
+    varies between runs, so every cut is recorded.
+  - **Low-value heuristic:** URL segment, title, version-number headings,
+    or link-line share, with config values in `config.LOW_VALUE_*`. The
+    reasons are recorded.
+  - **`skip`** marks the page `skipped_extract` before any call, and the dry
+    pass skips it too.
+  - **`result.json`'s `balance` section:** rows per page, the largest page
+    and its share, rows per source, every cut, the low-value pages and the
+    skipped pages.
+  - **Offline recompute:** `rebalance_rows()` runs the same logic over an
+    existing `canonical.jsonl`.
+- **Licence evidence is site-level only** (ROADMAP #63): `rel="license"`, a
+  link to a licence page or file, or a licence name in footer text. HTML
+  comments, `<svg>`, `<script>`, `<style>` and body text never count. The
+  HTML parse (`crawl/sources.py::page_evidence`) runs in `asyncio.to_thread`;
+  only its result is recorded on the event loop.
+- **Step 4 (done): pluggable generators** (`generators/`), v2 only.
+  - **Config key:** `generators`, a list of `{name, version, options?}`.
+    The default is `[{"name": "qa", "version": 1}]`. An unknown or
+    duplicate generator, or any option, is a config error.
+  - **Single-call interface:** `wants(unit, page, i)` (cheap filter),
+    `request(unit, page, i)` returning `(system prompt, text)`, and `parse(raw,
+    unit, page, i)` returning a list of field dicts. `parse` raises
+    `MalformedExtractionError` when it can't read the response.
+  - **The worker makes every call:** `extract_worker`'s `guarded_call`
+    applies the breaker gate, the unit semaphore, 429/5xx handling, cost and
+    timing for v1's call and for every generator's. A generator can't make
+    an ungated or uncounted call.
+  - **Labelling:** cost rows, timing events and 5xx releases carry the
+    generator id.
+  - **`PageContext`** holds url, title, section and every unit of the page.
+  - **`qa@1`** sends the provider exactly v1's messages (tested). Its v2
+    rows equal the golden v1 rows field for field, once the header and
+    provenance are removed.
+  - **`code_example@1`** calls only on units with a fenced block. It sends
+    up to `config.CODE_EXAMPLE_CONTEXT_CHARS` of the preceding unit as
+    context, because the chunker often leaves a code block alone in its
+    unit. Its rows have `instruction`, `code`, `language` and `explanation`.
+  - **Malformed answers:** a unit counts as malformed only when every
+    attempted generator's answer was unreadable.
+  - **Quality scoring** applies only to `qa` rows.
+  - **Dry pass:** `estimate.json` gives calls, input characters and tokens
+    per generator. A non-`qa` output ratio is labelled "unmeasured".
+  - **Exporters** skip non-`qa` rows and count them in the dataset card
+    (`skipped_non_qa_rows`, present only when something was skipped).
+- **Step 5 (done): verifier hook** (`verifiers/`), v2 only.
+  - **Config key:** `verifiers`, a list of `{name, version, on_fail:
+    "drop"|"flag", options?}`. The default is `schema@1` with `flag`, and
+    `[]` turns verification off: rows then carry no verification fields.
+  - **Order in the extract path:** generation, then verification, then
+    balancing, then the writer. Caps count only rows that survived, and
+    `commit()` sees only rows actually written.
+  - **On rows:** `verification` (one `{verifier, version, verdict,
+    reasons}` per verifier that applied, in config order) and
+    `verification_status`.
+    - The status is `fail` if any verifier failed, else `unknown` if any
+      was unknown, else `pass`. It's `unverified` when no verifier applied.
+    - `drop` removes a row that fails, and `unknown` never drops. A
+      verifier that raises gives `unknown`.
+  - **In `result.json`:** a `verification` section with pass, fail,
+    unknown and dropped counts per verifier, and written rows by status.
+  - **`schema@1`:** checks the generator's JSON Schema, plus the export
+    validation rules for `qa`. For `code_example`, the code must appear,
+    with whitespace collapsed, in the EXACT text sent. That text is
+    `CodeExampleV1.sent_text(row)`, rebuilt from the row's
+    `source_chunk`, its stored `context` and its title, and capped as the
+    worker caps it.
+  - **`near_duplicate@1`:** order-dependent by design. Within a page the
+    earliest row in chunk order wins; across pages, the order pages finish.
+  - **`code_syntax@1`:** parses only; nothing is executed.
+  - **`external@1`:** the row goes in as JSON on stdin and a JSON verdict
+    comes back on stdout.
+    - **How it runs:** an argv list with no shell, its own process group,
+      an empty temporary cwd that's removed afterwards, and an environment
+      of PATH and LANG only (plus HOME/TMPDIR set to the cwd), so no keys.
+    - **Limits:** stdout capped at
+      `config.EXTERNAL_VERIFIER_MAX_STDOUT_BYTES`, a timeout, and at most
+      `settings.external_verifier_concurrency` processes at once.
+    - **Failures:** on a timeout or oversized output, the group is killed by
+      the child's own PID. A non-zero exit or garbage output is `unknown`.
+    - **An external verifier that runs generated code must sandbox it
+      itself.** The isolation above is not a sandbox.
+- **Run safety settings (v2):**
+  - **`crawl_delay_seconds`:** a floor under per-host request spacing.
+    Spacing is `max(site Crawl-delay or the default, floor)`, so a smaller
+    `robots.txt` value can't undercut it.
+  - **`stop_on_site_429`:** the first 429 from a page or from `robots.txt`
+    stops the run `stopped_early` (exit 1), and the run stays resumable.
+  - **Error pages:** in v2, a page crawl4ai reports as a success but with
+    status ≥ 400 is an HTTP error, never content. Legacy and v1 are
+    unchanged.
+- **Tests that spawn the real `main.py`** must use a config that can't run
+  (an unsupported version, a never-existing run_dir). When version 2
+  became valid, one such test silently ran a real v2 crawl
+  (`LESSONS_LEARNED.md` #91).
 
 ## Control server (`server/`)
 

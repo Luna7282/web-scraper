@@ -13,6 +13,7 @@ AsyncWebCrawler.arun() call -- no network fetch, but genuinely exercises
 CrawlerRunConfig's excluded_tags/excluded_selector and the real
 markdown-generation pipeline, not a stand-in for it.
 """
+import os
 import unittest
 
 from crawl4ai import AsyncWebCrawler
@@ -20,6 +21,16 @@ from crawl4ai import AsyncWebCrawler
 import config
 from content.extraction_units import select_extraction_units
 from main import _make_fetch_fn
+
+try:
+    from netguard import allow_network
+except ImportError:  # pragma: no cover -- run as tests.test_fetch_fn_integration
+    from tests.netguard import allow_network
+
+# These launch a real Chromium (offline: raw: HTML, no fetch). The fast suite's
+# network guard forbids browser launches, so they run with RUN_SLOW_TESTS=1,
+# which is required before any merge (CLAUDE.md).
+SLOW = unittest.skipUnless(os.environ.get("RUN_SLOW_TESTS") == "1", "launches Chromium: set RUN_SLOW_TESTS=1")
 
 FIXTURE_HTML = """
 <html><body>
@@ -38,6 +49,8 @@ FIXTURE_HTML = """
 """
 
 
+@SLOW
+@allow_network
 class TestRealFetchFnStripsChrome(unittest.IsolatedAsyncioTestCase):
     async def test_nav_aside_footer_and_button_chrome_absent_from_real_fetch_output(self):
         async with AsyncWebCrawler() as crawler:
@@ -80,6 +93,8 @@ FURO_STYLE_FIXTURE_HTML = """
 """
 
 
+@SLOW
+@allow_network
 class TestRealFetchFnStripsChromeFromChunkedOutput(unittest.IsolatedAsyncioTestCase):
     async def test_furo_style_chrome_absent_from_every_extraction_chunk(self):
         async with AsyncWebCrawler() as crawler:
