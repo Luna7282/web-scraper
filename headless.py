@@ -78,8 +78,10 @@ SETTINGS: dict[str, Setting] = {
     "use_system_one": Setting("USE_SYSTEM_ONE", "USE_SYSTEM_ONE", bool, False),
     "system_one_provider": Setting("SYSTEM_ONE_PROVIDER", "SYSTEM_ONE_PROVIDER", str, None, allow_none=True),
     "extract_timing_log": Setting("EXTRACT_TIMING_LOG", "EXTRACT_TIMING_LOG", bool, False),
+    "stop_grace_seconds": Setting("STOP_GRACE_SECONDS", "SCRAPER_STOP_GRACE_SECONDS", int, 30),
 }
-_MINIMUMS = {"extract_unit_concurrency": 1, "llm_breaker_threshold": 0, "llm_sdk_max_retries": 0}
+_MINIMUMS = {"extract_unit_concurrency": 1, "llm_breaker_threshold": 0, "llm_sdk_max_retries": 0,
+             "stop_grace_seconds": 0}
 
 
 @dataclass(frozen=True)
@@ -279,6 +281,26 @@ def prepare_run_dir(cfg: dict, clock=time.time) -> str | None:
     return prev_id
 
 
+def repair_canonical_tail(run_dir: str | Path, run_id: str) -> dict | None:
+    """On resume: if canonical.jsonl ends mid-line (a write cut short --
+    possible in principle even with whole-page appends, e.g. disk full), move
+    the incomplete tail into canonical.tail.<run_id>.bin and truncate the file
+    to its last complete line. Never deletes data. Returns what was done, or
+    None if the file was clean."""
+    path = Path(run_dir) / "canonical.jsonl"
+    if not path.exists():
+        return None
+    raw = path.read_bytes()
+    if not raw or raw.endswith(b"\n"):
+        return None
+    keep = raw.rfind(b"\n") + 1
+    sidecar = Path(run_dir) / f"canonical.tail.{run_id}.bin"
+    sidecar.write_bytes(raw[keep:])
+    with open(path, "r+b") as f:
+        f.truncate(keep)
+    return {"bytes_moved": len(raw) - keep, "moved_to": sidecar.name}
+
+
 def describe_error(exc: BaseException) -> dict:
     """Exception type and a short message with absolute paths and key-shaped
     strings removed -- safe for result.json."""
@@ -310,6 +332,9 @@ def build_result(*, outcome: str, exit_code: int, contract_version: int | None, 
     }
     if resumed_from_run_id is not None:
         result["resumed_from_run_id"] = resumed_from_run_id
+    if run_result.get("stop") is not None:
+        result["signal"] = run_result.get("stopped_by_signal")
+        result["stop"] = run_result["stop"]
     if error is not None:
         result["error"] = error
     return result

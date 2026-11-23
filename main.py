@@ -16,6 +16,7 @@ from rich.table import Table
 
 import config
 import headless
+from crawl import graceful
 from llm_factory import get_llm
 from crawl.discovery import discover_branches, fetch_page_links
 from crawl.scope import normalize_url, derive_prefix, is_in_scope
@@ -265,12 +266,48 @@ async def headless_map(cfg: dict) -> dict:
     return {"mode": "map", "counts_by_status": counts, "fatal_errors": fatal_errors}
 
 
-async def headless_crawl(cfg: dict, api_key: str | None = None, context: "headless.RunContext | None" = None) -> dict:
+async def headless_crawl(cfg: dict, api_key: str | None = None, context: "headless.RunContext | None" = None,
+                         *, _crawler_factory=None, _fetch_fn_factory=None, _extract_fn=None) -> dict:
     """Non-interactive equivalent of main() -- same worker wiring, same
     RAG/threshold/provider logic, just no Prompt.ask calls. See
     headless_map's docstring for the seeds/host_prefix_pairs contract and
     why this is always subprocess-launched, never called in-process by
-    the server."""
+    the server.
+
+    With a v1 `context` (headless contract v1), SIGTERM/SIGINT stop the run
+    gracefully (crawl/graceful.py): drain, release, close the crawler, return
+    `stopped_by_signal`; a second signal exits at once. Legacy (context None)
+    installs no handlers. The underscore arguments are test seams (a fake
+    crawler, fetch or extractor); production never passes them."""
+    loop = asyncio.get_running_loop()
+    stop = None
+    if context is not None:
+        stop = graceful.GracefulStop(on_second=_second_signal_exit(cfg["run_dir"], context))
+        stop.install(loop)
+    try:
+        return await _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _fetch_fn_factory,
+                                          _extract_fn)
+    finally:
+        if stop is not None:
+            stop.uninstall(loop)
+
+
+def _second_signal_exit(run_dir: str, context: "headless.RunContext"):
+    """A second signal: record what happened (best effort) and exit now,
+    without cleanup -- the user asked twice. A browser may be left running;
+    CLAUDE.md documents recovery by recorded PID."""
+    def on_second(signame: str) -> None:
+        code = headless.EXIT_INTERRUPTED if signame == "SIGINT" else headless.EXIT_STOPPED_BY_SIGNAL
+        headless.write_result(run_dir, {
+            "contract_version": 1, "run_id": context.run_id, "outcome": "stopped_immediately",
+            "exit_code": code, "signal": signame, "scraper_version": context.scraper_version,
+            "finished_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "note": "second signal: exited without draining, releasing rows or closing the browser"})
+        os._exit(code)
+    return on_second
+
+
+async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _fetch_fn_factory, _extract_fn):
     config.validate_system_one_config()
     run_dir = cfg["run_dir"]
     os.makedirs(run_dir, exist_ok=True)
@@ -293,7 +330,7 @@ async def headless_crawl(cfg: dict, api_key: str | None = None, context: "headle
     embed_fn = _make_embed_fn(embeddings)
     intent_embedding = await embed_fn(intent) if intent else None
     score_fn = make_score_fn(intent, intent_embedding, embed_fn)
-    extract_fn = _make_extract_fn(llm, record_usage=config.EXTRACT_TIMING_LOG)
+    extract_fn = _extract_fn or _make_extract_fn(llm, record_usage=config.EXTRACT_TIMING_LOG)
     extraction_units_fn = make_extraction_units_fn(
         config.EXTRACTION_STRATEGY, embed_fn=embed_fn, intent_embedding=intent_embedding,
     )
@@ -330,16 +367,24 @@ async def headless_crawl(cfg: dict, api_key: str | None = None, context: "headle
     writer = Writer(canonical_path, chroma_upsert_fn=chroma_upsert_fn)
     crawl_workers_n = cfg.get("crawl_workers", 5)
     extract_workers_n = cfg.get("extract_workers", 2)
+    fatal_errors: list[str] = []
+    stop_info = None
 
-    async with AsyncWebCrawler() as crawler:
-        fetch_fn = _make_fetch_fn(crawler)
+    if stop is not None and stop.event.is_set():  # signalled during startup: start nothing
+        counts = await frontier.counts_by_status()
+        await frontier.close()
+        return {"mode": "crawl", "counts_by_status": counts, "fatal_errors": fatal_errors,
+                "stopped_by_signal": stop.signal_name, "stop": {"phase": "startup", "drained": True,
+                                                                "waited_seconds": 0.0, "released_rows": 0}}
+
+    async with (_crawler_factory or AsyncWebCrawler)() as crawler:
+        fetch_fn = (_fetch_fn_factory or _make_fetch_fn)(crawler)
         content_queue = asyncio.Queue(maxsize=max(4, crawl_workers_n * 2))
         results_queue = asyncio.Queue(maxsize=max(4, extract_workers_n * 2))
         politeness = HostPoliteness(
             max_concurrent_per_host=config.MAX_CONCURRENT_REQUESTS_PER_HOST,
             default_delay_seconds=config.DEFAULT_POLITENESS_DELAY_SECONDS,
         )
-        fatal_errors: list[str] = []
         timing = _start_timing_log(
             run_dir, provider_name, model_name, crawl_workers_n, extract_workers_n,
             cfg.get("max_pages"), quality_backend is not None,
@@ -366,15 +411,31 @@ async def headless_crawl(cfg: dict, api_key: str | None = None, context: "headle
             for _ in range(extract_workers_n)
         ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
 
-        await frontier.quiescent.wait()
+        if stop is None:
+            await frontier.quiescent.wait()
+        else:
+            finished = asyncio.ensure_future(frontier.quiescent.wait())
+            signalled = asyncio.ensure_future(stop.event.wait())
+            await asyncio.wait({finished, signalled}, return_when=asyncio.FIRST_COMPLETED)
+            for w in (finished, signalled):
+                w.cancel()
+            if stop.event.is_set() and not frontier.quiescent.is_set():
+                stop_info = {"phase": "running", **await graceful.drain(frontier, config.STOP_GRACE_SECONDS)}
+                frontier.quiescent.set()
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if stop_info is not None:
+            stop_info["released_rows"] = await frontier.release_in_progress("released_on_stop")
         await _stop_timing_log(timing)
+    # Leaving `async with` closed the crawler -- and with it Chromium.
 
     counts = await frontier.counts_by_status()
     await frontier.close()
-    return {"mode": "crawl", "counts_by_status": counts, "fatal_errors": fatal_errors}
+    result = {"mode": "crawl", "counts_by_status": counts, "fatal_errors": fatal_errors}
+    if stop_info is not None:
+        result.update({"stopped_by_signal": stop.signal_name, "stop": stop_info})
+    return result
 
 
 async def headless_run(cfg: dict, api_key: str | None = None, context: "headless.RunContext | None" = None) -> dict:
@@ -402,13 +463,15 @@ def headless_v1_entry(cfg: dict, run=None, out=None, err=None, environ=None, ver
     run_dir = cfg.get("run_dir") if isinstance(cfg, dict) and isinstance(cfg.get("run_dir"), str) else None
 
     def finish(outcome, code, *, hr=None, run_id=None, run_result=None, error=None, resumed_from=None,
-               print_line=True):
+               repaired=None, print_line=True):
         result = headless.build_result(
             outcome=outcome, exit_code=code, contract_version=hr.contract_version if hr else cfg.get("contract_version"),
             run_id=run_id, version=version, effective=hr.effective if hr else None,
             mode=cfg.get("mode") if isinstance(cfg, dict) else None,
             api_key_env=hr.api_key_env if hr else None, environ=environ, started_at=started_at,
             run_result=run_result, error=error, resumed_from_run_id=resumed_from)
+        if repaired:
+            result["repaired_canonical_tail"] = repaired
         writable_target = run_dir and os.path.isdir(run_dir) and not (
             outcome == "config_error" and headless.state_files(run_dir))  # never clobber an earlier run's result
         if writable_target and not headless.write_result(run_dir, result):
@@ -430,10 +493,11 @@ def headless_v1_entry(cfg: dict, run=None, out=None, err=None, environ=None, ver
         print(f"config error: {e}", file=err)
         return finish("config_error", headless.EXIT_CONFIG_ERROR, hr=hr, run_id=run_id,
                       error={"type": "HeadlessConfigError", "message": str(e)}, print_line=False)
+    repaired = headless.repair_canonical_tail(hr.cfg["run_dir"], run_id) if resumed_from is not None else None
     api_key = environ[hr.api_key_env].strip() if hr.api_key_env else None
     context = headless.RunContext(run_id=run_id, scraper_version=version["version"])
     run = headless_run if run is None else run
-    common = {"hr": hr, "run_id": run_id, "resumed_from": resumed_from}
+    common = {"hr": hr, "run_id": run_id, "resumed_from": resumed_from, "repaired": repaired}
     try:
         with headless.applied_settings(hr.effective):
             config.validate_system_one_config()
@@ -449,6 +513,10 @@ def headless_v1_entry(cfg: dict, run=None, out=None, err=None, environ=None, ver
         described = headless.describe_error(e)
         print(f"crashed: {described['type']}: {described['message']}", file=err)
         return finish("crashed", headless.EXIT_STOPPED_EARLY, error=described, **common)
+    if result.get("stopped_by_signal") == "SIGINT":
+        return finish("interrupted", headless.EXIT_INTERRUPTED, run_result=result, **common)
+    if result.get("stopped_by_signal"):
+        return finish("stopped_by_signal", headless.EXIT_STOPPED_BY_SIGNAL, run_result=result, **common)
     if result.get("fatal_errors"):
         return finish("stopped_early", headless.EXIT_STOPPED_EARLY, run_result=result, **common)
     return finish("ok", headless.EXIT_OK, run_result=result, **common)

@@ -97,6 +97,13 @@ EXTRACT_UNIT_CONCURRENCY = int(os.getenv("EXTRACT_UNIT_CONCURRENCY", "1"))
 # single row's backoff.
 RATE_LIMIT_MAX_BACKOFF_SECONDS = 300.0
 
+# Headless contract v1 graceful stop (Brief 3A Step 3): after SIGTERM/SIGINT,
+# how long in-flight pages get to finish and be written before the workers
+# are cancelled and still-claimed rows are put back to 'queued'. In-flight
+# LLM calls can't be cancelled (ROADMAP #58), so this is their window to
+# finish. v1 setting "stop_grace_seconds"; legacy runs install no handlers.
+STOP_GRACE_SECONDS = int(os.getenv("SCRAPER_STOP_GRACE_SECONDS", "30"))
+
 # Count terminally failed pages toward max_pages (crawl/frontier.py
 # count_failed_toward_budget). Off by default = the original budget
 # (done/skipped_extract/mapped only). On: genuine fetch/extraction failures
