@@ -344,6 +344,13 @@ class TestDryPass(V2RunCase):
         self.assertIn("Brief 2c real run", estimate["token_estimate"]["basis"])
         self.assertEqual(estimate["expected_calls"]["preflight"], 1)
         self.assertEqual(result["counts_by_status"], {"mapped": 3})
+        # Fingerprints: one per page, one sha per unit, sizes matching units_per_page.
+        prints = estimate["page_fingerprints"]
+        self.assertEqual(set(prints), set(estimate["units_per_page"]))
+        for url, fp in prints.items():
+            self.assertRegex(fp["content_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(len(fp["unit_chars"]), estimate["units_per_page"][url])
+            self.assertEqual(len(fp["unit_sha256"]), len(fp["unit_chars"]))
 
     def test_the_dry_pass_unit_count_equals_a_real_runs_calls(self):
         """Same fixture pages, same chunker: estimate.total_units == the

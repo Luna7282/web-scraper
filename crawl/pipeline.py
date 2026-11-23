@@ -8,6 +8,7 @@ tests/test_crawl_worker.py, tests/test_extract_worker.py.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import functools
 import math
 import re
@@ -787,6 +788,10 @@ async def extract_worker(
         await frontier.content_done(content_queue)
 
 
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 async def estimate_worker(
     frontier: Frontier,
     content_queue: asyncio.Queue,
@@ -801,8 +806,8 @@ async def estimate_worker(
     decisions without its LLM calls. Same score, same follow/promote, same
     extract_threshold skip, same extraction_units_fn -- so the pages and
     units match what a real run would extract -- then records each page's
-    unit sizes in `pages` (url -> {"units": [chars, ...]} or {"skipped":
-    reason}) and marks it 'mapped' (fetched, nothing extracted; it counts
+    unit sizes in `pages` (url -> {"units": [chars, ...], "content_sha256",
+    "unit_sha256": [...]} or {"skipped": reason}) and marks it 'mapped' (fetched, nothing extracted; it counts
     toward max_pages like 'done')."""
     while True:
         try:
@@ -825,7 +830,8 @@ async def estimate_worker(
             await frontier.content_done(content_queue)
             continue
         units = await extraction_units_fn(content) if extraction_units_fn else [content]
-        pages[url] = {"units": [len(u) for u in units]}
+        pages[url] = {"units": [len(u) for u in units], "content_sha256": _sha256(content),
+                      "unit_sha256": [_sha256(u) for u in units]}
         await frontier.mark_mapped(url)
         await frontier.content_done(content_queue)
 

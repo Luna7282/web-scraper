@@ -34,6 +34,11 @@ def build_estimate(pages: dict, *, provider: str, model: str, system_prompt: str
         "provider": provider, "model": model, "generators": [{**generator, "units": total_units}],
         "pages": len(pages), "pages_skipped": {u: p["skipped"] for u, p in sorted(pages.items()) if "skipped" in p},
         "units_per_page": units_per_page, "total_units": total_units, "expected_calls": calls,
+        # Fingerprints of what was chunked, to tell "the page changed" from
+        # "the estimate is wrong" when a later real run differs.
+        "page_fingerprints": {u: {"content_sha256": p.get("content_sha256"), "unit_chars": p["units"],
+                                  "unit_sha256": p.get("unit_sha256", [])}
+                              for u, p in sorted(pages.items()) if "units" in p},
         "input_chars": input_chars,
         "token_estimate": {"input_tokens": input_tokens,
                            "output_tokens": round(input_tokens * config.ESTIMATE_OUTPUT_PER_INPUT_TOKEN),
