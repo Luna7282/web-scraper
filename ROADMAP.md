@@ -1253,6 +1253,10 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     summary line ("Creative Commons named, MIT License") reads as if the site
     were licensed that way. Candidate fix: ignore matches inside HTML comments
     and `<svg>` elements, or report them as a separate "embedded asset" kind.
+    **Resolved (Brief 3B, after Step 3):** only site-level evidence counts now
+    (rel="license", a link to a licence page or file, licence names in footer
+    text). Comments, `<svg>`, `<script>`, `<style>` and body text are ignored.
+    The saved fastapi pages give `none_found`.
 
 64. **[Found 2026-11-23, Brief 3B Step 3] A per-page row cap can't bound the
     largest page's share in a small run.** With 3 pages the largest is always

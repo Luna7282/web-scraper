@@ -26,6 +26,7 @@ from crawl.sources import (
     SourceRecorder,
     ai_agent_rules,
     licence_evidence,
+    page_evidence,
     page_noai_tags,
     parse_content_signals,
 )
@@ -168,6 +169,76 @@ class TestSignals(unittest.TestCase):
         self.assertTrue({"rel=license link", "MIT License", "Creative Commons licence link"} <= kinds)
         self.assertTrue(all(e["url"] == "https://x.test/page" and 0 < len(e["snippet"]) <= 160 for e in ev))
         self.assertEqual(licence_evidence("<p>No licence words here.</p>", "u"), [])
+
+
+FONT_AWESOME_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.2.0 by '
+                    '@fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: '
+                    'CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2026 Fonticons, Inc.--><path d="M0"/>'
+                    '</svg>')
+PAGE_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+class TestLicenceEvidenceIsSiteLevelOnly(unittest.TestCase):
+    """ROADMAP #63: only rel=license, licence links and footer text count;
+    comments, <svg>, <script>, <style> and body text never do."""
+
+    def test_the_font_awesome_icon_comment_is_not_evidence(self):
+        html = f"<html><body><p>Docs</p>{FONT_AWESOME_SVG}<footer>Made with a generator {FONT_AWESOME_SVG}</footer>"
+        self.assertEqual(licence_evidence(html, "u"), [])
+
+    def test_comments_scripts_styles_and_svg_are_ignored(self):
+        html = ("<footer><!-- MIT License --><script>var l = 'MIT License';</script>"
+                "<style>/* Apache License, Version 2.0 */</style><svg><text>CC BY 4.0</text>"
+                "<a href='https://creativecommons.org/licenses/by/4.0/'>x</a></svg></footer>")
+        self.assertEqual(licence_evidence(html, "u"), [])
+
+    def test_licence_names_in_body_text_are_not_site_evidence(self):
+        html = "<main><h2>License</h2><p>This project is licensed under the terms of the MIT License.</p></main>"
+        self.assertEqual(licence_evidence(html, "u"), [])
+
+    def test_links_to_licence_pages_and_files(self):
+        for href, kind in (("https://github.com/o/r/blob/main/LICENSE", "licence link"),
+                           ("/LICENSE.md", "licence link"), ("/about/licence/", "licence link"),
+                           ("https://opensource.org/licenses/MIT", "licence link"),
+                           ("https://creativecommons.org/licenses/by-sa/4.0/", "Creative Commons licence link")):
+            with self.subTest(href=href):
+                (ev,) = licence_evidence(f'<p><a href="{href}">terms</a></p>', "u")
+                self.assertEqual((ev["kind"], ev["where"], ev["snippet"]), (kind, "licence link", f'href="{href}"'))
+        for href in ("#license", "conduct.html#license", "/licenses-of-dependencies-explained"):
+            with self.subTest(href=href):
+                self.assertEqual(licence_evidence(f'<a href="{href}">x</a>', "u"), [])
+
+    def test_footer_by_tag_role_or_footer_class_but_not_a_body_class(self):
+        for wrap in ("<footer>{}</footer>", '<div role="contentinfo">{}</div>', '<div class="md-footer-meta">{}</div>'):
+            with self.subTest(wrap=wrap):
+                (ev,) = licence_evidence(wrap.format("Content licensed under CC BY 4.0."), "u")
+                self.assertEqual((ev["kind"], ev["where"]), ("Creative Commons named", "footer"))
+        body = '<body class="has-footer"><p>We discuss the MIT License here.</p><footer>Copyright 2026</footer></body>'
+        self.assertEqual(licence_evidence(body, "u"), [])
+
+    def test_saved_fastapi_pages_give_none_found(self):
+        """The real pages behind the misleading Brief 3B dry-pass record."""
+        for name in ("fastapi_tiangolo.server.html", "fastapi_tiangolo.rendered.html"):
+            with self.subTest(name=name):
+                html = (PAGE_FIXTURES / name).read_text()
+                self.assertIn("Font Awesome Free", html)  # the comment is still there
+                self.assertEqual(licence_evidence(html, "https://fastapi.tiangolo.com/"), [])
+                rec = SourceRecorder()
+                rec.record_robots("https://fastapi.tiangolo.com/robots.txt", 200, "User-agent: *\nAllow: /\n")
+                rec.observe_page("https://fastapi.tiangolo.com/", {}, html)
+                (record,) = rec.build({})
+                self.assertEqual(record["licence"], NOTHING_FOUND)
+
+    def test_page_evidence_is_what_observe_page_records(self):
+        html = '<footer><a rel="license" href="/LICENSE">MIT License</a></footer>'
+        a, b = SourceRecorder(), SourceRecorder()
+        for rec in (a, b):
+            rec.record_robots("https://s.test/robots.txt", 200, "")
+        a.observe_page("https://s.test/p", {"X-Robots-Tag": "noai"}, html)
+        b.record_evidence("https://s.test/p", page_evidence("https://s.test/p", {"X-Robots-Tag": "noai"}, html))
+        self.assertEqual(a.build({}), b.build({}))
+        self.assertEqual(a.build({})[0]["licence"],
+                         "evidence only (not a legal determination): MIT License, rel=license link")
 
 
 class TestSourceRecords(unittest.TestCase):

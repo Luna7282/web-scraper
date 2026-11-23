@@ -23,7 +23,7 @@ from llm_factory import get_llm
 from crawl.discovery import discover_branches, fetch_page_links
 from crawl.scope import normalize_url, derive_prefix, is_in_scope
 from crawl.frontier import ROBOTS_DISALLOWED_ERROR, Frontier
-from crawl.sources import SourceRecorder
+from crawl.sources import SourceRecorder, page_evidence
 from crawl.cost import CostLedger
 from estimate import build_estimate
 from content.balance import Balancer, BalanceSettings
@@ -424,7 +424,7 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
         if _fetch_fn_factory is not None:
             fetch_fn = _fetch_fn_factory(crawler)
         else:
-            fetch_fn = _make_fetch_fn(crawler, observer=recorder.observe_page if v2 else None)
+            fetch_fn = _make_fetch_fn(crawler, observer=recorder.record_evidence if v2 else None)
         content_queue = asyncio.Queue(maxsize=max(4, crawl_workers_n * 2))
         results_queue = asyncio.Queue(maxsize=max(4, extract_workers_n * 2))
         politeness = HostPoliteness(
@@ -1100,7 +1100,8 @@ def _make_fetch_fn(crawler: AsyncWebCrawler, observer=None):
                 raise BrowserDriverError(error_message)
             raise FetchTimeout(error_message)
         if observer is not None:  # contract v2: source-record evidence (headers, raw HTML)
-            observer(url, result.response_headers, result.html)
+            # The HTML parse runs off the event loop; only the result is recorded on it.
+            observer(url, await asyncio.to_thread(page_evidence, url, result.response_headers, result.html))
         links = result.links.get("internal", []) + result.links.get("external", [])
         raw_hrefs = [l.get("href", "") for l in links if l.get("href")]
         markdown = strip_text_patterns(normalize_link_text(result.markdown))
