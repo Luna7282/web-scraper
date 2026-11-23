@@ -5797,3 +5797,37 @@ evidence counts now.
   ```` ```uvx library-skills``` ````, with the explanation in the unit before.
   So `code_example@1` sends up to 1,500 characters of the preceding unit
   as context.
+
+### 95. Brief 3B Step 5: verifiers. Grounding needs the exact text sent, and a killed child's pipes must be drained
+
+**What was built** (`198a03c`): the `verifiers/` hook with `schema@1`,
+`near_duplicate@1`, `code_syntax@1` and `external@1`, plus drop/flag,
+per-row verdicts and `result.json` counts. Order in the extract path:
+generation, verification, balancing, writer.
+
+**Grounding check, "code appears in the source":**
+- **The source must be what the model saw,** not just the unit.
+  `code_example@1` sends the preceding unit as context, so code copied from
+  the context is grounded, and code beyond the 4,000-character cap was
+  never seen.
+- **Rows now store the exact `context` sent.** `sent_text(row)` rebuilds
+  the capped request from the row, so the check can be repeated later,
+  offline.
+- **Tests:**
+  - hallucinated code fails;
+  - code present only in the context passes;
+  - code present only past the cap fails.
+
+**Leak found under `-W error::ResourceWarning`:** after killing an
+external verifier for oversized output, the stdout transport stayed open.
+`proc.wait()` isn't enough; `communicate()` drains the pipes to EOF and
+closes them. The timeout test also checks that a grandchild dies with the
+group: it's killed via `killpg` on the child's own PID, never by name.
+
+**Measured on Brief 2c's 276 real rows** (offline, as v2 `qa`):
+- **`schema@1`:** 276 pass.
+- **`near_duplicate@1`:** flags 2, both exact repeats across pages: the
+  root page's `read_item` question, and the `uv add "fastapi[standard]"`
+  question asked on both `/tutorial/` and `/features/`.
+- **Caveat:** this is one small dataset. The 0.9 threshold isn't
+  calibrated beyond it.

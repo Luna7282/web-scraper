@@ -56,6 +56,11 @@ not by accident.
 | `generators/` | `__init__.py` | Contract v2 `Generator` interface (`wants`/`request`/`parse`), registry, `parse_json_array` |
 | | `qa.py` | `qa@1`: today's Q&A extraction as a generator (same prompt, request and parser) |
 | | `code_example.py` | `code_example@1`: instruction/code pairs from units with fenced code |
+| `verifiers/` | `__init__.py` | Contract v2 `Verifier` interface, registry, `VerifierRunner` (drop/flag, statuses, report) |
+| | `schema.py` | `schema@1`: generator JSON Schema + export rules; code must appear in the exact text sent |
+| | `near_duplicate.py` | `near_duplicate@1`: same/near-same question or instruction+code within a run (order-dependent) |
+| | `code_syntax.py` | `code_syntax@1`: `ast.parse` / `json.loads` only, never executes |
+| | `external.py` | `external@1`: a supplied command, no shell, own process group, minimal env, timeout, stdout cap |
 | `storage/` | `writer.py` | Sole owner of the canonical JSONL file + Chroma upsert calls |
 | | `chunk_store.py` | Content-hash chunk IDs, `ChunkStore.add_or_merge_chunk`, embedding-identity check |
 | | `canonical.py` | The canonical record schema + `build_canonical_record` |
@@ -757,6 +762,43 @@ legacy runs take today's code paths (the v2 branches are all behind
     per generator. A non-`qa` output ratio is labelled "unmeasured".
   - **Exporters** skip non-`qa` rows and count them in the dataset card
     (`skipped_non_qa_rows`, present only when something was skipped).
+- **Step 5 (done): verifier hook** (`verifiers/`), v2 only.
+  - **Config key:** `verifiers`, a list of `{name, version, on_fail:
+    "drop"|"flag", options?}`. The default is `schema@1` with `flag`, and
+    `[]` turns verification off: rows then carry no verification fields.
+  - **Order in the extract path:** generation, then verification, then
+    balancing, then the writer. Caps count only rows that survived, and
+    `commit()` sees only rows actually written.
+  - **On rows:** `verification` (one `{verifier, version, verdict,
+    reasons}` per verifier that applied, in config order) and
+    `verification_status`.
+    - The status is `fail` if any verifier failed, else `unknown` if any
+      was unknown, else `pass`. It's `unverified` when no verifier applied.
+    - `drop` removes a row that fails, and `unknown` never drops. A
+      verifier that raises gives `unknown`.
+  - **In `result.json`:** a `verification` section with pass, fail,
+    unknown and dropped counts per verifier, and written rows by status.
+  - **`schema@1`:** checks the generator's JSON Schema, plus the export
+    validation rules for `qa`. For `code_example`, the code must appear,
+    with whitespace collapsed, in the EXACT text sent. That text is
+    `CodeExampleV1.sent_text(row)`, rebuilt from the row's
+    `source_chunk`, its stored `context` and its title, and capped as the
+    worker caps it.
+  - **`near_duplicate@1`:** order-dependent by design. Within a page the
+    earliest row in chunk order wins; across pages, the order pages finish.
+  - **`code_syntax@1`:** parses only; nothing is executed.
+  - **`external@1`:** the row goes in as JSON on stdin and a JSON verdict
+    comes back on stdout.
+    - **How it runs:** an argv list with no shell, its own process group,
+      an empty temporary cwd that's removed afterwards, and an environment
+      of PATH and LANG only (plus HOME/TMPDIR set to the cwd), so no keys.
+    - **Limits:** stdout capped at
+      `config.EXTERNAL_VERIFIER_MAX_STDOUT_BYTES`, a timeout, and at most
+      `settings.external_verifier_concurrency` processes at once.
+    - **Failures:** on a timeout or oversized output, the group is killed by
+      the child's own PID. A non-zero exit or garbage output is `unknown`.
+    - **An external verifier that runs generated code must sandbox it
+      itself.** The isolation above is not a sandbox.
 - **Tests that spawn the real `main.py`** must use a config that can't run
   (an unsupported version, a never-existing run_dir). When version 2
   became valid, one such test silently ran a real v2 crawl
