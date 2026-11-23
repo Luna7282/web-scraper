@@ -24,8 +24,11 @@ from crawl.discovery import discover_branches, fetch_page_links
 from crawl.scope import normalize_url, derive_prefix, is_in_scope
 from crawl.frontier import ROBOTS_DISALLOWED_ERROR, Frontier
 from crawl.sources import SourceRecorder
+from crawl.cost import CostLedger
+from estimate import build_estimate
+from preflight import PreflightFailed, embeddings_preflight, needs_embeddings, provider_preflight
 from storage.canonical import build_canonical_record_v2
-from crawl.pipeline import crawl_worker, extract_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError, ProviderUnavailableError, TRANSIENT_PROVIDER_STATUSES
+from crawl.pipeline import crawl_worker, extract_worker, estimate_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError, ProviderUnavailableError, TRANSIENT_PROVIDER_STATUSES
 from crawl.politeness import HostPoliteness
 from crawl.timing import TimingLog, call_usage, usage_from_message
 from crawl.provenance import call_served_model, served_model_from_message
@@ -273,7 +276,7 @@ async def headless_map(cfg: dict) -> dict:
 
 async def headless_crawl(cfg: dict, api_key: str | None = None, context: "headless.RunContext | None" = None,
                          *, _crawler_factory=None, _fetch_fn_factory=None, _extract_fn=None,
-                         _http_fetch=None) -> dict:
+                         _http_fetch=None, _llm=None, _embeddings=None) -> dict:
     """Non-interactive equivalent of main() -- same worker wiring, same
     RAG/threshold/provider logic, just no Prompt.ask calls. See
     headless_map's docstring for the seeds/host_prefix_pairs contract and
@@ -292,7 +295,7 @@ async def headless_crawl(cfg: dict, api_key: str | None = None, context: "headle
         stop.install(loop)
     try:
         return await _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _fetch_fn_factory,
-                                          _extract_fn, _http_fetch)
+                                          _extract_fn, _http_fetch, _llm, _embeddings)
     finally:
         if stop is not None:
             stop.uninstall(loop)
@@ -314,9 +317,10 @@ def _second_signal_exit(run_dir: str, context: "headless.RunContext"):
 
 
 async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _fetch_fn_factory, _extract_fn,
-                               _http_fetch=None):
+                               _http_fetch=None, _llm=None, _embeddings=None):
     config.validate_system_one_config()
     v2 = context is not None and context.contract_version >= 2
+    dry = v2 and bool(cfg.get("dry_run"))  # contract v2 dry pass: fetch + chunk, zero LLM calls
     run_dir = cfg["run_dir"]
     os.makedirs(run_dir, exist_ok=True)
     db_path = os.path.join(run_dir, "frontier.db")
@@ -327,7 +331,27 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
     scope_check = _make_scope_check(host_prefix_pairs)
     intent = cfg.get("intent") or None
 
-    provider_name, model_name, llm, embeddings = _resolve_llm(cfg, api_key=api_key)
+    if dry or _llm is not None:
+        # Dry pass: the chat provider is never constructed (no client, no call).
+        # _llm is a test seam standing in for the provider.
+        provider_name = cfg.get("provider", "gemini")
+        model_name = cfg.get("model") or _DEFAULT_MODEL_BY_PROVIDER[provider_name]
+        llm = None if dry else _llm
+        if _embeddings is not None:
+            embeddings = _embeddings
+        else:
+            from llm_factory import LocalOllamaEmbeddings
+            embeddings = LocalOllamaEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    else:
+        provider_name, model_name, llm, embeddings = _resolve_llm(cfg, api_key=api_key)
+
+    # Contract v2 preflights, before any page work (preflight.py).
+    cost = CostLedger(provider_name, model_name) if v2 and not dry else None
+    preflight_info = {}
+    if v2 and config.EMBEDDINGS_PREFLIGHT and needs_embeddings(cfg):
+        preflight_info["embeddings"] = await embeddings_preflight(embeddings, EMBEDDING_MODEL_NAME)
+    if v2 and not dry and config.PROVIDER_PREFLIGHT:
+        preflight_info["provider"] = await provider_preflight(llm, provider_name, model_name, cost)
 
     frontier = Frontier(db_path, max_pages=cfg.get("max_pages"), max_depth=cfg.get("max_depth"),
                         count_failed_toward_budget=config.MAX_PAGES_COUNTS_FAILED)
@@ -340,7 +364,7 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
     embed_fn = _make_embed_fn(embeddings)
     intent_embedding = await embed_fn(intent) if intent else None
     score_fn = make_score_fn(intent, intent_embedding, embed_fn)
-    extract_fn = _extract_fn or _make_extract_fn(llm, record_usage=config.EXTRACT_TIMING_LOG)
+    extract_fn = None if dry else (_extract_fn or _make_extract_fn(llm, record_usage=config.EXTRACT_TIMING_LOG or v2))
     extraction_units_fn = make_extraction_units_fn(
         config.EXTRACTION_STRATEGY, embed_fn=embed_fn, intent_embedding=intent_embedding,
     )
@@ -349,7 +373,8 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
                                if v2 else _http_get_text)
     record_builder = _make_v2_record_builder(context, provider_name, model_name, llm) if v2 else None
 
-    quality_backend = make_quality_backend(_make_decision_chat_fn(llm)) if cfg.get("enable_quality_scoring") else None
+    quality_backend = (make_quality_backend(_make_decision_chat_fn(llm))
+                       if cfg.get("enable_quality_scoring") and not dry else None)
     # None (unset): extract_worker looks up the per-method default itself
     # (config.DECISION_THRESHOLDS) once it knows which backend answered --
     # not resolved here, since this run's active method isn't necessarily
@@ -358,7 +383,7 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
 
     chunk_fn = None
     chroma_upsert_fn = None
-    if cfg.get("build_rag"):
+    if cfg.get("build_rag") and not dry:
         import chromadb
         chroma_client = chromadb.PersistentClient(path=os.path.join(run_dir, "chroma_db"))
         collection = get_or_create_collection(
@@ -377,7 +402,8 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
             for c in chunks:
                 await chunk_store.add_or_merge_chunk(c["text"], url, c["parent_text"])
 
-    writer = Writer(canonical_path, chroma_upsert_fn=chroma_upsert_fn)
+    writer = None if dry else Writer(canonical_path, chroma_upsert_fn=chroma_upsert_fn)
+    dry_pages: dict = {}
     crawl_workers_n = cfg.get("crawl_workers", 5)
     extract_workers_n = cfg.get("extract_workers", 2)
     fatal_errors: list[str] = []
@@ -414,7 +440,14 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
                              use_fetch_urls=v2)
             )
             for _ in range(crawl_workers_n)
-        ] + [
+        ]
+        if dry:
+            tasks += [asyncio.create_task(
+                estimate_worker(frontier, content_queue, score_fn, cfg.get("extract_threshold", 0.0),
+                                cfg.get("follow_threshold", 0.0), extraction_units_fn, dry_pages))
+                for _ in range(extract_workers_n)]
+        else:
+            tasks += [
             asyncio.create_task(
                 extract_worker(frontier, content_queue, results_queue, score_fn, extract_fn,
                                 cfg.get("extract_threshold", 0.0), cfg.get("follow_threshold", 0.0),
@@ -425,10 +458,10 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
                                 timing=timing, unit_concurrency=config.EXTRACT_UNIT_CONCURRENCY,
                                 breaker=breaker, scraper_version=context.scraper_version if context else None,
                                 llm_unavailable_max_releases=config.LLM_UNAVAILABLE_MAX_RELEASES,
-                                record_builder=record_builder)
+                                record_builder=record_builder, cost=cost)
             )
             for _ in range(extract_workers_n)
-        ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
+            ] + [asyncio.create_task(writer_worker(frontier, results_queue, writer))]
 
         if stop is None:
             await frontier.quiescent.wait()
@@ -458,6 +491,18 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
     result = {"mode": "crawl", "counts_by_status": counts, "fatal_errors": fatal_errors}
     if sources is not None:
         result["sources"] = sources
+    if v2:
+        result["preflight"] = preflight_info
+    if cost is not None:
+        result["cost"] = cost.to_dict()
+    if dry:
+        estimate = build_estimate(
+            dry_pages, provider=provider_name, model=model_name,
+            system_prompt=_EXTRACTION_SYSTEM_PROMPTS[config.EXTRACTION_PROMPT_VARIANT],
+            generator={"name": "qa", "version": 1}, provider_preflight=config.PROVIDER_PREFLIGHT,
+            quality_scoring=bool(cfg.get("enable_quality_scoring")))
+        await asyncio.to_thread(_write_json_atomic, os.path.join(run_dir, ESTIMATE_FILE), estimate)
+        result.update({"dry_run": True, "estimate": estimate})
     if stop_info is not None:
         result.update({"stopped_by_signal": stop.signal_name, "stop": stop_info})
     return result
@@ -533,6 +578,10 @@ def headless_v1_entry(cfg: dict, run=None, out=None, err=None, environ=None, ver
         print(f"config error: {e}", file=err)
         return finish("config_error", headless.EXIT_CONFIG_ERROR, error=headless.describe_error(e),
                       print_line=False, **common)
+    except PreflightFailed as e:  # contract v2: retired model, rejected key, missing embeddings
+        print(f"config error: {e}", file=err)
+        return finish("config_error", headless.EXIT_CONFIG_ERROR,
+                      error={"type": "PreflightFailed", "message": str(e)}, print_line=False, **common)
     except KeyboardInterrupt:
         print("Interrupted.", file=err)
         return finish("interrupted", headless.EXIT_INTERRUPTED, **common)
@@ -904,6 +953,7 @@ def _recording_text_fetch(recorder: SourceRecorder, fetch_status_text):
 
 
 SOURCES_FILE = "sources.json"
+ESTIMATE_FILE = "estimate.json"
 
 
 def _write_json_atomic(path: str, data) -> None:

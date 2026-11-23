@@ -308,6 +308,7 @@ class TestV2Run(unittest.TestCase):
                "extract_workers": 1, "intent": "", "settings": {"llm_breaker_threshold": 0}}
         if version == 2:
             cfg["model_pinned_version"] = "requested-model@2026-11-01"
+            cfg["settings"]["provider_preflight"] = False  # preflight has its own tests (fake provider)
 
         async def extract(unit):
             call_served_model.set("provider-served-v7")  # what the provider's response said

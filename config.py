@@ -122,6 +122,24 @@ SITE_RETRY_BACKOFF = os.getenv("SCRAPER_SITE_RETRY_BACKOFF", "false").strip().lo
 # counted retry, no backoff).
 LLM_UNAVAILABLE_MAX_RELEASES = int(os.getenv("SCRAPER_LLM_UNAVAILABLE_MAX_RELEASES", "0"))
 
+# Brief 3B Step 2 (contract v2 only; headless.SETTINGS_V2_ONLY overrides per
+# run). Before any page work: one tiny provider call (a retired model or a
+# rejected key fails the run with exit 2), and one embedding when the run
+# needs embeddings (intent, RAG, top_k_chunks_by_relevance).
+PROVIDER_PREFLIGHT = os.getenv("SCRAPER_PROVIDER_PREFLIGHT", "true").strip().lower() == "true"
+EMBEDDINGS_PREFLIGHT = os.getenv("SCRAPER_EMBEDDINGS_PREFLIGHT", "true").strip().lower() == "true"
+PREFLIGHT_MAX_TOKENS = 16
+# Dry-pass token estimate (estimate.json). Basis, measured: the Brief 2c real
+# run (fastapi, 3 pages, 52 extraction calls, every call reporting usage,
+# ollama_cloud deepseek-v4.1-flash:cloud, qa prompt): 109,992 input chars
+# (system prompt + prefix + unit) = 26,097 input tokens -> 4.215 chars/token;
+# 63,949 output tokens = 2.4504 x input. One run, one model, one prompt.
+ESTIMATE_CHARS_PER_INPUT_TOKEN = 4.215
+ESTIMATE_OUTPUT_PER_INPUT_TOKEN = 2.4504
+ESTIMATE_BASIS = ("Brief 2c real run 2026-11-23: fastapi.tiangolo.com, 3 pages, 52 calls, "
+                  "ollama_cloud deepseek-v4.1-flash:cloud, qa prompt; 4.215 input chars/token, "
+                  "output = 2.4504 x input tokens. One run, one model, one prompt.")
+
 # Brief 3B Step 1 (contract v2 source records, crawl/sources.py): AI crawlers
 # whose explicit robots.txt groups are reported as an AI-training signal.
 # Reported only -- the scraper's own requests don't use these names.

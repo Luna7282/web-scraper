@@ -52,7 +52,7 @@ V1_KEYS = ("contract_version", "run_id", "resume", "settings", "api_key_env")
 ALLOWED_KEYS = frozenset(RUN_KEYS + V1_KEYS)
 # Contract v2 (Brief 3B) = every v1 key plus these. A v1 config using one is
 # refused as an unknown key, exactly as before.
-V2_KEYS = ("model_pinned_version",)
+V2_KEYS = ("model_pinned_version", "dry_run")
 ALLOWED_KEYS_BY_VERSION = {1: ALLOWED_KEYS, 2: frozenset(ALLOWED_KEYS | set(V2_KEYS))}
 MODES = ("crawl", "map")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -89,6 +89,19 @@ SETTINGS: dict[str, Setting] = {
     "llm_unavailable_max_releases": Setting("LLM_UNAVAILABLE_MAX_RELEASES", "SCRAPER_LLM_UNAVAILABLE_MAX_RELEASES",
                                             int, 5),
 }
+# Contract v2 only (Brief 3B). A v1 config naming one is refused as an
+# unknown setting, and v1's effective settings (result.json) are unchanged.
+SETTINGS_V2_ONLY: dict[str, Setting] = {
+    "provider_preflight": Setting("PROVIDER_PREFLIGHT", "SCRAPER_PROVIDER_PREFLIGHT", bool, True),
+    "embeddings_preflight": Setting("EMBEDDINGS_PREFLIGHT", "SCRAPER_EMBEDDINGS_PREFLIGHT", bool, True),
+}
+ALL_SETTINGS: dict[str, Setting] = {**SETTINGS, **SETTINGS_V2_ONLY}
+
+
+def settings_for(version: int) -> dict[str, Setting]:
+    return SETTINGS if version == 1 else ALL_SETTINGS
+
+
 _MINIMUMS = {"extract_unit_concurrency": 1, "llm_breaker_threshold": 0, "llm_sdk_max_retries": 0,
              "stop_grace_seconds": 0, "llm_unavailable_max_releases": 0}
 
@@ -134,6 +147,10 @@ def validate(cfg: dict, environ: Mapping[str, str] | None = None) -> HeadlessRun
     if "model_pinned_version" in cfg and (not isinstance(cfg["model_pinned_version"], str)
                                           or not cfg["model_pinned_version"].strip()):
         raise HeadlessConfigError("model_pinned_version must be a non-empty string")
+    if "dry_run" in cfg and not isinstance(cfg["dry_run"], bool):
+        raise HeadlessConfigError("dry_run must be true or false")
+    if cfg.get("dry_run") and cfg.get("resume"):
+        raise HeadlessConfigError("a dry pass needs its own run_dir: dry_run and resume can't be combined")
     api_key_env = cfg.get("api_key_env")
     if api_key_env is not None:
         if not isinstance(api_key_env, str) or not _ENV_NAME.match(api_key_env):
@@ -141,7 +158,8 @@ def validate(cfg: dict, environ: Mapping[str, str] | None = None) -> HeadlessRun
         if not (environ.get(api_key_env) or "").strip():
             raise HeadlessConfigError(f"api_key_env names {api_key_env}, which is not set or empty")
     return HeadlessRun(cfg=dict(cfg), contract_version=version,
-                       effective=resolve_settings(cfg.get("settings", {}), environ), api_key_env=api_key_env)
+                       effective=resolve_settings(cfg.get("settings", {}), environ, version),
+                       api_key_env=api_key_env)
 
 
 def _check_pairs(name: str, value) -> None:
@@ -149,15 +167,16 @@ def _check_pairs(name: str, value) -> None:
         raise HeadlessConfigError(f"{name} must be a non-empty list of [value, value] pairs")
 
 
-def resolve_settings(settings, environ: Mapping[str, str]) -> dict:
+def resolve_settings(settings, environ: Mapping[str, str], version: int = 1) -> dict:
     """config value, then environment variable, then default -- with the source."""
     if not isinstance(settings, dict):
         raise HeadlessConfigError("settings must be an object")
-    unknown = sorted(set(settings) - set(SETTINGS))
+    known = settings_for(version)
+    unknown = sorted(set(settings) - set(known))
     if unknown:
         raise HeadlessConfigError(f"unknown settings: {', '.join(unknown)}")
     effective = {}
-    for name, spec in SETTINGS.items():
+    for name, spec in known.items():
         if name in settings:
             value, source = _check_value(name, spec, settings[name]), "config"
         elif environ.get(spec.env_var) not in (None, ""):
@@ -201,10 +220,10 @@ def _parse_env(name: str, spec: Setting, raw: str):
 def applied_settings(effective: dict):
     """Write the effective settings onto the config module for the duration of
     a v1 run, then restore exactly what was there before."""
-    saved = {spec.config_attr: getattr(config, spec.config_attr) for spec in SETTINGS.values()}
+    saved = {spec.config_attr: getattr(config, spec.config_attr) for spec in ALL_SETTINGS.values()}
     try:
-        for name, spec in SETTINGS.items():
-            setattr(config, spec.config_attr, effective[name]["value"])
+        for name, entry in effective.items():
+            setattr(config, ALL_SETTINGS[name].config_attr, entry["value"])
         yield
     finally:
         for attr, value in saved.items():
@@ -213,7 +232,7 @@ def applied_settings(effective: dict):
 
 def settings_snapshot() -> dict:
     """The config attributes v1 settings touch (for guards and tests)."""
-    return {spec.config_attr: getattr(config, spec.config_attr) for spec in SETTINGS.values()}
+    return {spec.config_attr: getattr(config, spec.config_attr) for spec in ALL_SETTINGS.values()}
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +296,8 @@ def prepare_run_dir(cfg: dict, clock=time.time) -> str | None:
                                   f'set "resume": true to continue it, or use an empty run_dir')
     if resume and not found:
         raise HeadlessConfigError('"resume": true but run_dir holds no scraper run to resume')
+    if resume and (run_dir / "estimate.json").exists():
+        raise HeadlessConfigError("run_dir holds a dry pass (estimate.json); a real run needs its own run_dir")
     if not resume:
         return None
     previous = run_dir / RESULT_FILE
@@ -349,8 +370,9 @@ def build_result(*, outcome: str, exit_code: int, contract_version: int | None, 
     if run_result.get("stop") is not None:
         result["signal"] = run_result.get("stopped_by_signal")
         result["stop"] = run_result["stop"]
-    if run_result.get("sources") is not None:   # contract v2 only
-        result["sources"] = run_result["sources"]
+    for key in ("sources", "preflight", "cost", "dry_run", "estimate"):   # contract v2 only
+        if run_result.get(key) is not None:
+            result[key] = run_result[key]
     if error is not None:
         result["error"] = error
     return result

@@ -501,6 +501,7 @@ async def extract_worker(
     scraper_version: str | None = None,
     llm_unavailable_max_releases: int = 0,
     record_builder: Callable[..., dict] | None = None,
+    cost=None,
 ) -> None:
     """unit_concurrency (config.EXTRACT_UNIT_CONCURRENCY, default 1): how
     many of one page's extraction units -- and, with a quality_backend, its
@@ -526,7 +527,12 @@ async def extract_worker(
     record_builder(fields, served_model=...) for each pair instead of
     build_canonical_record(**fields); served_model is what the provider's
     response said it ran for that unit's call (crawl.provenance). None:
-    build_canonical_record, exactly as before."""
+    build_canonical_record, exactly as before.
+
+    cost (headless contract v2 only, crawl.cost.CostLedger): every
+    extraction and quality call attempt is recorded by outcome, with the
+    token usage the response reported; 5xx page releases too. None: nothing
+    recorded, exactly as before."""
     if unit_concurrency < 1:
         raise ValueError(f"unit_concurrency must be >= 1, got {unit_concurrency}")
 
@@ -548,6 +554,8 @@ async def extract_worker(
                             "Is this a good instruction-response training pair?",
                         )
                     except Exception as e:
+                        if cost is not None:
+                            cost.record("quality", _call_outcome(e)[0])
                         if timing is not None:
                             outcome, extra = _call_outcome(e)
                             timing.record(
@@ -557,6 +565,8 @@ async def extract_worker(
                         if breaker is not None and breaker.failure(permit, e):
                             continue  # back to the gate; retry this same call
                         raise
+                    if cost is not None:
+                        cost.record("quality", "ok")
                     if timing is not None:
                         timing.record("quality_call", url=url, chunk_index=chunk_index,
                                       seconds=_since(quality_started), outcome="ok")
@@ -575,7 +585,7 @@ async def extract_worker(
             which need permits too (holding one there could deadlock)."""
             while True:
                 permit = await breaker.acquire() if breaker is not None else None
-                if timing is not None:
+                if timing is not None or cost is not None:
                     call_usage.set(None)  # never attribute a previous call's usage to this one
                 call_served_model.set(None)
                 async with sem if sem is not None else nullcontext():
@@ -584,21 +594,28 @@ async def extract_worker(
                         raw_response = await extract_fn(unit)
                     except Exception as e:
                         outcome, extra = _call_outcome(e)
+                        if cost is not None:
+                            cost.record("extraction", outcome)
                         _record_extract_call(timing, url, chunk_index, unit, call_started, outcome, **extra)
                         if breaker is not None and breaker.failure(permit, e):
                             continue  # back to the gate; retry this same unit
                         raise
                     call_seconds = _since(call_started)
                     served_model = call_served_model.get()  # this call's, read in the same task
+                    call_usage_now = call_usage.get() if cost is not None else None
                 if breaker is not None:
                     breaker.success(permit)
                 break
             try:
                 pairs = parse_qa_json(raw_response)
             except MalformedExtractionError:
+                if cost is not None:
+                    cost.record("extraction", "malformed", call_usage_now)
                 _record_extract_call(timing, url, chunk_index, unit, call_started, "malformed",
                                      seconds=call_seconds)
                 return None
+            if cost is not None:
+                cost.record("extraction", "ok", call_usage_now)
             _record_extract_call(timing, url, chunk_index, unit, call_started, "ok", seconds=call_seconds)
 
             scores = [(None, None)] * len(pairs)
@@ -733,6 +750,8 @@ async def extract_worker(
         except ProviderUnavailableError as e:
             pairs_so_far = sum(len(r) for r in unit_results if r)
             if llm_unavailable_max_releases > 0:
+                if cost is not None:
+                    cost.unavailable_release()
                 _record_page(timing, url, "unavailable", units=len(units), pairs=pairs_so_far,
                              started=extraction_started)
                 await frontier.release_llm_unavailable(
@@ -765,6 +784,49 @@ async def extract_worker(
         _record_page(timing, url, "ok", units=len(units), pairs=len(qa_pairs), started=extraction_started)
         chunks = chunk_fn(content) if chunk_fn is not None else None
         await frontier.put_results(results_queue, ExtractionResult(url=url, qa_pairs=qa_pairs, chunks=chunks))
+        await frontier.content_done(content_queue)
+
+
+async def estimate_worker(
+    frontier: Frontier,
+    content_queue: asyncio.Queue,
+    score_fn: ScoreFn,
+    extract_threshold: float,
+    follow_threshold: float,
+    extraction_units_fn: Callable[[str], Awaitable[list[str]]] | None,
+    pages: dict,
+    poll_interval: float = POLL_INTERVAL,
+) -> None:
+    """Dry pass (headless contract v2 `dry_run: true`): extract_worker's
+    decisions without its LLM calls. Same score, same follow/promote, same
+    extract_threshold skip, same extraction_units_fn -- so the pages and
+    units match what a real run would extract -- then records each page's
+    unit sizes in `pages` (url -> {"units": [chars, ...]} or {"skipped":
+    reason}) and marks it 'mapped' (fetched, nothing extracted; it counts
+    toward max_pages like 'done')."""
+    while True:
+        try:
+            url, content = await asyncio.wait_for(content_queue.get(), timeout=poll_interval)
+        except TimeoutError:
+            if frontier.quiescent.is_set():
+                return
+            continue
+        try:
+            score = await score_fn(url, content)
+        except Exception as e:  # noqa: BLE001 -- recorded; the dry pass goes on
+            pages[url] = {"skipped": f"scoring failed: {type(e).__name__}"}
+            await frontier.mark_extract_outcome(url, "failed", f"dry pass scoring: {type(e).__name__}: {e}")
+            await frontier.content_done(content_queue)
+            continue
+        await frontier.score_and_resolve_children(url, score, score >= follow_threshold)
+        if score < extract_threshold:
+            pages[url] = {"skipped": f"relevance {score:.3f} below extract_threshold {extract_threshold}"}
+            await frontier.mark_extract_outcome(url, "skipped_extract")
+            await frontier.content_done(content_queue)
+            continue
+        units = await extraction_units_fn(content) if extraction_units_fn else [content]
+        pages[url] = {"units": [len(u) for u in units]}
+        await frontier.mark_mapped(url)
         await frontier.content_done(content_queue)
 
 
