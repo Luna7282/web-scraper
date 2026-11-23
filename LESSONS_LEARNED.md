@@ -5857,3 +5857,30 @@ verifiers on, delay 1s, stop on 429:**
 
 **As instructed, Step 6 stopped at the first stop rule.** Neither real run
 happened, and no key was loaded.
+
+### 97. Items mode (foundry P1 Step 2): the scraper as a pure connector
+
+- **Built on the dry pass's path, not a new one.** `items_worker` makes the
+  same score / follow / `extract_threshold` decisions as `estimate_worker`
+  and `extract_worker`. So the pages an items run keeps are the pages a
+  real run would extract, and its `content_sha256` is the same hash the dry
+  pass records in `page_fingerprints` (tested on one fake site run both
+  ways).
+- **"No provider" is asserted, not assumed.** The test patches
+  `_resolve_llm`, `llm_factory.get_llm`, `LocalOllamaEmbeddings`,
+  `build_generators`, `build_verifiers` and both preflights to raise. A
+  mutation that sent items mode down the normal provider path made the run
+  `crashed`, so the test catches it. Embeddings are now skipped in items mode
+  when nothing needs them. The dry pass still constructs a (local)
+  embeddings object; that's unchanged.
+- **`max_pages: 1` did not stop a 3-page fake run at one page.** The budget
+  counts finished rows, and with fast fakes the claims race ahead of the
+  marks. The resume test therefore simulates the case resume dedupe exists
+  for (record appended, page not yet marked) by re-queuing one frontier
+  row, instead of relying on a page cap.
+- **Resume can't append after a cut line.** The canonical tail repair was
+  generalised with a file-name parameter. canonical.jsonl's sidecar name is
+  unchanged (`canonical.tail.<run_id>.bin`), and the golden byte tests pass.
+- Suites: fast 748 and slow 748, only the 10 known #50 control-server
+  failures. Golden v1 / legacy byte tests OK. No new lint findings in the
+  touched files.

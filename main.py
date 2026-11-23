@@ -32,7 +32,7 @@ from verifiers import VerifierRunner
 from verifiers import build as build_verifiers
 from preflight import PreflightFailed, embeddings_preflight, needs_embeddings, provider_preflight
 from storage.canonical import build_canonical_record_v2
-from crawl.pipeline import crawl_worker, extract_worker, estimate_worker, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError, ProviderUnavailableError, TRANSIENT_PROVIDER_STATUSES
+from crawl.pipeline import crawl_worker, extract_worker, estimate_worker, items_worker, ITEMS_RECORD_SCHEMA_VERSION, writer_worker, map_worker, FetchTimeout, FetchHTTPError, RateLimitError, BrowserDriverError, ProviderUnavailableError, TRANSIENT_PROVIDER_STATUSES
 from crawl.politeness import HostPoliteness
 from crawl.timing import TimingLog, call_usage, usage_from_message
 from crawl.provenance import call_served_model, served_model_from_message
@@ -44,7 +44,7 @@ from content.sample_quality import make_quality_backend
 from crawl.robots_cache import RobotsCache
 from crawl.graph import discovery_graph, path_tree, to_json
 from crawl.live_status import read_live_status
-from storage.writer import Writer
+from storage.writer import Writer, append_page_atomically
 from progress_display import run_progress_display
 from crawl.score_report import format_score_report
 from storage.chunk_store import ChunkStore, get_or_create_collection, split_into_parent_child_chunks
@@ -325,6 +325,7 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
     config.validate_system_one_config()
     v2 = context is not None and context.contract_version >= 2
     dry = v2 and bool(cfg.get("dry_run"))  # contract v2 dry pass: fetch + chunk, zero LLM calls
+    items = v2 and bool(cfg.get("items_mode"))  # items mode: fetch + clean, one record per page, zero LLM calls
     run_dir = cfg["run_dir"]
     os.makedirs(run_dir, exist_ok=True)
     db_path = os.path.join(run_dir, "frontier.db")
@@ -335,14 +336,16 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
     scope_check = _make_scope_check(host_prefix_pairs)
     intent = cfg.get("intent") or None
 
-    if dry or _llm is not None:
-        # Dry pass: the chat provider is never constructed (no client, no call).
-        # _llm is a test seam standing in for the provider.
+    if dry or items or _llm is not None:
+        # Dry pass and items mode: the chat provider is never constructed (no
+        # client, no call). _llm is a test seam standing in for the provider.
         provider_name = cfg.get("provider", "gemini")
         model_name = cfg.get("model") or _DEFAULT_MODEL_BY_PROVIDER[provider_name]
-        llm = None if dry else _llm
+        llm = None if (dry or items) else _llm
         if _embeddings is not None:
             embeddings = _embeddings
+        elif items and not needs_embeddings(cfg):
+            embeddings = None   # items mode without an intent: nothing to embed, nothing constructed
         else:
             from llm_factory import LocalOllamaEmbeddings
             embeddings = LocalOllamaEmbeddings(model_name=EMBEDDING_MODEL_NAME)
@@ -350,11 +353,11 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
         provider_name, model_name, llm, embeddings = _resolve_llm(cfg, api_key=api_key)
 
     # Contract v2 preflights, before any page work (preflight.py).
-    cost = CostLedger(provider_name, model_name) if v2 and not dry else None
+    cost = CostLedger(provider_name, model_name) if v2 and not dry and not items else None
     preflight_info = {}
     if v2 and config.EMBEDDINGS_PREFLIGHT and needs_embeddings(cfg):
         preflight_info["embeddings"] = await embeddings_preflight(embeddings, EMBEDDING_MODEL_NAME)
-    if v2 and not dry and config.PROVIDER_PREFLIGHT:
+    if v2 and not dry and not items and config.PROVIDER_PREFLIGHT:
         preflight_info["provider"] = await provider_preflight(llm, provider_name, model_name, cost)
 
     frontier = Frontier(db_path, max_pages=cfg.get("max_pages"), max_depth=cfg.get("max_depth"),
@@ -368,12 +371,12 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
     embed_fn = _make_embed_fn(embeddings)
     intent_embedding = await embed_fn(intent) if intent else None
     score_fn = make_score_fn(intent, intent_embedding, embed_fn)
-    gens = build_generators(cfg.get("generators")) if v2 else None
+    gens = build_generators(cfg.get("generators")) if v2 and not items else None
     if v2:
         # Every v2 call goes through a generator. Test seams: _llm_call(system, text), or a
         # per-unit _extract_fn that only ever sees the request text.
         extract_fn = None
-        llm_call = None if dry else (_llm_call or (_adapt_extract_fn(_extract_fn) if _extract_fn else None)
+        llm_call = None if (dry or items) else (_llm_call or (_adapt_extract_fn(_extract_fn) if _extract_fn else None)
                                      or _make_llm_call(llm, record_usage=True))
     else:
         llm_call = None
@@ -387,17 +390,17 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
                                                      stop_on_429=(frontier, fatal_errors)
                                                      if config.STOP_ON_SITE_429 else None)
                                if v2 else _http_get_text)
-    record_builder = _make_v2_record_builder(context, provider_name, model_name, llm) if v2 else None
-    balancer = Balancer(BalanceSettings.from_config(cfg.get("low_value_overrides"))) if v2 else None
+    record_builder = _make_v2_record_builder(context, provider_name, model_name, llm) if v2 and not items else None
+    balancer = Balancer(BalanceSettings.from_config(cfg.get("low_value_overrides"))) if v2 and not items else None
     verifier_runner = (VerifierRunner(build_verifiers(cfg.get("verifiers")), config.EXTERNAL_VERIFIER_CONCURRENCY)
-                       if v2 and not dry else None)
+                       if v2 and not dry and not items else None)
     if balancer is not None and not dry and os.path.exists(canonical_path):  # resume: rows already written
         written = await asyncio.to_thread(_read_jsonl_rows, canonical_path)
         balancer.seed_written(written)
         verifier_runner.seed_written(written)
 
     quality_backend = (make_quality_backend(_make_decision_chat_fn(llm))
-                       if cfg.get("enable_quality_scoring") and not dry else None)
+                       if cfg.get("enable_quality_scoring") and not dry and not items else None)
     # None (unset): extract_worker looks up the per-method default itself
     # (config.DECISION_THRESHOLDS) once it knows which backend answered --
     # not resolved here, since this run's active method isn't necessarily
@@ -406,7 +409,7 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
 
     chunk_fn = None
     chroma_upsert_fn = None
-    if cfg.get("build_rag") and not dry:
+    if cfg.get("build_rag") and not dry and not items:
         import chromadb
         chroma_client = chromadb.PersistentClient(path=os.path.join(run_dir, "chroma_db"))
         collection = get_or_create_collection(
@@ -425,8 +428,18 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
             for c in chunks:
                 await chunk_store.add_or_merge_chunk(c["text"], url, c["parent_text"])
 
-    writer = None if dry else Writer(canonical_path, chroma_upsert_fn=chroma_upsert_fn)
+    writer = None if (dry or items) else Writer(canonical_path, chroma_upsert_fn=chroma_upsert_fn)
     dry_pages: dict = {}
+    items_path = os.path.join(run_dir, ITEMS_FILE)
+    items_report = {"file": ITEMS_FILE, "record_schema_version": ITEMS_RECORD_SCHEMA_VERSION,
+                    "pages_written": 0, "already_written": 0, "skipped": {}}
+    items_written_urls: set = set()
+    if items and os.path.exists(items_path):  # resume: never write a page twice, never append to a cut line
+        repaired_tail = await asyncio.to_thread(headless.repair_canonical_tail, run_dir,
+                                                context.run_id, ITEMS_FILE)
+        if repaired_tail:
+            items_report["repaired_tail"] = repaired_tail
+        items_written_urls = {r["url"] for r in await asyncio.to_thread(_read_jsonl_rows, items_path)}
     crawl_workers_n = cfg.get("crawl_workers", 5)
     extract_workers_n = cfg.get("extract_workers", 2)
     stop_info = None
@@ -464,7 +477,20 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
             )
             for _ in range(crawl_workers_n)
         ]
-        if dry:
+        if items:
+            async def write_item(record: dict) -> None:
+                data = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+                await asyncio.to_thread(append_page_atomically, items_path, data)
+
+            def item_clock() -> str:
+                return datetime.now(UTC).isoformat(timespec="seconds")
+
+            tasks += [asyncio.create_task(
+                items_worker(frontier, content_queue, score_fn, cfg.get("extract_threshold", 0.0),
+                             cfg.get("follow_threshold", 0.0), write_item, items_written_urls, items_report,
+                             item_clock, scraper_version=context.scraper_version, run_id=context.run_id))
+                for _ in range(extract_workers_n)]
+        elif dry:
             tasks += [asyncio.create_task(
                 estimate_worker(frontier, content_queue, score_fn, cfg.get("extract_threshold", 0.0),
                                 cfg.get("follow_threshold", 0.0), extraction_units_fn, dry_pages,
@@ -518,6 +544,8 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
         result["sources"] = sources
     if v2:
         result["preflight"] = preflight_info
+    if items:
+        result["items"] = items_report
     if cost is not None:
         result["cost"] = cost.to_dict()
     if balancer is not None:
@@ -988,6 +1016,7 @@ def _recording_text_fetch(recorder: SourceRecorder, fetch_status_text, stop_on_4
 
 SOURCES_FILE = "sources.json"
 ESTIMATE_FILE = "estimate.json"
+ITEMS_FILE = "items.jsonl"   # items mode: one page record per line (crawl/pipeline.py::page_record)
 
 
 def _read_jsonl_rows(path: str) -> list[dict]:

@@ -711,6 +711,14 @@ class Frontier:
             await self._conn.executemany("INSERT OR IGNORE INTO fetch_urls (url, fetch_url) VALUES (?, ?)", differing)
             await self._conn.commit()
 
+    async def page_info(self, url: str) -> dict:
+        """Read-only: depth and first discoverer of a row (items mode's fetch
+        metadata). {} for an unknown URL."""
+        async with self._lock:
+            cur = await self._conn.execute("SELECT depth, parent_url FROM frontier WHERE url = ?", (url,))
+            row = await cur.fetchone()
+        return {} if row is None else {"depth": row[0], "parent_url": row[1]}
+
     async def fetch_url_for(self, url: str) -> str:
         async with self._lock:
             cur = await self._conn.execute("SELECT fetch_url FROM fetch_urls WHERE url = ?", (url,))

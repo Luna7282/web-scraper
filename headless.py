@@ -54,7 +54,10 @@ V1_KEYS = ("contract_version", "run_id", "resume", "settings", "api_key_env")
 ALLOWED_KEYS = frozenset(RUN_KEYS + V1_KEYS)
 # Contract v2 (Brief 3B) = every v1 key plus these. A v1 config using one is
 # refused as an unknown key, exactly as before.
-V2_KEYS = ("model_pinned_version", "dry_run", "low_value_overrides", "generators", "verifiers")
+V2_KEYS = ("model_pinned_version", "dry_run", "low_value_overrides", "generators", "verifiers", "items_mode")
+# items_mode (P1, connector work, ROADMAP #67): fetch + clean only. One record
+# per page in items.jsonl, zero LLM calls, no generators / verifiers / balancing.
+ITEMS_MODE_EXCLUSIVE_KEYS = ("dry_run", "generators", "verifiers", "low_value_overrides", "model_pinned_version")
 ALLOWED_KEYS_BY_VERSION = {1: ALLOWED_KEYS, 2: frozenset(ALLOWED_KEYS | set(V2_KEYS))}
 MODES = ("crawl", "map")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -179,6 +182,18 @@ def validate(cfg: dict, environ: Mapping[str, str] | None = None) -> HeadlessRun
                 raise HeadlessConfigError(str(e)) from None
     if cfg.get("dry_run") and cfg.get("resume"):
         raise HeadlessConfigError("a dry pass needs its own run_dir: dry_run and resume can't be combined")
+    if "items_mode" in cfg and not isinstance(cfg["items_mode"], bool):
+        raise HeadlessConfigError("items_mode must be true or false")
+    if cfg.get("items_mode"):
+        clash = [k for k in ITEMS_MODE_EXCLUSIVE_KEYS if k in cfg]
+        if clash:
+            raise HeadlessConfigError(f"items_mode makes no LLM calls and writes page records only; "
+                                      f"remove: {', '.join(clash)}")
+        if cfg.get("mode") != "crawl":
+            raise HeadlessConfigError("items_mode needs mode 'crawl'")
+        for key in ("build_rag", "enable_quality_scoring"):
+            if cfg.get(key):
+                raise HeadlessConfigError(f"items_mode makes no LLM calls: {key} must be off")
     api_key_env = cfg.get("api_key_env")
     if api_key_env is not None:
         if not isinstance(api_key_env, str) or not _ENV_NAME.match(api_key_env):
@@ -295,7 +310,7 @@ REPO_DIR = Path(__file__).resolve().parent
 FALLBACK_VERSION = "0.1.0"   # pyproject.toml's static version, used when git can't answer
 # Files that mean "this run_dir already holds a scraper run". Anything else
 # (e.g. foundry's headless_config.json and run.log) doesn't count.
-STATE_FILES = ("frontier.db", "canonical.jsonl", "timings.jsonl", "result.json")
+STATE_FILES = ("frontier.db", "canonical.jsonl", "timings.jsonl", "result.json", "items.jsonl")
 RESULT_FILE = "result.json"
 ERROR_MESSAGE_MAX = 200
 _ABS_PATH = re.compile(r"(?:[A-Za-z]:\\|/)(?:[^\s'\"<>|]+)")
@@ -369,20 +384,20 @@ def prepare_run_dir(cfg: dict, clock=time.time) -> str | None:
     return prev_id
 
 
-def repair_canonical_tail(run_dir: str | Path, run_id: str) -> dict | None:
+def repair_canonical_tail(run_dir: str | Path, run_id: str, name: str = "canonical.jsonl") -> dict | None:
     """On resume: if canonical.jsonl ends mid-line (a write cut short --
     possible in principle even with whole-page appends, e.g. disk full), move
     the incomplete tail into canonical.tail.<run_id>.bin and truncate the file
     to its last complete line. Never deletes data. Returns what was done, or
     None if the file was clean."""
-    path = Path(run_dir) / "canonical.jsonl"
+    path = Path(run_dir) / name   # items mode passes "items.jsonl"
     if not path.exists():
         return None
     raw = path.read_bytes()
     if not raw or raw.endswith(b"\n"):
         return None
     keep = raw.rfind(b"\n") + 1
-    sidecar = Path(run_dir) / f"canonical.tail.{run_id}.bin"
+    sidecar = Path(run_dir) / f"{Path(name).stem}.tail.{run_id}.bin"
     sidecar.write_bytes(raw[keep:])
     with open(path, "r+b") as f:
         f.truncate(keep)
@@ -423,7 +438,8 @@ def build_result(*, outcome: str, exit_code: int, contract_version: int | None, 
     if run_result.get("stop") is not None:
         result["signal"] = run_result.get("stopped_by_signal")
         result["stop"] = run_result["stop"]
-    for key in ("sources", "preflight", "cost", "balance", "verification", "dry_run", "estimate"):  # v2 only
+    for key in ("sources", "preflight", "cost", "balance", "verification", "dry_run", "estimate",
+                "items"):  # v2 only
         if run_result.get(key) is not None:
             result[key] = run_result[key]
     if error is not None:

@@ -969,6 +969,80 @@ async def estimate_worker(
         await frontier.content_done(content_queue)
 
 
+ITEMS_RECORD_SCHEMA_VERSION = 1
+
+
+def page_record(url: str, content: str, *, fetch_url: str, info: dict, score: float | None,
+                fetched_at: str, scraper_version: str | None, run_id: str | None) -> dict:
+    """Items mode's one record per page: the cleaned markdown exactly as the
+    extract stage would have received it (chrome-stripped), its SHA-256 (the
+    same hash the dry pass records as page_fingerprints[url].content_sha256),
+    and fetch metadata. No chunking: that's the consumer's job."""
+    return {"record_type": "page", "schema_version": ITEMS_RECORD_SCHEMA_VERSION, "url": url,
+            "fetch_url": fetch_url, "title": extract_page_title(content), "markdown": content,
+            "content_sha256": _sha256(content), "chars": len(content), "fetched_at": fetched_at,
+            "depth": info.get("depth"), "parent_url": info.get("parent_url"), "relevance_score": score,
+            "scraper_version": scraper_version, "run_id": run_id}
+
+
+async def items_worker(
+    frontier: Frontier,
+    content_queue: asyncio.Queue,
+    score_fn: ScoreFn,
+    extract_threshold: float,
+    follow_threshold: float,
+    write_record: Callable[[dict], Awaitable[None]],
+    written_urls: set,
+    report: dict,
+    clock: Callable[[], str],
+    scraper_version: str | None = None,
+    run_id: str | None = None,
+    poll_interval: float = POLL_INTERVAL,
+) -> None:
+    """Items mode (headless contract v2 `items_mode: true`): extract_worker's
+    score / follow / extract_threshold decisions, then one page record via
+    `write_record` (an atomic append, run off the event loop) instead of any
+    LLM work. No generators, verifiers, balancing or chunking. A URL already
+    in `written_urls` (a resumed run) is not written twice. The page ends
+    'mapped' (fetched, nothing extracted; it counts toward max_pages)."""
+    while True:
+        try:
+            url, content = await asyncio.wait_for(content_queue.get(), timeout=poll_interval)
+        except TimeoutError:
+            if frontier.quiescent.is_set():
+                return
+            continue
+        try:
+            score = await score_fn(url, content)
+        except Exception as e:  # noqa: BLE001 -- recorded; the run goes on
+            report["skipped"][url] = f"scoring failed: {type(e).__name__}"
+            await frontier.mark_extract_outcome(url, "failed", f"items scoring: {type(e).__name__}: {e}")
+            await frontier.content_done(content_queue)
+            continue
+        await frontier.score_and_resolve_children(url, score, score >= follow_threshold)
+        if score < extract_threshold:
+            report["skipped"][url] = f"relevance {score:.3f} below extract_threshold {extract_threshold}"
+            await frontier.mark_extract_outcome(url, "skipped_extract")
+            await frontier.content_done(content_queue)
+            continue
+        if url in written_urls:
+            report["already_written"] += 1
+        else:
+            record = page_record(url, content, fetch_url=await frontier.fetch_url_for(url),
+                                 info=await frontier.page_info(url), score=score, fetched_at=clock(),
+                                 scraper_version=scraper_version, run_id=run_id)
+            try:
+                await write_record(record)
+            except OSError as e:
+                await frontier.mark_write_failed(url, f"items write: {type(e).__name__}: {e}")
+                await frontier.content_done(content_queue)
+                continue
+            written_urls.add(url)
+            report["pages_written"] += 1
+        await frontier.mark_mapped(url)
+        await frontier.content_done(content_queue)
+
+
 async def map_worker(
     frontier: Frontier,
     content_queue: asyncio.Queue,

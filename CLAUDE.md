@@ -815,6 +815,26 @@ legacy runs take today's code paths (the v2 branches are all behind
   - **Error pages:** in v2, a page crawl4ai reports as a success but with
     status ≥ 400 is an HTTP error, never content. Legacy and v1 are
     unchanged.
+- **Items mode (`items_mode: true`, foundry P1, connector work under
+  ROADMAP #67):** fetch and clean only.
+  - **Output:** one page record per page in `items.jsonl`
+    (`crawl/pipeline.py::page_record`): url, fetch_url, title, the
+    chrome-stripped markdown, its `content_sha256` (the same hash as the dry
+    pass's `page_fingerprints`), chars, fetched_at, depth, parent_url,
+    relevance score, scraper version and run id. Each record is one atomic
+    append (`append_page_atomically`) run off the loop.
+  - **Nothing LLM-related is built:** no chat provider, no provider
+    preflight, no generators, verifiers, balancer, writer or
+    `canonical.jsonl`, and no embeddings unless an intent needs them.
+    `result.json` has an `items` section and the source records, and no
+    cost / balance / verification / estimate.
+  - **Refused with it:** `dry_run`, `generators`, `verifiers`,
+    `low_value_overrides`, `model_pinned_version`, `build_rag`,
+    `enable_quality_scoring`, and any mode other than `crawl`.
+  - **No chunking:** that's the consumer's job (foundry's text processor).
+  - **Resume:** `items.jsonl` is run state. URLs already in it are never
+    written again, and a cut tail is moved to `items.tail.<run_id>.bin`
+    (the canonical tail repair, generalised by file name).
 - **Tests that spawn the real `main.py`** must use a config that can't run
   (an unsupported version, a never-existing run_dir). When version 2
   became valid, one such test silently ran a real v2 crawl
