@@ -1289,6 +1289,17 @@ Sizes: XS (<30 min), S (<2h), M (half day), L (multi-day).
     Earlier manim numbers in this file came from before the challenge
     existed.
 
+67. **[DECISION 2026-11-23, after Brief 3B] The scraper is one connector
+    (websites/text) in foundry's data layer.** No new generation features are
+    added to web-scraper from here on. Generators (`generators/`) and
+    verifiers (`verifiers/`) will move to foundry's dataset builder later.
+    Until then they stay as they are, behind contract v2, maintained but not
+    extended.
+    - **Still in scope:** fetching, scope, robots/politeness, source records,
+      chunking/units, provenance, cost, and the contract.
+    - **The second-site token-basis check is deferred.** The dry-pass token
+      estimate is still fitted on one run (Brief 2c).
+
 ---
 
 *Nothing in this list has been implemented. Highest-value first pass, if/when

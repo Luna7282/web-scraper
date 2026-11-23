@@ -6,6 +6,13 @@ someone remembers to.
 
 ## What this is
 
+> **Direction (2026-11-23, ROADMAP #67):** this scraper is ONE connector
+> (websites/text) in foundry's data layer. **Do not add new generation
+> features here.** `generators/` and `verifiers/` (contract v2) are
+> maintained but not extended, and will move to foundry's dataset builder.
+> Work here is fetching, scope, robots/politeness, source records, units,
+> provenance, cost and the contract.
+
 A general-purpose, prompt-steered crawler for any website — give it a root
 URL and a natural-language intent, and it crawls, judges pages against that
 intent, and turns the result into training datasets (multiple schemas and
