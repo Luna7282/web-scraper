@@ -368,6 +368,7 @@ async def crawl_worker(
     timing: TimingLog | None = None,
     site_backoff: bool = False,
     use_fetch_urls: bool = False,
+    stop_on_site_429: bool = False,
 ) -> None:
     """site_backoff (config.SITE_RETRY_BACKOFF; off = today's immediate
     re-fetch): a site's 429/503 re-queues the page after doubling_backoff
@@ -377,6 +378,11 @@ async def crawl_worker(
     checked against, and the page fetched at, the form the URL was first
     discovered in (Frontier.fetch_url_for: e.g. with its trailing slash),
     and each child's request form is recorded. Row identity is unchanged.
+    Off: exactly today's behaviour.
+
+    stop_on_site_429 (headless contract v2 setting): the first 429 from the
+    site fails that page (a counted retry, so it stays resumable), records a
+    fatal error and stops the run via quiescence -- like a dead browser.
     Off: exactly today's behaviour."""
     while True:
         # Checked before claim() too, not just in the row-is-None branch
@@ -430,6 +436,14 @@ async def crawl_worker(
             await frontier.mark_fetch_failed(row.url, f"timeout: {e}")
             continue
         except FetchHTTPError as e:
+            if stop_on_site_429 and e.status_code == 429:
+                await frontier.mark_fetch_failed(row.url, "http_429 (run stopped: stop_on_site_429)")
+                msg = f"[FATAL] Site returned 429 for {target}; stopping the run (stop_on_site_429)."
+                print(msg)
+                if fatal_error_sink is not None:
+                    fatal_error_sink.append(msg)
+                frontier.quiescent.set()
+                return
             if site_backoff and e.status_code in SITE_BACKOFF_STATUSES:
                 backoff = doubling_backoff(row.retry_count, e.retry_after)
                 await frontier.mark_fetch_failed(row.url, f"http_{e.status_code} (backoff {backoff:g}s)",

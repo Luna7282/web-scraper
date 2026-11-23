@@ -799,6 +799,15 @@ legacy runs take today's code paths (the v2 branches are all behind
       the child's own PID. A non-zero exit or garbage output is `unknown`.
     - **An external verifier that runs generated code must sandbox it
       itself.** The isolation above is not a sandbox.
+- **Run safety settings (v2):**
+  - **`crawl_delay_seconds`:** a floor under per-host request spacing.
+    Spacing is `max(site Crawl-delay or the default, floor)`, so a smaller
+    `robots.txt` value can't undercut it.
+  - **`stop_on_site_429`:** the first 429 from a page or from `robots.txt`
+    stops the run `stopped_early` (exit 1), and the run stays resumable.
+  - **Error pages:** in v2, a page crawl4ai reports as a success but with
+    status ≥ 400 is an HTTP error, never content. Legacy and v1 are
+    unchanged.
 - **Tests that spawn the real `main.py`** must use a config that can't run
   (an unsupported version, a never-existing run_dir). When version 2
   became valid, one such test silently ran a real v2 crawl

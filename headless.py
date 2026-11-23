@@ -69,7 +69,7 @@ class HeadlessConfigError(ValueError):
 class Setting:
     config_attr: str   # attribute on the config module the run reads
     env_var: str
-    kind: type         # bool / int / str
+    kind: type         # bool / int / float / str
     default: object    # v1 default when neither config nor environment sets it
     allow_none: bool = False
 
@@ -106,6 +106,11 @@ SETTINGS_V2_ONLY: dict[str, Setting] = {
     # Step 5: at most this many external@1 verifier processes at once.
     "external_verifier_concurrency": Setting("EXTERNAL_VERIFIER_CONCURRENCY",
                                              "SCRAPER_EXTERNAL_VERIFIER_CONCURRENCY", int, 2),
+    # Step 6 run safety: a floor under per-host request spacing (seconds), and
+    # stop the run at the first site-side 429.
+    "crawl_delay_seconds": Setting("MIN_CRAWL_DELAY_SECONDS", "SCRAPER_CRAWL_DELAY_SECONDS", float, None,
+                                   allow_none=True),
+    "stop_on_site_429": Setting("STOP_ON_SITE_429", "SCRAPER_STOP_ON_SITE_429", bool, False),
 }
 ALL_SETTINGS: dict[str, Setting] = {**SETTINGS, **SETTINGS_V2_ONLY}
 
@@ -117,7 +122,7 @@ def settings_for(version: int) -> dict[str, Setting]:
 _MINIMUMS = {"extract_unit_concurrency": 1, "llm_breaker_threshold": 0, "llm_sdk_max_retries": 0,
              "stop_grace_seconds": 0, "llm_unavailable_max_releases": 0,
              "max_rows_per_page": 1, "max_rows_per_source": 1, "low_value_max_rows": 1,
-             "external_verifier_concurrency": 1}
+             "external_verifier_concurrency": 1, "crawl_delay_seconds": 0}
 _CHOICES = {"low_value_policy": ("skip", "cap", "keep")}
 
 
@@ -225,6 +230,10 @@ def _check_value(name: str, spec: Setting, value):
         return None
     if spec.kind is int and (type(value) is not int):
         raise HeadlessConfigError(f"settings.{name} must be an integer")
+    if spec.kind is float:
+        if type(value) not in (int, float):
+            raise HeadlessConfigError(f"settings.{name} must be a number")
+        value = float(value)
     if spec.kind is bool and type(value) is not bool:
         raise HeadlessConfigError(f"settings.{name} must be true or false")
     if spec.kind is str and not isinstance(value, str):
@@ -239,10 +248,17 @@ def _check_value(name: str, spec: Setting, value):
 def _parse_env(name: str, spec: Setting, raw: str):
     """Same parsing config.py uses at import ("true" for bools, int() for ints)."""
     raw = raw.strip()
-    if spec.allow_none and spec.kind is int and raw.lower() in ("none", "null"):  # v2 caps: "off"
+    if spec.allow_none and spec.kind in (int, float) and raw.lower() in ("none", "null"):  # v2: "off"
         return None
     if spec.kind is bool:
         return raw.lower() == "true"
+    if spec.kind is float:
+        try:
+            value = float(raw)
+        except ValueError:
+            raise HeadlessConfigError(f"environment variable {spec.env_var}={raw!r} is not a number "
+                                      f"(for settings.{name})") from None
+        return _check_value(name, spec, value)
     if spec.kind is int:
         try:
             value = int(raw)

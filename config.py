@@ -168,6 +168,15 @@ LOW_VALUE_LINK_LINE_SHARE = 0.5
 # puts a code block alone in a unit and its explanation in the one before.
 CODE_EXAMPLE_CONTEXT_CHARS = 1500
 
+# Brief 3B Step 6 run safety (contract v2 only; headless settings override
+# per run). MIN_CRAWL_DELAY_SECONDS: a floor under the per-host spacing --
+# max(site's robots.txt Crawl-delay or DEFAULT_POLITENESS_DELAY_SECONDS,
+# this). None = no floor. STOP_ON_SITE_429: the first 429 from the site
+# (a page or robots.txt) stops the run (stopped_early, resumable) instead of
+# re-queueing the page.
+MIN_CRAWL_DELAY_SECONDS = None
+STOP_ON_SITE_429 = False
+
 # Brief 3B Step 5: verifiers (contract v2, verifiers/).
 VERIFY_MIN_ANSWER_LENGTH = 20            # schema@1 on qa rows: export_formats' default minimum
 NEAR_DUPLICATE_THRESHOLD = 0.9           # near_duplicate@1: token-set (Jaccard) similarity

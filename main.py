@@ -382,7 +382,10 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
         config.EXTRACTION_STRATEGY, embed_fn=embed_fn, intent_embedding=intent_embedding,
     )
     recorder = SourceRecorder() if v2 else None
-    robots_cache = RobotsCache(_recording_text_fetch(recorder, _http_fetch or _http_get_status_text)
+    fatal_errors: list[str] = []
+    robots_cache = RobotsCache(_recording_text_fetch(recorder, _http_fetch or _http_get_status_text,
+                                                     stop_on_429=(frontier, fatal_errors)
+                                                     if config.STOP_ON_SITE_429 else None)
                                if v2 else _http_get_text)
     record_builder = _make_v2_record_builder(context, provider_name, model_name, llm) if v2 else None
     balancer = Balancer(BalanceSettings.from_config(cfg.get("low_value_overrides"))) if v2 else None
@@ -426,7 +429,6 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
     dry_pages: dict = {}
     crawl_workers_n = cfg.get("crawl_workers", 5)
     extract_workers_n = cfg.get("extract_workers", 2)
-    fatal_errors: list[str] = []
     stop_info = None
 
     if stop is not None and stop.event.is_set():  # signalled during startup: start nothing
@@ -440,12 +442,13 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
         if _fetch_fn_factory is not None:
             fetch_fn = _fetch_fn_factory(crawler)
         else:
-            fetch_fn = _make_fetch_fn(crawler, observer=recorder.record_evidence if v2 else None)
+            fetch_fn = _make_fetch_fn(crawler, observer=recorder.record_evidence if v2 else None, strict_status=v2)
         content_queue = asyncio.Queue(maxsize=max(4, crawl_workers_n * 2))
         results_queue = asyncio.Queue(maxsize=max(4, extract_workers_n * 2))
         politeness = HostPoliteness(
             max_concurrent_per_host=config.MAX_CONCURRENT_REQUESTS_PER_HOST,
             default_delay_seconds=config.DEFAULT_POLITENESS_DELAY_SECONDS,
+            min_delay_seconds=config.MIN_CRAWL_DELAY_SECONDS if v2 else None,
         )
         timing = _start_timing_log(
             run_dir, provider_name, model_name, crawl_workers_n, extract_workers_n,
@@ -457,7 +460,7 @@ async def _headless_crawl_body(cfg, api_key, context, stop, _crawler_factory, _f
             asyncio.create_task(
                 crawl_worker(frontier, fetch_fn, content_queue, scope_check, robots_cache, politeness,
                              fatal_error_sink=fatal_errors, timing=timing, site_backoff=config.SITE_RETRY_BACKOFF,
-                             use_fetch_urls=v2)
+                             use_fetch_urls=v2, stop_on_site_429=v2 and config.STOP_ON_SITE_429)
             )
             for _ in range(crawl_workers_n)
         ]
@@ -965,13 +968,20 @@ async def _http_get_status_text(url: str) -> tuple[int | None, str | None]:
     return await asyncio.to_thread(_get)
 
 
-def _recording_text_fetch(recorder: SourceRecorder, fetch_status_text):
+def _recording_text_fetch(recorder: SourceRecorder, fetch_status_text, stop_on_429=None):
     """RobotsCache's fetch (text or None), recording robots.txt's status and
-    text for the source record on the way."""
+    text for the source record on the way. stop_on_429 = (frontier,
+    fatal_errors): a 429 here stops the run like a page's 429 does."""
     async def fetch(url: str) -> str | None:
         status, text = await fetch_status_text(url)
         if urlparse(url).path == "/robots.txt":
             recorder.record_robots(url, status, text)
+        if status == 429 and stop_on_429 is not None:
+            frontier, fatal_errors = stop_on_429
+            msg = f"[FATAL] Site returned 429 for {url}; stopping the run (stop_on_site_429)."
+            print(msg)
+            fatal_errors.append(msg)
+            frontier.quiescent.set()
         return text if status == 200 else None
     return fetch
 
@@ -1079,7 +1089,7 @@ async def _stop_timing_log(timing: TimingLog | None) -> None:
         await timing.close()  # writes run_end (wall_seconds) and flushes
 
 
-def _make_fetch_fn(crawler: AsyncWebCrawler, observer=None):
+def _make_fetch_fn(crawler: AsyncWebCrawler, observer=None, strict_status: bool = False):
     """Shares one AsyncWebCrawler instance across every crawl_worker call
     -- matching orchestrator.py's existing pattern, not spinning up a new
     browser context per fetch. Live crawl bypasses crawl4ai's cache
@@ -1104,6 +1114,10 @@ def _make_fetch_fn(crawler: AsyncWebCrawler, observer=None):
             excluded_selector=DEFAULT_EXCLUDED_SELECTOR,
         )
         result = await crawler.arun(url=url, config=run_config)
+        if strict_status and result.success and (result.status_code or 0) >= 400:
+            # Contract v2: an error page crawl4ai rendered "successfully" (e.g. a 429
+            # body) is an HTTP error, never content. Legacy/v1 unchanged.
+            raise FetchHTTPError.from_response(result.status_code, result.response_headers)
         if not result.success:
             status = result.redirected_status_code or result.status_code
             if status and status != 200:
