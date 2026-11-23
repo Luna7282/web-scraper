@@ -68,20 +68,25 @@ class Setting:
     allow_none: bool = False
 
 
-# Step 1: v1 defaults equal today's config.py defaults. (Brief 3A Step 4
-# changes some of them for v1 headless runs only.)
+# v1 defaults equal today's config.py defaults, except the Step 4 safe
+# defaults (v1 headless only; legacy and config.py unchanged):
+# max_pages_counts_failed on, llm_breaker_threshold 5, site_retry_backoff on,
+# llm_unavailable_max_releases 5.
 SETTINGS: dict[str, Setting] = {
     "extract_unit_concurrency": Setting("EXTRACT_UNIT_CONCURRENCY", "EXTRACT_UNIT_CONCURRENCY", int, 1),
-    "max_pages_counts_failed": Setting("MAX_PAGES_COUNTS_FAILED", "MAX_PAGES_COUNTS_FAILED", bool, False),
-    "llm_breaker_threshold": Setting("LLM_BREAKER_THRESHOLD", "LLM_BREAKER_THRESHOLD", int, 0),
+    "max_pages_counts_failed": Setting("MAX_PAGES_COUNTS_FAILED", "MAX_PAGES_COUNTS_FAILED", bool, True),
+    "llm_breaker_threshold": Setting("LLM_BREAKER_THRESHOLD", "LLM_BREAKER_THRESHOLD", int, 5),
     "llm_sdk_max_retries": Setting("LLM_SDK_MAX_RETRIES", "LLM_SDK_MAX_RETRIES", int, 2),
     "use_system_one": Setting("USE_SYSTEM_ONE", "USE_SYSTEM_ONE", bool, False),
     "system_one_provider": Setting("SYSTEM_ONE_PROVIDER", "SYSTEM_ONE_PROVIDER", str, None, allow_none=True),
     "extract_timing_log": Setting("EXTRACT_TIMING_LOG", "EXTRACT_TIMING_LOG", bool, False),
     "stop_grace_seconds": Setting("STOP_GRACE_SECONDS", "SCRAPER_STOP_GRACE_SECONDS", int, 30),
+    "site_retry_backoff": Setting("SITE_RETRY_BACKOFF", "SCRAPER_SITE_RETRY_BACKOFF", bool, True),
+    "llm_unavailable_max_releases": Setting("LLM_UNAVAILABLE_MAX_RELEASES", "SCRAPER_LLM_UNAVAILABLE_MAX_RELEASES",
+                                            int, 5),
 }
 _MINIMUMS = {"extract_unit_concurrency": 1, "llm_breaker_threshold": 0, "llm_sdk_max_retries": 0,
-             "stop_grace_seconds": 0}
+             "stop_grace_seconds": 0, "llm_unavailable_max_releases": 0}
 
 
 @dataclass(frozen=True)

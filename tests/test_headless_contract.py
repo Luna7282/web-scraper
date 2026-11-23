@@ -110,13 +110,17 @@ class TestPrecedence(ConfigGuard):
         self.assertEqual(eff["system_one_provider"], {"value": None, "source": "default"})
         self.assertEqual(set(eff), set(headless.SETTINGS))
 
-    def test_v1_defaults_equal_todays_config_defaults_in_step_1(self):
-        """Step 4 changes some v1 defaults deliberately; until then they match."""
+    def test_v1_defaults_equal_todays_config_defaults_except_step_4s_safe_defaults(self):
+        """v1 defaults match config.py except the four Step 4 safe defaults,
+        which differ on purpose (v1 headless only)."""
+        todays = {"EXTRACT_UNIT_CONCURRENCY": 1, "MAX_PAGES_COUNTS_FAILED": False, "LLM_BREAKER_THRESHOLD": 0,
+                  "LLM_SDK_MAX_RETRIES": 2, "USE_SYSTEM_ONE": False, "SYSTEM_ONE_PROVIDER": None,
+                  "EXTRACT_TIMING_LOG": False, "STOP_GRACE_SECONDS": 30, "SITE_RETRY_BACKOFF": False,
+                  "LLM_UNAVAILABLE_MAX_RELEASES": 0}
+        step_4 = {"MAX_PAGES_COUNTS_FAILED": True, "LLM_BREAKER_THRESHOLD": 5, "SITE_RETRY_BACKOFF": True,
+                  "LLM_UNAVAILABLE_MAX_RELEASES": 5}
         for name, spec in headless.SETTINGS.items():
-            self.assertEqual(spec.default, {"EXTRACT_UNIT_CONCURRENCY": 1, "MAX_PAGES_COUNTS_FAILED": False,
-                                            "LLM_BREAKER_THRESHOLD": 0, "LLM_SDK_MAX_RETRIES": 2,
-                                            "USE_SYSTEM_ONE": False, "SYSTEM_ONE_PROVIDER": None,
-                                            "EXTRACT_TIMING_LOG": False, "STOP_GRACE_SECONDS": 30}[spec.config_attr], name)
+            self.assertEqual(spec.default, {**todays, **step_4}[spec.config_attr], name)
 
     def test_bad_settings_are_refused(self):
         cases = [({"nope": 1}, "unknown settings: nope"),
