@@ -17,6 +17,7 @@ from rich.table import Table
 
 import config
 import headless
+from crawl import browser_flags
 from crawl import graceful
 from llm_factory import get_llm
 from crawl.discovery import discover_branches, fetch_page_links
@@ -53,6 +54,9 @@ from content.extraction_units import make_extraction_units_fn
 from export.dataset_report import build_dataset_report
 from export.export import load_canonical_records
 from content.chrome_strip import DEFAULT_EXCLUDED_SELECTOR, DEFAULT_EXCLUDED_TAGS, normalize_link_text, strip_text_patterns
+
+# ROADMAP #70: never hide automation (removes crawl4ai's --disable-blink-features=AutomationControlled).
+browser_flags.install()
 
 EMBEDDING_MODEL_NAME = "nomic-embed-text"  # LocalOllamaEmbeddings' default; keep in sync (see get_llm)
 EMBEDDING_DIM = 768  # measured in step 6 -- see LESSONS_LEARNED.md #17
