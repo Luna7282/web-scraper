@@ -5890,3 +5890,21 @@ happened, and no key was loaded.
   `run_end`, and a provider-construction guard injected into the process
   logged 0 hits. Fetch spacing was 1.00s start to start. Note: a `fetch`
   event's `ts` is when the fetch *ended*, so `ts` gaps understate spacing.
+
+### 98. Never hide automation: crawl4ai's AutomationControlled flag removed (ROADMAP #70)
+
+- **What:** crawl4ai 0.9.2 always adds `--disable-blink-features=AutomationControlled` (hides
+  `navigator.webdriver`) in both of its Chromium arg builders: `BrowserManager._build_browser_args` (the
+  Playwright launch path `AsyncWebCrawler()` uses) and `ManagedBrowser.build_browser_flags`. It is an
+  anti-detection feature, against the never-stealth rule. Found from foundry P2.
+- **Fix:** crawl4ai has no setting to drop a default arg, so `crawl/browser_flags.py` wraps both builders
+  and removes every arg in `config.BROWSER_FORBIDDEN_ARGS`. main.py installs it at import, before any
+  crawler starts.
+- **Tests:** `tests/test_browser_flags.py`:
+  - crawl4ai's ORIGINAL builders do add the flag (so the test says when an upgrade makes the wrapper
+    unnecessary);
+  - after install, both paths are clean and keep their other args;
+  - install is idempotent.
+- **Verification:** fast and slow (RUN_SLOW_TESTS=1) suites, 751 each, with only the 10 known #50
+  control-server failures. The golden byte tests pass, because the change touches launch args, not
+  rows.

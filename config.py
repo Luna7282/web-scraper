@@ -457,3 +457,7 @@ def validate_system_one_config() -> None:
             "installed. See SYSTEM_ONE_MODELS.md before installing it -- torch/"
             "transformers may conflict with this project's numpy<2 pin."
         )
+
+# Never hide automation from sites (ROADMAP #70, HIGH): Chromium launch args crawl4ai adds by default that are
+# removed before every launch (crawl/browser_flags.py, installed by main.py at import).
+BROWSER_FORBIDDEN_ARGS = ("--disable-blink-features=AutomationControlled",)
