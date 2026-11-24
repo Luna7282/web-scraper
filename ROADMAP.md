@@ -1327,3 +1327,14 @@ isn't reproducible.*
     records carry no HTTP status or response headers, because the
     content queue passes only (url, markdown). Add them only if a consumer
     needs them.
+70. **[HIGH PRIORITY, found 2026-11-24 from foundry P2 Step 3] crawl4ai's default launch args hide
+    automation.** `crawl4ai/browser_manager.py::_build_browser_args` (0.9.2) always adds
+    `--disable-blink-features=AutomationControlled`, which hides `navigator.webdriver` from sites.
+    That is an anti-detection feature, and it conflicts with the never-stealth rule (foundry's agent
+    browser refuses stealth outright). The scraper uses crawl4ai's defaults (`AsyncWebCrawler()` with
+    no `BrowserConfig`), so every crawl runs with it. **Fix on the next scraper change:** remove the
+    flag (e.g. a `BrowserConfig` whose args are filtered, or Playwright's `ignore_default_args` for
+    it), and add a test that the launch args never contain it. Related: the scraper's Chromium does
+    get `--use-mock-keychain` / `--password-store=basic`, but only implicitly from Playwright's own
+    defaults (crawl4ai adds them itself only in `light_mode`); make them explicit in the same change.
+    Size: S.
